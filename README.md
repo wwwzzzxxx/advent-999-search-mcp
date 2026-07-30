@@ -1,5 +1,7 @@
 # advent-999-search-mcp 🔍
 
+> [中文文档](README.zh-CN.md)
+
 A Rust-based MCP (Model Context Protocol) server that provides **web search**, **local file search**, and **web page fetching** capabilities for AI assistants.
 
 ## Features
