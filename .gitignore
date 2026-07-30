@@ -1,0 +1,22 @@
+# Rust build outputs
+target/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cargo lock is committed for binaries
+# Cargo.lock is kept for reproducible builds
+
+# Temp scripts
+gen_*.py
+write_*.py
+
+# Sensitive files (do NOT commit)
+cookies.txt
+*.env
