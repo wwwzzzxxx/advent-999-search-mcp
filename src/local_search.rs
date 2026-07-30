@@ -42,6 +42,17 @@ pub fn find_es_exe() -> Option<PathBuf> {
         if p.exists() { return Some(p); }
     }
 
+    // Check bundled vendor/ directory (relative to the binary)
+    if let Ok(exe_path) = std::env::current_exe() {
+        let vendor_path = exe_path.parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|p| p.join("vendor").join("es.exe"));
+        if let Some(p) = vendor_path {
+            if p.exists() { return Some(p); }
+        }
+    }
+
     let candidates = vec![
         format!("{}/.local/bin/es.exe", std::env::var("USERPROFILE").unwrap_or_default()),
         "C:\\Program Files\\Everything\\es.exe".to_string(),
