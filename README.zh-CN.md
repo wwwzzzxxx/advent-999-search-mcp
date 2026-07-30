@@ -27,11 +27,15 @@ cargo build --release
 
 ### Everything 配置（本地搜索）
 
-本地文件搜索需要 Everything 的命令行工具 `es.exe`。启用方法：
+本地文件搜索需要 Everything 的命令行工具 `es.exe`。仓库已打包相关文件：
 
-1. 安装 [Everything](https://www.voidtools.com/)
-2. 从 [ES 发布页面](https://github.com/voidtools/ES/releases) 下载 `es.exe`
-3. 设置环境变量 `EVERYTHING_ES_PATH`，指向 `es.exe` 的路径
+- `vendor/Everything-1.5.0.1418b.x64-Setup.exe` — Everything 安装包
+- `vendor/es.exe` — 命令行搜索工具
+
+启用方法：
+
+1. 运行 `vendor/Everything-1.5.0.1418b.x64-Setup.exe` 安装 Everything，或从 [voidtools.com](https://www.voidtools.com/) 下载最新版
+2. 设置环境变量 `EVERYTHING_ES_PATH`，指向 `es.exe`（可使用仓库自带的 `vendor/es.exe`，或从 [ES 发布页面](https://github.com/voidtools/ES/releases) 下载最新版）
 
 若未设置此环境变量，`local` 工具将不会显示。
 
