@@ -40,9 +40,21 @@ If you want local file search, install Everything by voidtools:
 - Run `vendor/Everything-1.5.0.1418b.x64-Setup.exe` (bundled in this repo)
 - Or download from [voidtools.com](https://www.voidtools.com/)
 
-After installation, set the `EVERYTHING_ES_PATH` environment variable to point to `es.exe` (the bundled one at `vendor/es.exe`, or download the latest from [ES releases](https://github.com/voidtools/ES/releases)).
+After installation, copy `vendor/Everything.ini` to `%APPDATA%\Everything\Everything.ini` (overwrite existing) to apply recommended settings that prevent excessive memory usage.
+
+Then set the `EVERYTHING_ES_PATH` environment variable to point to `es.exe` (the bundled one at `vendor/es.exe`, or download the latest from [ES releases](https://github.com/voidtools/ES/releases)).
 
 > Skip this step if you don't need local search — the `local` tool will not appear when this env var is unset.
+
+#### Recommended Everything Settings
+
+Content indexing in Everything 1.5 can consume **several GB of RAM** if left unrestricted. The bundled `vendor/Everything.ini` limits content indexing to small text/code files only (under 20 KB), which keeps memory usage minimal. Key settings:
+
+- `content_indexing_include_only_files` — Only index code and text files (no binaries, images, videos)
+- `content_indexing_max_size=20` (KB) — Skip files larger than 20 KB
+- `content_indexing_exclude_recall_on_data_access=1` — Skip cloud-only files
+
+You can adjust these settings in Everything under **Tools → Options → Advanced**.
 
 ### 3. Configure environment variables
 

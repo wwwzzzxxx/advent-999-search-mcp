@@ -38,9 +38,21 @@ cargo build --release
 - 运行 `vendor/Everything-1.5.0.1418b.x64-Setup.exe`（仓库已打包）
 - 或从 [voidtools.com](https://www.voidtools.com/) 下载
 
-安装后，设置环境变量 `EVERYTHING_ES_PATH` 指向 `es.exe`（可用仓库自带的 `vendor/es.exe`，或从 [ES 发布页面](https://github.com/voidtools/ES/releases) 下载最新版）。
+安装后，将 `vendor/Everything.ini` 复制到 `%APPDATA%\Everything\Everything.ini`（覆盖原文件）以应用推荐配置，避免内容索引占用过多内存。
+
+然后设置环境变量 `EVERYTHING_ES_PATH` 指向 `es.exe`（可用仓库自带的 `vendor/es.exe`，或从 [ES 发布页面](https://github.com/voidtools/ES/releases) 下载最新版）。
 
 > 不需要本地搜索可跳过此步 — 未设置该环境变量时，`local` 工具不会出现。
+
+#### Everything 推荐配置
+
+Everything 1.5 的内容索引若不加以限制，可能占用**数 GB 内存**。仓库打包的 `vendor/Everything.ini` 将内容索引限制为仅索引 20KB 以下的小型文本/代码文件，极大降低内存占用。核心设置：
+
+- `content_indexing_include_only_files` — 仅索引代码和文本文件（不含二进制、图片、视频）
+- `content_indexing_max_size=20`（KB）— 跳过大于 20KB 的文件
+- `content_indexing_exclude_recall_on_data_access=1` — 跳过云端按需同步文件
+
+可在 Everything 的 **工具 → 选项 → 高级** 中调整这些设置。
 
 ### 3. 配置环境变量
 
