@@ -40,7 +40,9 @@ If you want local file search, install Everything by voidtools:
 - Run `vendor/Everything-1.5.0.1418b.x64-Setup.exe` (bundled in this repo)
 - Or download from [voidtools.com](https://www.voidtools.com/)
 
-After installation, copy `vendor/Everything.ini` to `%APPDATA%\Everything\Everything.ini` (overwrite existing) to apply recommended settings that prevent excessive memory usage.
+After installation, copy `vendor/Everything.ini` over your existing Everything.ini to apply recommended settings that prevent excessive memory usage.
+
+The config file location varies by installation. To find yours, open Everything and type `about:config` in the search bar, then press Enter — it will open the file directly.
 
 Then set the `EVERYTHING_ES_PATH` environment variable to point to `es.exe` (the bundled one at `vendor/es.exe`, or download the latest from [ES releases](https://github.com/voidtools/ES/releases)).
 

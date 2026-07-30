@@ -38,7 +38,9 @@ cargo build --release
 - 运行 `vendor/Everything-1.5.0.1418b.x64-Setup.exe`（仓库已打包）
 - 或从 [voidtools.com](https://www.voidtools.com/) 下载
 
-安装后，将 `vendor/Everything.ini` 复制到 `%APPDATA%\Everything\Everything.ini`（覆盖原文件）以应用推荐配置，避免内容索引占用过多内存。
+安装后，用 `vendor/Everything.ini` 覆盖你本机的 Everything.ini 文件以应用推荐配置，避免内容索引占用过多内存。
+
+配置文件位置因安装方式而异。如需查找本机位置，打开 Everything，在搜索框输入 `about:config` 后回车即可直接打开配置文件。
 
 然后设置环境变量 `EVERYTHING_ES_PATH` 指向 `es.exe`（可用仓库自带的 `vendor/es.exe`，或从 [ES 发布页面](https://github.com/voidtools/ES/releases) 下载最新版）。
 
