@@ -2,133 +2,173 @@
 
 > [中文文档](README.zh-CN.md)
 
-A Rust-based MCP (Model Context Protocol) server that provides **web search**, **local file search**, and **web page fetching** capabilities for AI assistants.
+A Rust-based MCP server that gives your AI assistant **web search**, **local file search**, and **web page fetching** abilities.
 
-## Features
+- **`web`** — Search with Exa, Bing, CSDN, Juejin, Startpage, Sogou
+- **`local`** — Search your local files via Everything (voidtools)
+- **`get_page`** — Fetch and extract readable content from any web page
 
-- **`web`** — Multi-engine web search (Exa, Bing, CSDN, Juejin, Startpage, Sogou)
-- **`local`** — Local filesystem search via Everything (voidtools) ES.exe
-- **`get_page`** — Web page content extraction with HTML-to-Markdown conversion
+### Why advent?
 
-## Quick Start
+- 🪶 **Extremely low memory** — Written in Rust, ~5 MB binary, minimal runtime footprint
+- ⚙️ **Minimal configuration** — Works out of the box with sensible defaults, no heavy dependencies
+- 🌐 **Smart `get_page`** — Fetches and renders content from almost any site: handles JS-rendered pages, authenticated pages (Zhihu, Discourse), and complex HTML, all with automatic fallback strategies
 
-### Prerequisites
+---
 
-- [Rust](https://rustup.rs/) (edition 2021)
-- For local search: [Everything](https://www.voidtools.com/) by voidtools
+> **💡 Tip**: You can ask your AI agent to follow these installation steps for you.
 
-### Install
+## Installation
+
+### 1. Get the binary
+
+**Option A — Download** (recommended): Get the latest `.exe` from the [Releases page](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases).
+
+**Option B — Build from source**:
 
 ```bash
 git clone https://github.com/wwwzzzxxx/advent-999-search-mcp.git
 cd advent-999-search-mcp
 cargo build --release
+# Binary at: target/release/advent-999-search-mcp.exe
 ```
 
-The binary will be at `target/release/advent-999-search-mcp.exe`.
+### 2. (Optional) Install Everything for local file search
 
-### Everything Setup (Local Search)
+If you want local file search, install Everything by voidtools:
 
-Local file search uses Everything's command-line tool `es.exe`. Bundled files:
+- Run `vendor/Everything-1.5.0.1418b.x64-Setup.exe` (bundled in this repo)
+- Or download from [voidtools.com](https://www.voidtools.com/)
 
-- `vendor/Everything-1.5.0.1418b.x64-Setup.exe` — Everything installer
-- `vendor/es.exe` — Command-line search tool
+After installation, set the `EVERYTHING_ES_PATH` environment variable to point to `es.exe` (the bundled one at `vendor/es.exe`, or download the latest from [ES releases](https://github.com/voidtools/ES/releases)).
 
-To enable local search:
+> Skip this step if you don't need local search — the `local` tool will not appear when this env var is unset.
 
-1. Run `vendor/Everything-1.5.0.1418b.x64-Setup.exe` to install Everything, or download the latest from [voidtools.com](https://www.voidtools.com/)
-2. Set `EVERYTHING_ES_PATH` environment variable to point to `es.exe` (the bundled one at `vendor/es.exe`, or download the latest from [ES releases](https://github.com/voidtools/ES/releases))
+### 3. Configure environment variables
 
-If this env var is not set, the `local` tool will not be available.
+Set these in your OS user environment (or pass them via MCP config `env`):
 
-## MCP Configuration
+```bash
+# Required for proxy (recommended)
+PROXY_URL=http://127.0.0.1:7890
+USE_PROXY=true
 
-### VS Code (`mcp.json`)
+# Optional — Exa API key (free $10/month at https://dashboard.exa.ai/api-keys)
+EXA_API_KEY=your_key_here
 
-Add to your `.vscode/mcp.json` or user-level MCP config:
+# Optional — browser cookies for fetching authenticated pages (e.g. zhihu.com)
+# Same format as the HTTP Cookie header:
+FETCH_COOKIES="d_c0=ABC...; z_c0=DEF...; SESSIONID=GHI..."
+
+# Optional — for local file search (see step 2)
+EVERYTHING_ES_PATH=C:\path\to\es.exe
+```
+
+### 4. Register as an MCP server
+
+#### VS Code
+
+Edit `%APPDATA%\Code\User\mcp.json` (all projects) or `.vscode\mcp.json` (current project):
 
 ```json
 {
   "servers": {
     "advent": {
       "type": "stdio",
-      "command": "path/to/advent-999-search-mcp.exe",
+      "command": "C:\\path\\to\\advent-999-search-mcp.exe",
       "args": [],
       "env": {
-        "DEFAULT_SEARCH_ENGINE": "exa",
         "PROXY_URL": "http://127.0.0.1:7890",
-        "USE_PROXY": "true"
+        "USE_PROXY": "true",
+        "EXA_API_KEY": "your_key_here",
+        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF..."
       }
     }
   }
 }
 ```
 
-### OpenCode (`opencode.json`)
+#### OpenCode
+
+Edit `opencode.json`:
 
 ```json
 {
   "mcp": {
     "advent": {
-      "command": ["path/to/advent-999-search-mcp.exe"],
+      "command": ["C:\\path\\to\\advent-999-search-mcp.exe"],
       "enabled": true,
+      "env": {
+        "PROXY_URL": "http://127.0.0.1:7890",
+        "USE_PROXY": "true",
+        "EXA_API_KEY": "your_key_here",
+        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF..."
+      },
       "type": "local"
     }
   }
 }
 ```
 
-## Environment Variables
+---
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DEFAULT_SEARCH_ENGINE` | `exa` | Default search engine |
-| `ALLOWED_SEARCH_ENGINES` | *(all)* | Comma-separated list of allowed engines |
-| `PROXY_URL` | — | Proxy URL (e.g. `http://127.0.0.1:7890`) |
-| `USE_PROXY` | `true` | Enable/disable proxy |
-| `EXA_API_KEY` | — | Exa API key for higher rate limits ([get one](https://dashboard.exa.ai/api-keys)) |
-| `FETCH_COOKIES` | — | Browser cookies for authenticated page fetching (e.g. zhihu.com) |
-| `FETCH_TIMEOUT` | `30` | Fetch timeout in seconds |
-| `EVERYTHING_ES_PATH` | — | Custom path to ES.exe |
+## Environment Variables Reference
 
-## Search Engines
+| Variable | Required | Default | Description |
+|----------|:--------:|---------|-------------|
+| `PROXY_URL` | No | — | Proxy address (e.g. `http://127.0.0.1:7890`) |
+| `USE_PROXY` | No | `true` | Enable/disable proxy |
+| `EXA_API_KEY` | No | — | Exa API key — get one [here](https://dashboard.exa.ai/api-keys) |
+| `FETCH_COOKIES` | No | — | Browser cookies for authenticated pages. Format: `key=value; key2=value2` |
+| `EVERYTHING_ES_PATH` | No | — | Path to ES.exe (required to enable local search) |
+| `DEFAULT_SEARCH_ENGINE` | No | `exa` | Default search engine |
+| `ALLOWED_SEARCH_ENGINES` | No | *(all)* | Comma-separated list of allowed engines |
+| `FETCH_TIMEOUT` | No | `30` | Fetch timeout in seconds |
 
-| Engine | Type | Requires API Key | Notes |
-|--------|------|:---------------:|-------|
-| Exa | MCP API | Optional (free $10/month) | Default engine |
-| Bing | Scraping | No | cn.bing.com |
-| CSDN | API | No | so.csdn.net |
-| Juejin | API | No | juejin.cn |
-| Startpage | Scraping | No | Privacy-focused |
-| Sogou | Scraping | No | sogou.com |
+---
 
 ## Tools
 
 ### `web` — Web Search
+
 ```
-query: string (required)      — Search query
-limit: number (default: 10)   — Max results (1-50)
-engines: string[]             — Engines to use
-searchMode: string            — "request" | "auto" | "playwright"
+query      (string, required)  — Search query
+limit      (number, default 10) — Results per engine (1-50)
+engines    (string[])           — Which engine(s) to use
+searchMode (string)             — "request" | "auto" | "playwright"
 ```
 
+Supported engines: Exa (default), Bing, CSDN, Juejin, Startpage, Sogou.
+
 ### `local` — Local File Search
+
 ```
-query: string (required)      — Everything query syntax
-maxResults: number (1-1000)   — Max results
-sort: string                  — Sort field
-path: string                  — Limit to directory
-contentSearch: boolean        — Search file contents
-... more options
+query         (string, required) — Everything query syntax
+maxResults    (number, 1-1000)   — Max results
+sort          (string)           — Sort field
+path          (string)           — Limit to directory
+contentSearch (boolean)          — Search file contents
+matchCase     (boolean)          — Case-sensitive
+matchRegex    (boolean)          — Regex mode
+filesOnly     (boolean)          — Files only
+foldersOnly   (boolean)          — Folders only
 ```
 
 ### `get_page` — Fetch Web Page
+
 ```
-url: string (required)        — URL to fetch
-maxLength: number (max 200k)  — Max content length
+url       (string, required)    — URL to fetch
+maxLength (number, max 200000)  — Max content length
 ```
 
-Supports: Zhihu (signed API), CSDN, Discourse forums, Jina fallback for JS-heavy sites.
+Smart fetching strategy:
+- **Zhihu** → signed API (requires `d_c0` in `FETCH_COOKIES`)
+- **CSDN** → direct HTML extraction
+- **Discourse** forums → JSON API
+- **JS-heavy sites** → Jina Reader fallback
+- **Normal sites** → direct HTTP with HTML-to-Markdown
+
+---
 
 ## License
 

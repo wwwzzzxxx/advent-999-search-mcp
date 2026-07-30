@@ -1,132 +1,173 @@
 # advent-999-search-mcp 🔍
 
-基于 Rust 的 MCP（Model Context Protocol）服务器，为 AI 助手提供**网络搜索**、**本地文件搜索**和**网页抓取**能力。
+基于 Rust 的 MCP 服务器，为你的 AI 助手提供**网络搜索**、**本地文件搜索**和**网页抓取**能力。
 
-## 功能特性
+- **`web`** — 多引擎搜索（Exa、Bing、CSDN、掘金、Startpage、搜狗）
+- **`local`** — 通过 Everything (voidtools) 搜索本地文件
+- **`get_page`** — 抓取任意网页并提取可读内容
 
-- **`web`** — 多引擎网络搜索（Exa、Bing、CSDN、掘金、Startpage、搜狗）
-- **`local`** — 通过 Everything (voidtools) ES.exe 进行本地文件搜索
-- **`get_page`** — 网页内容抓取，支持 HTML 到 Markdown 转换
+### 为什么选 advent？
 
-## 快速开始
+- 🪶 **极低内存占用** — 使用 Rust 编写，二进制仅 ~5 MB，运行时内存占用极小
+- ⚙️ **轻量化配置** — 开箱即用，无需繁琐依赖
+- 🌐 **智能 `get_page`** — 能抓取并渲染几乎所有网站：支持 JS 渲染页面、需登录页面（知乎、Discourse）、复杂 HTML，自动降级策略保证成功率
 
-### 前置依赖
+---
 
-- [Rust](https://rustup.rs/)（edition 2021）
-- 本地搜索需安装 [Everything](https://www.voidtools.com/)
+> **💡 提示**：你可以直接让你的 AI 助手按以下步骤帮你完成安装。
 
-### 安装
+## 安装指南
+
+### 1. 获取可执行文件
+
+**方式一：直接下载**（推荐）：从 [Releases 页面](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases) 下载最新的 `.exe`。
+
+**方式二：从源码编译**：
 
 ```bash
 git clone https://github.com/wwwzzzxxx/advent-999-search-mcp.git
 cd advent-999-search-mcp
 cargo build --release
+# 编译产物：target/release/advent-999-search-mcp.exe
 ```
 
-编译后的二进制文件位于 `target/release/advent-999-search-mcp.exe`。
+### 2. （可选）安装 Everything 以启用本地搜索
 
-### Everything 配置（本地搜索）
+如果需要本地文件搜索功能，请安装 voidtools 的 Everything：
 
-本地文件搜索需要 Everything 的命令行工具 `es.exe`。仓库已打包相关文件：
+- 运行 `vendor/Everything-1.5.0.1418b.x64-Setup.exe`（仓库已打包）
+- 或从 [voidtools.com](https://www.voidtools.com/) 下载
 
-- `vendor/Everything-1.5.0.1418b.x64-Setup.exe` — Everything 安装包
-- `vendor/es.exe` — 命令行搜索工具
+安装后，设置环境变量 `EVERYTHING_ES_PATH` 指向 `es.exe`（可用仓库自带的 `vendor/es.exe`，或从 [ES 发布页面](https://github.com/voidtools/ES/releases) 下载最新版）。
 
-启用方法：
+> 不需要本地搜索可跳过此步 — 未设置该环境变量时，`local` 工具不会出现。
 
-1. 运行 `vendor/Everything-1.5.0.1418b.x64-Setup.exe` 安装 Everything，或从 [voidtools.com](https://www.voidtools.com/) 下载最新版
-2. 设置环境变量 `EVERYTHING_ES_PATH`，指向 `es.exe`（可使用仓库自带的 `vendor/es.exe`，或从 [ES 发布页面](https://github.com/voidtools/ES/releases) 下载最新版）
+### 3. 配置环境变量
 
-若未设置此环境变量，`local` 工具将不会显示。
+以下变量可通过系统环境变量设置，或在 MCP 配置的 `env` 中传递：
 
-## MCP 配置
+```bash
+# 代理设置（推荐配置）
+PROXY_URL=http://127.0.0.1:7890
+USE_PROXY=true
 
-### VS Code（`mcp.json`）
+# （可选）Exa API 密钥，每月免费 $10
+# 申请地址：https://dashboard.exa.ai/api-keys
+EXA_API_KEY=你的密钥
 
-添加到你的 `.vscode/mcp.json` 或用户级别的 MCP 配置：
+# （可选）浏览器 Cookie，用于抓取需登录的页面（如知乎）
+# 格式与 HTTP 的 Cookie 请求头相同：
+FETCH_COOKIES="d_c0=ABC...; z_c0=DEF...; SESSIONID=GHI..."
+
+# （可选）本地文件搜索（见第 2 步）
+EVERYTHING_ES_PATH=C:\path\to\es.exe
+```
+
+### 4. 注册为 MCP 服务器
+
+#### VS Code
+
+编辑 `%APPDATA%\Code\User\mcp.json`（全局）或 `.vscode\mcp.json`（当前项目）：
 
 ```json
 {
   "servers": {
     "advent": {
       "type": "stdio",
-      "command": "path/to/advent-999-search-mcp.exe",
+      "command": "C:\\path\\to\\advent-999-search-mcp.exe",
       "args": [],
       "env": {
-        "DEFAULT_SEARCH_ENGINE": "exa",
         "PROXY_URL": "http://127.0.0.1:7890",
-        "USE_PROXY": "true"
+        "USE_PROXY": "true",
+        "EXA_API_KEY": "你的密钥",
+        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF..."
       }
     }
   }
 }
 ```
 
-### OpenCode（`opencode.json`）
+#### OpenCode
+
+编辑 `opencode.json`：
 
 ```json
 {
   "mcp": {
     "advent": {
-      "command": ["path/to/advent-999-search-mcp.exe"],
+      "command": ["C:\\path\\to\\advent-999-search-mcp.exe"],
       "enabled": true,
+      "env": {
+        "PROXY_URL": "http://127.0.0.1:7890",
+        "USE_PROXY": "true",
+        "EXA_API_KEY": "你的密钥",
+        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF..."
+      },
       "type": "local"
     }
   }
 }
 ```
 
-## 环境变量
+---
 
-| 变量 | 默认值 | 说明 |
-|----------|---------|------|
-| `DEFAULT_SEARCH_ENGINE` | `exa` | 默认搜索引擎 |
-| `ALLOWED_SEARCH_ENGINES` | *（全部）* | 允许的搜索引擎列表（逗号分隔） |
-| `PROXY_URL` | — | 代理地址（如 `http://127.0.0.1:7890`） |
-| `USE_PROXY` | `true` | 是否启用代理 |
-| `EXA_API_KEY` | — | Exa API 密钥，用于更高频率限制（[申请](https://dashboard.exa.ai/api-keys)） |
-| `FETCH_COOKIES` | — | 浏览器 Cookie，用于抓取需要登录的页面（如知乎） |
-| `FETCH_TIMEOUT` | `30` | 抓取超时时间（秒） |
-| `EVERYTHING_ES_PATH` | — | ES.exe 的自定义路径 |
+## 环境变量参考
 
-## 搜索引擎
+| 变量 | 必填 | 默认值 | 说明 |
+|----------|:---:|---------|------|
+| `PROXY_URL` | 否 | — | 代理地址（如 `http://127.0.0.1:7890`） |
+| `USE_PROXY` | 否 | `true` | 是否启用代理 |
+| `EXA_API_KEY` | 否 | — | Exa API 密钥，[点此申请](https://dashboard.exa.ai/api-keys) |
+| `FETCH_COOKIES` | 否 | — | 浏览器 Cookie。格式：`key=value; key2=value2` |
+| `EVERYTHING_ES_PATH` | 否 | — | ES.exe 路径（必须设置才能启用本地搜索） |
+| `DEFAULT_SEARCH_ENGINE` | 否 | `exa` | 默认搜索引擎 |
+| `ALLOWED_SEARCH_ENGINES` | 否 | *（全部）* | 允许的搜索引擎列表（逗号分隔） |
+| `FETCH_TIMEOUT` | 否 | `30` | 抓取超时（秒） |
 
-| 引擎 | 类型 | 需要 API Key | 备注 |
-|--------|------|:-----------:|------|
-| Exa | MCP API | 可选（每月免费 $10） | 默认引擎 |
-| Bing | 爬取 | 否 | cn.bing.com |
-| CSDN | API | 否 | so.csdn.net |
-| 掘金 | API | 否 | juejin.cn |
-| Startpage | 爬取 | 否 | 注重隐私 |
-| 搜狗 | 爬取 | 否 | sogou.com |
+---
 
 ## 工具说明
 
 ### `web` — 网络搜索
+
 ```
-query: string（必填）     — 搜索关键词
-limit: number（默认 10）  — 最大结果数（1-50）
-engines: string[]         — 使用的搜索引擎
-searchMode: string        — "request" | "auto" | "playwright"
+query      (string, 必填)      — 搜索关键词
+limit      (number, 默认 10)   — 每引擎结果数（1-50）
+engines    (string[])           — 使用的搜索引擎
+searchMode (string)             — "request" | "auto" | "playwright"
 ```
 
+支持的搜索引擎：Exa（默认）、Bing、CSDN、掘金、Startpage、搜狗。
+
 ### `local` — 本地文件搜索
+
 ```
-query: string（必填）      — Everything 查询语法
-maxResults: number（1-1000）— 最大结果数
-sort: string               — 排序字段
-path: string               — 限定搜索目录
-contentSearch: boolean     — 搜索文件内容
-... 更多选项
+query         (string, 必填)   — Everything 查询语法
+maxResults    (number, 1-1000) — 最大结果数
+sort          (string)         — 排序字段
+path          (string)         — 限定搜索目录
+contentSearch (boolean)        — 搜索文件内容
+matchCase     (boolean)        — 区分大小写
+matchRegex    (boolean)        — 正则模式
+filesOnly     (boolean)        — 仅文件
+foldersOnly   (boolean)        — 仅文件夹
 ```
 
 ### `get_page` — 网页抓取
+
 ```
-url: string（必填）         — 要抓取的 URL
-maxLength: number（最大 200k）— 最大内容长度
+url       (string, 必填)       — 要抓取的 URL
+maxLength (number, 最大 200000) — 最大内容长度
 ```
 
-支持：知乎（签名 API）、CSDN、Discourse 论坛、对 JS 密集型站点自动降级到 Jina。
+智能抓取策略：
+- **知乎** → 签名 API（需在 `FETCH_COOKIES` 中提供 `d_c0`）
+- **CSDN** → 直接 HTML 提取
+- **Discourse** 论坛 → JSON API
+- **JS 密集型站点** → 自动降级到 Jina Reader
+- **普通站点** → 直接 HTTP + HTML 转 Markdown
+
+---
 
 ## 许可证
 
