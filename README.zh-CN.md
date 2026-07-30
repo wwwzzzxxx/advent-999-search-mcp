@@ -169,6 +169,13 @@ maxLength (number, 最大 200000) — 最大内容长度
 
 ---
 
+## 致谢
+
+- **[Aas-ee/open-webSearch](https://github.com/aas-ee/open-websearch)** — 原始的 Node.js 多引擎搜索 MCP，本项目的灵感来源。
+- **[code-yeongyu/oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)** — Exa MCP 集成模式的参考来源。
+- **[voidtools](https://www.voidtools.com/)** — Everything 和 ES.exe，本地文件搜索的基石。
+- **[Exa](https://exa.ai/)** — AI 驱动的网络搜索 API。
+
 ## 许可证
 
 MIT

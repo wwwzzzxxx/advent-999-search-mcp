@@ -170,6 +170,13 @@ Smart fetching strategy:
 
 ---
 
+## Acknowledgements
+
+- **[Aas-ee/open-webSearch](https://github.com/aas-ee/open-websearch)** — The original Node.js multi-engine search MCP that this project was inspired by.
+- **[code-yeongyu/oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)** — Referenced for the Exa MCP integration pattern.
+- **[voidtools](https://www.voidtools.com/)** — Everything and ES.exe, the backbone of local file search.
+- **[Exa](https://exa.ai/)** — AI-powered web search API.
+
 ## License
 
 MIT
