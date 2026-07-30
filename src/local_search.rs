@@ -36,31 +36,10 @@ pub struct LocalSearchOptions {
 }
 
 pub fn find_es_exe() -> Option<PathBuf> {
-    // Check environment variable first
+    // ONLY use the EVERYTHING_ES_PATH environment variable.
+    // If not set, the local search tool will not be exposed.
     if let Ok(env_path) = std::env::var("EVERYTHING_ES_PATH") {
         let p = PathBuf::from(&env_path);
-        if p.exists() { return Some(p); }
-    }
-
-    // Check bundled vendor/ directory (relative to the binary)
-    if let Ok(exe_path) = std::env::current_exe() {
-        let vendor_path = exe_path.parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(|p| p.join("vendor").join("es.exe"));
-        if let Some(p) = vendor_path {
-            if p.exists() { return Some(p); }
-        }
-    }
-
-    let candidates = vec![
-        format!("{}/.local/bin/es.exe", std::env::var("USERPROFILE").unwrap_or_default()),
-        "C:\\Program Files\\Everything\\es.exe".to_string(),
-        "C:\\Program Files (x86)\\Everything\\es.exe".to_string(),
-    ];
-
-    for c in candidates {
-        let p = PathBuf::from(&c);
         if p.exists() { return Some(p); }
     }
 
@@ -69,7 +48,7 @@ pub fn find_es_exe() -> Option<PathBuf> {
 
 pub fn search_local(options: &LocalSearchOptions) -> Result<LocalSearchResponse, String> {
     let es_path = find_es_exe().ok_or_else(|| {
-        "es.exe not found. Install Everything (voidtools) or set EVERYTING_ES_PATH env var.".to_string()
+        "es.exe not found. Set the EVERYTHING_ES_PATH env var to point to es.exe from voidtools Everything.".to_string()
     })?;
 
     let mut args = vec!["-csv".to_string(), "-size".to_string(), "-date-modified".to_string()];

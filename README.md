@@ -27,14 +27,13 @@ The binary will be at `target/release/advent-999-search-mcp.exe`.
 
 ### Everything Setup (Local Search)
 
-For local file search, you need Everything installed on Windows.
+Local file search uses Everything's command-line tool `es.exe`. To enable it:
 
-1. **Install Everything** — an installer is bundled in `vendor/`:
-   - Run `vendor/Everything-1.5.0.1418b.x64-Setup.exe`
-   - Or download from [voidtools.com](https://www.voidtools.com/)
-2. **ES.exe** is also bundled in `vendor/es.exe` — the MCP will find it automatically.
+1. Install [Everything](https://www.voidtools.com/) by voidtools
+2. Download `es.exe` from the [ES releases page](https://github.com/voidtools/ES/releases)
+3. Set the `EVERYTHING_ES_PATH` environment variable to the path of `es.exe`
 
-Alternatively, set the `EVERYTHING_ES_PATH` environment variable to point to your `es.exe`.
+If this env var is not set, the `local` tool will not be available.
 
 ## MCP Configuration
 
