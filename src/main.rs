@@ -253,18 +253,27 @@ fn list_tools(config: &Config) -> Vec<Value> {
 
     let fetch_tool = serde_json::json!({
         "name": "get_page",
-        "description": "Fetch the content of a web page and extract its readable text. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). For academic papers: search first with web (engines: dblp, cnki, exa), then use this tool to read the full text. Uses proxy if configured. Returns the page title and extracted content as markdown.",
+        "description": "Fetch the content of a web page and extract its readable text. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). For academic papers: search first with web (engines: dblp, cnki, exa), then use this tool to read the full text. To read long content in chunks, pass startChar/endChar (0-based character offsets; the response includes totalLength so you can continue with startChar=endChar of the previous call). Uses proxy if configured. Returns the page title and extracted content as markdown.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "URL to fetch"
+                    "description": "URL to fetch, or an arXiv paper ID"
                 },
                 "maxLength": {
                     "type": "number",
                     "description": "Maximum characters to return (default: 50000, max: 200000)",
                     "default": 50000
+                },
+                "startChar": {
+                    "type": "number",
+                    "description": "Start reading from this character offset (0-based, default 0)",
+                    "default": 0
+                },
+                "endChar": {
+                    "type": "number",
+                    "description": "Read up to this character offset (exclusive). Defaults to startChar + maxLength"
                 }
             },
             "required": ["url"]
@@ -425,16 +434,42 @@ async fn handle_fetch(args: &Value, config: &Config) -> String {
     let max_length = args["maxLength"].as_f64().unwrap_or(50000.0) as usize;
     let max_length = std::cmp::min(max_length, 200000);
 
+    // Optional character-range reading (0-based, half-open [start, end)).
+    let start_char = args["startChar"].as_f64().unwrap_or(0.0) as usize;
+    let end_char = args["endChar"].as_f64().map(|v| v as usize);
+
     eprintln!("🌐 Fetching URL: {}", url);
 
     match fetch::fetch_url(&url, config).await {
         Ok(result) => {
-            let mut content = result.content;
+            let full = result.content;
+            let total = full.chars().count();
 
-            // Truncate if too long
-            if content.len() > max_length {
-                content = content.chars().take(max_length).collect::<String>()
-                    + &format!("\n\n... [内容过长，已截断至 {} 字符，原始长度 {} 字符]", max_length, content.len());
+            // Compute the slice window.
+            let start = std::cmp::min(start_char, total);
+            let end = match end_char {
+                Some(e) => std::cmp::min(e, total),
+                None => std::cmp::min(start + max_length, total),
+            };
+            let window_len = end.saturating_sub(start);
+            let window_len = std::cmp::min(window_len, max_length);
+
+            let mut content: String = full.chars().skip(start).take(window_len).collect();
+
+            // Truncate if the window itself exceeds max_length (defensive).
+            let chars_len = content.chars().count();
+            if chars_len > max_length {
+                content = content.chars().take(max_length).collect::<String>();
+            }
+
+            // Note when we are not at the end of the document.
+            let actual_end = start + content.chars().count();
+            let truncated = actual_end < total;
+            if truncated {
+                content.push_str(&format!(
+                    "\n\n... [内容较长，已读取第 {}–{} 字符，共 {} 字符。继续读取请调用 get_page 并传 startChar={}]\n",
+                    start, actual_end, total, actual_end
+                ));
             }
 
             let response = serde_json::json!({
@@ -443,6 +478,9 @@ async fn handle_fetch(args: &Value, config: &Config) -> String {
                 "site": result.site_name,
                 "content": content,
                 "contentType": result.content_type,
+                "startChar": start,
+                "endChar": actual_end,
+                "totalLength": total,
             });
 
             serde_json::to_string_pretty(&response).unwrap_or_default()
