@@ -65,6 +65,11 @@ Everything 1.5 的内容索引若不加以限制，可能占用**数 GB 内存**
 PROXY_URL=http://127.0.0.1:7890
 USE_PROXY=true
 
+# （可选）必须绕过代理直连的域名
+# 默认包含大陆站点（sogou、weixin、baidu 等），这些站点会拦截代理/机房 IP 并弹验证码。
+# 大陆用户无需设置；海外用户建议设为 none 让所有请求走代理，或自定义列表：
+DIRECT_DOMAINS=sogou,weixin,baidu
+
 # （可选）Exa API 密钥，每月免费 $10
 # 申请地址：https://dashboard.exa.ai/api-keys
 EXA_API_KEY=你的密钥
@@ -131,7 +136,10 @@ EVERYTHING_ES_PATH=C:\path\to\es.exe
 |----------|:---:|---------|------|
 | `PROXY_URL` | 否 | — | 代理地址（如 `http://127.0.0.1:7890`） |
 | `USE_PROXY` | 否 | `true` | 是否启用代理 |
+| `DIRECT_DOMAINS` | 否 | *大陆列表* | 绕过代理直连的域名。默认：`sogou,weixin,baidu,bilibili,zhihu,csdn,juejin,xiaohongshu`。设为 `none` 则全部走代理 |
 | `EXA_API_KEY` | 否 | — | Exa API 密钥，[点此申请](https://dashboard.exa.ai/api-keys) |
+| `IEEE_API_KEY` | 否 | — | IEEE Xplore API 密钥（[developer.ieee.org](https://developer.ieee.org)），设置后启用 `ieee` 引擎 |
+| `SEMANTIC_SCHOLAR_API_KEY` | 否 | — | Semantic Scholar API 密钥（[semanticscholar.org/product/api](https://www.semanticscholar.org/product/api)），设置后启用 `semantic_scholar` 引擎 |
 | `FETCH_COOKIES` | 否 | — | 浏览器 Cookie。格式：`key=value; key2=value2` |
 | `EVERYTHING_ES_PATH` | 否 | — | ES.exe 路径（必须设置才能启用本地搜索） |
 | `DEFAULT_SEARCH_ENGINE` | 否 | `exa` | 默认搜索引擎 |
@@ -151,7 +159,15 @@ engines    (string[])           — 使用的搜索引擎
 searchMode (string)             — "request" | "auto" | "playwright"
 ```
 
-支持的搜索引擎：Exa（默认）、Bing、CSDN、掘金、Startpage、搜狗。
+支持的搜索引擎（9 个，均已实测）：Exa（默认）、Bing、CSDN、掘金、Startpage、搜狗、微信（公众号文章）、DBLP（计算机文献）、知网。
+
+规划中的引擎（已实现但暂未暴露，等待 API 密钥）：
+- **`ieee`** — IEEE Xplore 论文（需 [developer.ieee.org](https://developer.ieee.org) 申请的 `IEEE_API_KEY`，审核需数个工作日）
+- **`semantic_scholar`** — 带引用数的论文搜索（需 [semanticscholar.org/product/api](https://www.semanticscholar.org/product/api) 的 `SEMANTIC_SCHOLAR_API_KEY`，注册后邮件发送）
+
+通过环境变量设置密钥后，引擎会自动出现在 `tools/list` 中；未设置密钥时保持隐藏。
+
+说明：`cnki`（知网）无需 Cookie 或密钥，直接使用公开的 scholar.cnki.net REST API。
 
 ### `local` — 本地文件搜索
 
@@ -170,7 +186,7 @@ foldersOnly   (boolean)        — 仅文件夹
 ### `get_page` — 网页抓取
 
 ```
-url       (string, 必填)       — 要抓取的 URL
+url       (string, 必填)       — 要抓取的 URL，或 arXiv 论文号
 maxLength (number, 最大 200000) — 最大内容长度
 ```
 
@@ -178,6 +194,9 @@ maxLength (number, 最大 200000) — 最大内容长度
 - **知乎** → 签名 API（需在 `FETCH_COOKIES` 中提供 `d_c0`）
 - **CSDN** → 直接 HTML 提取
 - **Discourse** 论坛 → JSON API
+- **微信公众号**（`mp.weixin.qq.com`）→ 微信 UA 直抓
+- **搜狗微信跳转**（`weixin.sogou.com/link?url=...`）→ JS 拼接 URL 解析 + 抓取
+- **arXiv 论文** → 接受论文号（`2401.12345`、`arXiv:2401.12345` 或 `arxiv.org/abs/...` 链接），返回论文 HTML 内容（优先官方 `arxiv.org/html/` 转换版，老论文自动降级到 ar5iv）
 - **JS 密集型站点** → 自动降级到 Jina Reader
 - **普通站点** → 直接 HTTP + HTML 转 Markdown
 

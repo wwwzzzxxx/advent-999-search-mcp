@@ -22,7 +22,7 @@ async fn main() {
     let engine_map = create_engine_map(&config);
 
     if config.allowed_search_engines.is_empty() {
-        eprintln!("🔍 No engine restrictions, all 6 engines available");
+        eprintln!("🔍 No engine restrictions, all {} engines available", engine_map.len());
     } else {
         eprintln!("🔍 Allowed engines: {}", config.allowed_search_engines.join(", "));
     }
@@ -30,6 +30,11 @@ async fn main() {
     if config.use_proxy {
         if let Some(ref url) = config.proxy_url {
             eprintln!("🌐 Using proxy: {}", url);
+        }
+        if config.direct_domains.is_empty() {
+            eprintln!("🔓 DIRECT_DOMAINS=none: all requests go through the proxy");
+        } else {
+            eprintln!("🔓 Direct (no proxy) for: {}", config.direct_domains.join(", "));
         }
     }
 
@@ -70,7 +75,7 @@ async fn main() {
                         },
                         "serverInfo": {
                             "name": "advent-999-search-mcp",
-                            "version": "0.1.0"
+                            "version": "0.2.0"
                         }
                     }
                 });
@@ -133,28 +138,44 @@ fn write_response(resp: &Value) {
 }
 
 fn list_tools(config: &Config) -> Vec<Value> {
-    // Build web search tool
+    // All engines that are actually available right now (free ones + any
+    // enabled by env credentials). Keeps the tools/list schema honest.
+    let engine_map = create_engine_map(config);
+    let mut engine_names: Vec<String> = engine_map.iter().map(|e| e.name().to_string()).collect();
+    engine_names.sort();
+
+    // If ALLOWED_SEARCH_ENGINES restricts the list, respect that for the description
     let engines_desc = if config.allowed_search_engines.is_empty() {
-        "Exa, Bing, CSDN, Juejin(掘金), Startpage, Sogou(搜狗)".to_string()
+        let labeled: Vec<String> = engine_names.iter().map(|e| match e.as_str() {
+            "juejin" => "Juejin(掘金)".to_string(),
+            "startpage" => "Startpage".to_string(),
+            "sogou" => "Sogou(搜狗)".to_string(),
+            "weixin" => "Weixin(微信公众号)".to_string(),
+            "dblp" => "DBLP(计算机文献)".to_string(),
+            "semantic_scholar" => "Semantic Scholar".to_string(),
+            "ieee" => "IEEE Xplore".to_string(),
+            "cnki" => "CNKI(知网)".to_string(),
+            _ => e.chars().next().map(|c| c.to_uppercase().to_string() + &e[1..]).unwrap_or_default(),
+        }).collect();
+        labeled.join(", ")
     } else {
         config.allowed_search_engines.iter()
             .map(|e| match e.as_str() {
                 "juejin" => "Juejin(掘金)".to_string(),
                 "startpage" => "Startpage".to_string(),
                 "sogou" => "Sogou(搜狗)".to_string(),
+                "weixin" => "Weixin(微信公众号)".to_string(),
+                "dblp" => "DBLP(计算机文献)".to_string(),
+                "semantic_scholar" => "Semantic Scholar".to_string(),
+                "ieee" => "IEEE Xplore".to_string(),
+                "cnki" => "CNKI(知网)".to_string(),
                 _ => e.chars().next().map(|c| c.to_uppercase().to_string() + &e[1..]).unwrap_or_default(),
             })
             .collect::<Vec<_>>()
             .join(", ")
     };
 
-    let mut allowed = config.allowed_search_engines.clone();
-    if allowed.is_empty() {
-        allowed = vec![
-            "exa".to_string(), "bing".to_string(), "csdn".to_string(),
-            "juejin".to_string(), "startpage".to_string(), "sogou".to_string(),
-        ];
-    }
+    let allowed = engine_names;
 
     let engine_schema = serde_json::json!({
         "type": "string",
@@ -232,7 +253,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
 
     let fetch_tool = serde_json::json!({
         "name": "get_page",
-        "description": "Fetch the content of a web page and extract its readable text. Supports Chinese websites like Zhihu, CSDN, Juejin, Bilibili, etc. Uses proxy if configured. Returns the page title and extracted content as markdown.",
+        "description": "Fetch the content of a web page and extract its readable text. Supports Chinese websites like Zhihu, CSDN, Juejin, Bilibili, WeChat articles (mp.weixin.qq.com), etc. Also accepts an arXiv paper ID (e.g. 2401.12345, arXiv:2401.12345, or an arxiv.org/abs/... URL) and returns the paper's HTML content. Uses proxy if configured. Returns the page title and extracted content as markdown.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -14,6 +14,25 @@ pub mod csdn;
 pub mod juejin;
 pub mod startpage;
 pub mod sogou;
+pub mod weixin;
+pub mod dblp;
+pub mod semantic_scholar;
+pub mod ieee;
+pub mod cnki;
+
+/// Engines that require an API key / cookie from the environment.
+/// They are only added to the engine map when the credential is present;
+/// otherwise they are disabled entirely (not listed, not callable).
+fn credential_gated_engines(config: &Config) -> Vec<Box<dyn SearchEngine>> {
+    let mut engines: Vec<Box<dyn SearchEngine>> = Vec::new();
+    if config.has_semantic_scholar_key() {
+        engines.push(Box::new(semantic_scholar::SemanticScholarEngine));
+    }
+    if config.has_ieee_key() {
+        engines.push(Box::new(ieee::IeeeEngine));
+    }
+    engines
+}
 
 pub fn create_engine_map(config: &Config) -> Vec<Box<dyn SearchEngine>> {
     let engines: Vec<Box<dyn SearchEngine>> = vec![
@@ -23,10 +42,14 @@ pub fn create_engine_map(config: &Config) -> Vec<Box<dyn SearchEngine>> {
         Box::new(juejin::JuejinEngine),
         Box::new(startpage::StartpageEngine),
         Box::new(sogou::SogouEngine),
+        Box::new(weixin::WeixinEngine),
+        Box::new(dblp::DblpEngine),
+        Box::new(cnki::CnkiEngine),
     ];
 
     engines
         .into_iter()
+        .chain(credential_gated_engines(config))
         .filter(|e| config.is_engine_allowed(e.name()))
         .collect()
 }

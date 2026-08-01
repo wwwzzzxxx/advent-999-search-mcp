@@ -64,6 +64,11 @@ pub fn normalize_engine(engine: &str) -> String {
         "juejin" => "juejin".to_string(),
         "startpage" => "startpage".to_string(),
         "sogou" | "sougou" | "搜狗" => "sogou".to_string(),
+        "weixin" | "wechat" | "微信" | "公众号" => "weixin".to_string(),
+        "dblp" => "dblp".to_string(),
+        "semantic_scholar" | "semanticscholar" | "s2" => "semantic_scholar".to_string(),
+        "ieee" | "ieeexplore" => "ieee".to_string(),
+        "cnki" | "知网" => "cnki".to_string(),
         _ => cleaned,
     }
 }

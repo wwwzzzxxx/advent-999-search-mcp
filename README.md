@@ -67,6 +67,12 @@ Set these in your OS user environment (or pass them via MCP config `env`):
 PROXY_URL=http://127.0.0.1:7890
 USE_PROXY=true
 
+# Optional — domains that must bypass the proxy (direct connection)
+# Defaults to mainland-China domains (sogou, weixin, baidu, ...) which block
+# proxy/datacenter IPs with captchas. Set to `none` to proxy everything
+# (recommended for users outside mainland China), or provide a custom list:
+DIRECT_DOMAINS=sogou,weixin,baidu
+
 # Optional — Exa API key (free $10/month at https://dashboard.exa.ai/api-keys)
 EXA_API_KEY=your_key_here
 
@@ -132,7 +138,10 @@ Edit `opencode.json`:
 |----------|:--------:|---------|-------------|
 | `PROXY_URL` | No | — | Proxy address (e.g. `http://127.0.0.1:7890`) |
 | `USE_PROXY` | No | `true` | Enable/disable proxy |
+| `DIRECT_DOMAINS` | No | *mainland list* | Domains that bypass the proxy (direct). Default: `sogou,weixin,baidu,bilibili,zhihu,csdn,juejin,xiaohongshu`. Set `none` to proxy everything |
 | `EXA_API_KEY` | No | — | Exa API key — get one [here](https://dashboard.exa.ai/api-keys) |
+| `IEEE_API_KEY` | No | — | IEEE Xplore API key ([developer.ieee.org](https://developer.ieee.org)) — enables the `ieee` engine |
+| `SEMANTIC_SCHOLAR_API_KEY` | No | — | Semantic Scholar API key ([semanticscholar.org/product/api](https://www.semanticscholar.org/product/api)) — enables the `semantic_scholar` engine |
 | `FETCH_COOKIES` | No | — | Browser cookies for authenticated pages. Format: `key=value; key2=value2` |
 | `EVERYTHING_ES_PATH` | No | — | Path to ES.exe (required to enable local search) |
 | `DEFAULT_SEARCH_ENGINE` | No | `exa` | Default search engine |
@@ -152,7 +161,15 @@ engines    (string[])           — Which engine(s) to use
 searchMode (string)             — "request" | "auto" | "playwright"
 ```
 
-Supported engines: Exa (default), Bing, CSDN, Juejin, Startpage, Sogou.
+Supported engines (9, all tested): Exa (default), Bing, CSDN, Juejin, Startpage, Sogou, Weixin (WeChat articles), DBLP (CS bibliography), CNKI (知网).
+
+Planned engines (implemented but NOT exposed yet — awaiting API keys):
+- **`ieee`** — IEEE Xplore papers (needs `IEEE_API_KEY` from [developer.ieee.org](https://developer.ieee.org); approval takes a few business days)
+- **`semantic_scholar`** — papers with citation counts (needs `SEMANTIC_SCHOLAR_API_KEY` from [semanticscholar.org/product/api](https://www.semanticscholar.org/product/api); key is delivered by email)
+
+When the key is set via the env var, the engine is automatically listed in `tools/list`; without the key it stays hidden.
+
+Note: `cnki` needs no cookie or key — it uses the public scholar.cnki.net REST API.
 
 ### `local` — Local File Search
 
@@ -171,7 +188,7 @@ foldersOnly   (boolean)          — Folders only
 ### `get_page` — Fetch Web Page
 
 ```
-url       (string, required)    — URL to fetch
+url       (string, required)    — URL to fetch, or an arXiv paper ID
 maxLength (number, max 200000)  — Max content length
 ```
 
@@ -179,6 +196,9 @@ Smart fetching strategy:
 - **Zhihu** → signed API (requires `d_c0` in `FETCH_COOKIES`)
 - **CSDN** → direct HTML extraction
 - **Discourse** forums → JSON API
+- **WeChat articles** (`mp.weixin.qq.com`) → MicroMessenger UA direct fetch
+- **Sogou WeChat links** (`weixin.sogou.com/link?url=...`) → JS-URL resolution + fetch
+- **arXiv papers** → accepts a paper ID (`2401.12345`, `arXiv:2401.12345`, or an `arxiv.org/abs/...` URL) and returns the paper's HTML content (official `arxiv.org/html/` conversion, falling back to ar5iv for older papers)
 - **JS-heavy sites** → Jina Reader fallback
 - **Normal sites** → direct HTTP with HTML-to-Markdown
 

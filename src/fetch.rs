@@ -313,7 +313,6 @@ const JINA_TIMEOUT_SECS: u64 = 12;
 const JINA_PREFERRED_DOMAINS: &[&str] = &[
     "developer.aliyun.com",
     "cloud.tencent.com",
-    "mp.weixin.qq.com",
     "juejin.cn",
     "zhuanlan.zhihu.com",
     // SPA / JS-rendered documentation sites
@@ -365,6 +364,22 @@ pub struct FetchResult {
 /// 5. If direct fetch fails (403/empty/timeout), fallback to Jina Reader.
 /// 6. If domain is blocked, return error immediately.
 pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchError> {
+    // ── arXiv paper ID / abs URL → official HTML version ──
+    // Must run BEFORE URL parsing: a bare ID like "2401.12345" is not a
+    // valid URL. Accepts: bare IDs, "arXiv:xxxx", arxiv.org/abs/... URLs.
+    if let Some(arxiv_id) = extract_arxiv_id(url) {
+        return match fetch_arxiv_html(&arxiv_id, config).await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                // Last resort: Jina Reader on the abs page.
+                match fetch_via_jina(&format!("https://arxiv.org/abs/{}", arxiv_id), config).await {
+                    Ok(r) => Ok(r),
+                    Err(_) => Err(e),
+                }
+            }
+        };
+    }
+
     let parsed = url::Url::parse(url).map_err(|e| FetchError::InvalidUrl(e.to_string()))?;
     let host = parsed.host_str().unwrap_or("");
 
@@ -408,6 +423,36 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
         }
     }
 
+    // ── WeChat official account article (mp.weixin.qq.com) → WeChat UA direct ──
+    // WeChat serves full article HTML only to MicroMessenger UAs; a normal browser
+    // UA gets an "环境异常" block page. Jina Reader is kept as final fallback.
+    if host.contains("mp.weixin.qq.com") {
+        return match fetch_weixin_article(url, config).await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                match fetch_via_jina(url, config).await {
+                    Ok(r) => Ok(r),
+                    Err(_) => Err(e),
+                }
+            }
+        };
+    }
+
+    // ── Sogou WeChat search redirect (weixin.sogou.com/link?url=...) → resolve + fetch ──
+    // The /link page returns a JS snippet that concatenates the real article URL;
+    // resolving it requires the SNUID cookie issued by weixin.sogou.com.
+    if host.contains("weixin.sogou.com") {
+        return match fetch_sogou_weixin_link(url, config).await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                match fetch_via_jina(url, config).await {
+                    Ok(r) => Ok(r),
+                    Err(_) => Err(e),
+                }
+            }
+        };
+    }
+
     // Determine strategy: Jina-first or direct-first
     // Check JINA_PREFERRED first (more specific match) before BLOCKED
     let prefer_jina = JINA_PREFERRED_DOMAINS.iter().any(|d| host.contains(d));
@@ -443,6 +488,193 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
             }
         }
     }
+}
+
+// ─── arXiv Paper Fetcher ───
+//
+// get_page accepts an arXiv paper ID (bare, "arXiv:"-prefixed, or an
+// arxiv.org/abs/... URL) and returns the paper's HTML content:
+// 1. Official HTML5 conversion at arxiv.org/html/ (Dec 2023+ papers).
+// 2. Fallback to ar5iv.labs.arxiv.org/html/ (renders older LaTeX sources).
+
+/// Try to extract an arXiv paper ID from user input.
+///
+/// Accepts:
+/// - bare IDs: `2401.12345`, `2401.12345v2`
+/// - prefixed: `arXiv:2401.12345`
+/// - URLs: `https://arxiv.org/abs/2401.12345`, `.../html/2401.12345v2`
+/// - old-style IDs: `math/0501001v2`
+fn extract_arxiv_id(input: &str) -> Option<String> {
+    let t = input.trim();
+
+    // URL forms (strip query/hash fragments)
+    for prefix in [
+        "https://arxiv.org/abs/", "http://arxiv.org/abs/",
+        "https://arxiv.org/html/", "http://arxiv.org/html/",
+    ] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let id = rest.split(['?', '#']).next().unwrap_or("").trim();
+            return is_valid_arxiv_id(id).then(|| id.to_string());
+        }
+    }
+
+    // "arXiv:" / "arxiv:" prefix
+    if let Some(rest) = t.strip_prefix("arXiv:").or_else(|| t.strip_prefix("arxiv:")) {
+        let id = rest.trim();
+        return is_valid_arxiv_id(id).then(|| id.to_string());
+    }
+
+    // Bare ID — must not look like a URL
+    if !t.contains("://") && is_valid_arxiv_id(t) {
+        return Some(t.to_string());
+    }
+
+    None
+}
+
+/// Validate an arXiv paper ID.
+///
+/// New style: `2401.12345(vN)` — 4 digits, dot, 4-5 digits, optional version.
+/// Old style: `math/0501001(vN)` — category, slash, 7 digits, optional version.
+fn is_valid_arxiv_id(s: &str) -> bool {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+
+    // New style: YYMM.NNNNN
+    if s.len() >= 9 && bytes[4] == b'.' {
+        let prefix = &s[..4];
+        let rest = &s[5..];
+        let (num, ver) = match rest.split_once('v') {
+            Some((n, v)) => (n, Some(v)),
+            None => (rest, None),
+        };
+        let digits_ok = |x: &str| !x.is_empty() && x.len() <= 5 && x.bytes().all(|b| b.is_ascii_digit());
+        let ver_ok = |v: Option<&str>| v.map_or(true, |x| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()));
+        if prefix.bytes().all(|b| b.is_ascii_digit()) && digits_ok(num) && ver_ok(ver) {
+            return true;
+        }
+    }
+
+    // Old style: category/1234567 (e.g. math/0501001, cs.CL/0501001v2)
+    if let Some((cat, num)) = s.split_once('/') {
+        let (num, ver) = match num.split_once('v') {
+            Some((n, v)) => (n, Some(v)),
+            None => (num, None),
+        };
+        let cat_ok = !cat.is_empty()
+            && cat.len() <= 20
+            && cat.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+        let num_ok = num.len() == 7 && num.bytes().all(|b| b.is_ascii_digit());
+        let ver_ok = |v: Option<&str>| v.map_or(true, |x| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()));
+        if cat_ok && num_ok && ver_ok(ver) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Fetch an arXiv paper's HTML version by its ID.
+///
+/// Tries the official HTML conversion first (arxiv.org/html/, redirects to the
+/// latest version when no version is given), then falls back to ar5iv which
+/// renders older papers without an official HTML version.
+async fn fetch_arxiv_html(id: &str, config: &Config) -> Result<FetchResult, FetchError> {
+    let domain = "arxiv.org".to_string();
+    let client = build_fetch_client(config, &domain)?;
+    let headers = build_headers(&domain);
+
+    // 1. Official HTML version
+    let official_url = format!("https://arxiv.org/html/{}", id);
+    match fetch_arxiv_page(&client, &official_url, &headers, &domain).await {
+        Ok(r) => return Ok(r),
+        Err(e) => {
+            eprintln!("⚠️ arXiv HTML unavailable for {} ({}), trying ar5iv...", id, e);
+        }
+    }
+
+    // 2. ar5iv fallback (older papers)
+    let ar5iv_url = format!("https://ar5iv.labs.arxiv.org/html/{}", id);
+    match fetch_arxiv_page(&client, &ar5iv_url, &headers, &domain).await {
+        Ok(r) => return Ok(r),
+        Err(e) => {
+            return Err(FetchError::Http(format!(
+                "Failed to fetch arXiv paper {} via arxiv.org/html or ar5iv: {}", id, e
+            )));
+        }
+    }
+}
+
+/// Fetch and extract a single arXiv HTML page.
+async fn fetch_arxiv_page(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &reqwest::header::HeaderMap,
+    domain: &str,
+) -> Result<FetchResult, FetchError> {
+    let resp = client.get(url)
+        .headers(headers.clone())
+        .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() { FetchError::Timeout }
+            else if e.is_connect() { FetchError::Network(format!("Connection failed: {}", e)) }
+            else { FetchError::Http(format!("arXiv request failed: {}", e)) }
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(FetchError::HttpStatus(status.as_u16(), status.as_str().to_string()));
+    }
+
+    let final_url = resp.url().to_string();
+    let content_type = resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let bytes = resp.bytes().await
+        .map_err(|e| FetchError::Http(format!("Failed to read arXiv body: {}", e)))?;
+
+    let html = decode_html(&bytes, &content_type);
+    let title = extract_title(&html);
+    let content = extract_arxiv_content(&html);
+
+    if content.trim().len() < MIN_CONTENT_LEN {
+        return Err(FetchError::EmptyContent);
+    }
+
+    let content = post_process_content(&content, domain);
+
+    Ok(FetchResult {
+        url: final_url,
+        title,
+        content,
+        content_type,
+        site_name: "arXiv".to_string(),
+        via: "direct".into(),
+    })
+}
+
+/// Extract paper content from arXiv/ar5iv HTML.
+///
+/// Both wrap the paper in `<main id="content">` (arXiv) or `#content` (ar5iv).
+/// Falls back to the generic extractor if the container is not found.
+fn extract_arxiv_content(html: &str) -> String {
+    let doc = Html::parse_document(html);
+    for sel_str in ["main#content", "#content", "main", "article"] {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            if let Some(el) = doc.select(&sel).next() {
+                let md = element_to_markdown(&el);
+                if md.trim().len() >= MIN_CONTENT_LEN {
+                    return md;
+                }
+            }
+        }
+    }
+    extract_general_content(&doc)
 }
 
 // ─── Discourse API Fetcher ───
@@ -936,6 +1168,307 @@ async fn fetch_direct(url: &str, config: &Config) -> Result<FetchResult, FetchEr
     Ok(FetchResult { url: url.to_string(), title, content, content_type, site_name, via: "direct".into() })
 }
 
+// ─── WeChat Official Account (mp.weixin.qq.com) Fetcher ───
+//
+// WeChat gates article pages behind UA sniffing: only UAs containing
+// `MicroMessenger` receive the full article HTML; a normal browser UA gets
+// an "环境异常" block page. No cookies or tokens are required.
+
+/// Fetch a WeChat official account article (mp.weixin.qq.com).
+///
+/// Requires a MicroMessenger UA (see build_user_agent). The final redirected
+/// URL (nwr_flag=1#wechat_redirect) is reported back in the result.
+async fn fetch_weixin_article(url: &str, config: &Config) -> Result<FetchResult, FetchError> {
+    let domain = "mp.weixin.qq.com".to_string();
+
+    let client = build_fetch_client(config, &domain)?;
+
+    let resp = client.get(url)
+        .headers(build_headers(&domain))
+        .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() { FetchError::Timeout }
+            else if e.is_connect() { FetchError::Network(format!("Connection failed: {}", e)) }
+            else { FetchError::Http(format!("WeChat request failed: {}", e)) }
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(FetchError::HttpStatus(status.as_u16(), status.as_str().to_string()));
+    }
+
+    let content_type = resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let final_url = resp.url().to_string();
+    let bytes = resp.bytes().await
+        .map_err(|e| FetchError::Http(format!("Failed to read WeChat body: {}", e)))?;
+
+    let html = decode_html(&bytes, &content_type);
+
+    // WeChat anti-bot block page ("环境异常，完成验证后即可继续访问")
+    if html.contains("环境异常") || html.contains("完成验证") {
+        return Err(FetchError::Blocked(
+            "WeChat returned an environment verification page; too many requests from this IP, retry later".to_string(),
+        ));
+    }
+
+    // Deleted articles return a bare page frame without js_content.
+    let title = match extract_weixin_title(&html) {
+        Some(t) => t,
+        None => extract_title(&html),
+    };
+
+    let account = extract_weixin_account(&html);
+    let site_name = if account.is_empty() {
+        "微信公众号".to_string()
+    } else {
+        account
+    };
+
+    let content = extract_weixin_content(&html);
+
+    if content.trim().len() < MIN_CONTENT_LEN {
+        return Err(FetchError::EmptyContent);
+    }
+
+    let content = post_process_content(&content, &domain);
+
+    Ok(FetchResult {
+        url: final_url,
+        title,
+        content,
+        content_type,
+        site_name,
+        via: "direct".into(),
+    })
+}
+
+/// Resolve a Sogou WeChat search redirect link and fetch the underlying article.
+///
+/// The /link page returns 200 with a JS snippet that concatenates the real
+/// mp.weixin.qq.com URL piece by piece (`url += '...'`). It requires the SNUID
+/// cookie issued by weixin.sogou.com — we warm up the cookie jar with a search
+/// page hit first, and retry once if we still land on the antispider page.
+async fn fetch_sogou_weixin_link(url: &str, config: &Config) -> Result<FetchResult, FetchError> {
+    let domain = "weixin.sogou.com".to_string();
+
+    let client = build_fetch_client(config, &domain)?;
+    let headers = build_headers(&domain);
+
+    // 1. Warm up: fetch the search page once so weixin.sogou.com issues SNUID.
+    //    The cookie_store keeps it for the /link request below.
+    let warm = client.get("https://weixin.sogou.com/weixin?type=2&query=test")
+        .headers(headers.clone())
+        .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS))
+        .send()
+        .await;
+    let _ = warm; // best-effort, failure is fine
+
+    // 2. Fetch the /link redirect page.
+    let resp = client.get(url)
+        .headers(headers.clone())
+        .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() { FetchError::Timeout }
+            else if e.is_connect() { FetchError::Network(format!("Connection failed: {}", e)) }
+            else { FetchError::Http(format!("Sogou /link request failed: {}", e)) }
+        })?;
+
+    let final_url = resp.url().to_string();
+    let status = resp.status();
+    let bytes = resp.bytes().await
+        .map_err(|e| FetchError::Http(format!("Failed to read Sogou /link body: {}", e)))?;
+    let html = String::from_utf8_lossy(&bytes).to_string();
+
+    // 3. Landed on the antispider page? Refresh the cookie once and retry.
+    if !status.is_success() || is_sogou_antispider(&final_url, &html) {
+        let _ = client.get("https://weixin.sogou.com/weixin?type=2&query=test")
+            .headers(headers.clone())
+            .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS))
+            .send()
+            .await;
+
+        let resp = client.get(url)
+            .headers(headers.clone())
+            .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS))
+            .send()
+            .await
+            .map_err(|e| FetchError::Http(format!("Sogou /link retry failed: {}", e)))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(FetchError::HttpStatus(status.as_u16(), status.as_str().to_string()));
+        }
+        let retry_url = resp.url().to_string();
+        let bytes = resp.bytes().await
+            .map_err(|e| FetchError::Http(format!("Failed to read Sogou /link retry body: {}", e)))?;
+        let html = String::from_utf8_lossy(&bytes).to_string();
+        if is_sogou_antispider(&retry_url, &html) {
+            return Err(FetchError::Blocked(
+                "Sogou WeChat /link requires a captcha; too many requests from this IP, retry later".to_string(),
+            ));
+        }
+    }
+
+    // 4. Extract the real mp.weixin.qq.com URL from the JS concatenation.
+    let real_url = extract_js_concatenated_url(&html).ok_or_else(|| {
+        FetchError::Parse("Failed to extract real URL from Sogou /link page".to_string())
+    })?;
+
+    // 5. Fetch the article with a WeChat UA. The signature URL is time-limited,
+    //    so fetch immediately.
+    fetch_weixin_article(&real_url, config).await
+}
+
+/// Detect the Sogou antispider page (by final URL or page markers).
+fn is_sogou_antispider(final_url: &str, html: &str) -> bool {
+    final_url.contains("antispider")
+        || {
+            let lower = html.to_lowercase();
+            lower.contains("antispider")
+                || lower.contains("seccoderight")
+                || lower.contains("anti.min.css")
+                || lower.contains("验证码")
+        }
+}
+
+/// Extract the real URL from the Sogou /link JS snippet:
+///
+/// ```html
+/// <script>
+///   var url = '';
+///   url += 'https://mp.';
+///   url += 'weixin.qq.c';
+///   url += 'om/s?src=11';
+///   url += '&timestamp=';
+///   url += '1785584251&';
+///   ...
+///   url.replace("@", "");
+///   window.location.replace(url)
+/// </script>
+/// ```
+///
+/// Collects ALL consecutive `url += '...'` fragments (the signature/timestamp
+/// params come AFTER the domain, so stopping at the domain match would drop
+/// them), then removes the `@` placeholder characters.
+fn extract_js_concatenated_url(html: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = html;
+
+    loop {
+        // Find the earliest "url +=" / "url+=" occurrence.
+        let (idx, op_len) = match (rest.find("url +="), rest.find("url+=")) {
+            (Some(a), Some(b)) => if a <= b { (a, 6) } else { (b, 5) },
+            (Some(a), None) => (a, 6),
+            (None, Some(b)) => (b, 5),
+            (None, None) => break,
+        };
+
+        // The value must be a quoted string literal directly after the operator.
+        let after = rest[idx + op_len..].trim_start();
+        let stripped = match after.strip_prefix('\'') {
+            Some(s) => s,
+            None => match after.strip_prefix('"') {
+                Some(s) => s,
+                None => break, // not a string concatenation — end of block
+            },
+        };
+
+        let end = match stripped.find(['\'', '"']) {
+            Some(e) => e,
+            None => break,
+        };
+        let frag = &stripped[..end];
+
+        // While empty, only start collecting at an http fragment; afterwards
+        // keep everything (params follow the domain).
+        if out.is_empty() {
+            if frag.starts_with("http://") || frag.starts_with("https://") {
+                out.push_str(frag);
+            }
+        } else {
+            out.push_str(frag);
+        }
+
+        rest = &stripped[end + 1..];
+    }
+
+    let out = out.replace('@', "").trim().to_string();
+    if (out.starts_with("http://") || out.starts_with("https://"))
+        && out.contains("mp.weixin.qq.com")
+    {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Extract article title from `var msg_title = '...'` (single or double quotes).
+fn extract_weixin_title(html: &str) -> Option<String> {
+    const MARKERS: [&str; 4] = [
+        "var msg_title = '",
+        "var msg_title = \"",
+        "var msg_title='",
+        "var msg_title=\"",
+    ];
+    for m in MARKERS {
+        if let Some(idx) = html.find(m) {
+            let rest = &html[idx + m.len()..];
+            let end = rest.find('\'').or_else(|| rest.find('"'))?;
+            let t = rest[..end].trim();
+            if !t.is_empty() { return Some(t.to_string()); }
+        }
+    }
+    None
+}
+
+/// Extract WeChat account name from `id="js_name"` (fallback: `var nickname = '...'`).
+fn extract_weixin_account(html: &str) -> String {
+    let doc = Html::parse_document(html);
+    if let Ok(sel) = Selector::parse("#js_name") {
+        if let Some(el) = doc.select(&sel).next() {
+            let t = el.text().collect::<String>();
+            let t = t.trim();
+            if !t.is_empty() { return t.to_string(); }
+        }
+    }
+    const MARKERS: [&str; 4] = [
+        "var nickname = '",
+        "var nickname = \"",
+        "var nickname='",
+        "var nickname=\"",
+    ];
+    for m in MARKERS {
+        if let Some(idx) = html.find(m) {
+            let rest = &html[idx + m.len()..];
+            if let Some(end) = rest.find('\'').or_else(|| rest.find('"')) {
+                let t = rest[..end].trim();
+                if !t.is_empty() { return t.to_string(); }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Extract the article body from `div#js_content`.
+fn extract_weixin_content(html: &str) -> String {
+    let doc = Html::parse_document(html);
+    let Ok(sel) = Selector::parse("#js_content") else { return String::new(); };
+    if let Some(el) = doc.select(&sel).next() {
+        let md = element_to_markdown(&el);
+        if md.trim().len() >= MIN_CONTENT_LEN { return md; }
+    }
+    String::new()
+}
+
 /// Fetch via Jina Reader API — handles JS rendering server-side.
 /// Returns content as markdown. Zero extra memory, just an HTTP request.
 async fn fetch_via_jina(url: &str, config: &Config) -> Result<FetchResult, FetchError> {
@@ -1040,7 +1573,11 @@ fn build_fetch_client(config: &Config, domain: &str) -> Result<reqwest::Client, 
 
     // Gzip/deflate/brotli are auto-enabled by default in reqwest
 
-    if config.use_proxy {
+    // Mainland domains (sogou/weixin/baidu/...) must bypass the proxy:
+    // they either block datacenter IPs with captchas or are unreachable
+    // through foreign egress. Controlled by DIRECT_DOMAINS env var.
+    let use_proxy = !config.should_bypass_proxy(domain);
+    if use_proxy {
         if let Some(ref url) = config.proxy_url {
             let proxy = reqwest::Proxy::all(url).map_err(|e| {
                 FetchError::Config(format!("Invalid proxy URL: {}", e))
@@ -1106,6 +1643,18 @@ fn build_headers(domain: &str) -> reqwest::header::HeaderMap {
             headers.insert(reqwest::header::REFERER,
                 "https://www.bilibili.com/".parse().unwrap());
         }
+        d if d.contains("mp.weixin") => {
+            headers.insert(reqwest::header::REFERER,
+                "https://mp.weixin.qq.com/".parse().unwrap());
+        }
+        d if d.contains("weixin.sogou") => {
+            headers.insert(reqwest::header::REFERER,
+                "https://weixin.sogou.com/".parse().unwrap());
+        }
+        d if d.contains("arxiv") => {
+            headers.insert(reqwest::header::REFERER,
+                "https://arxiv.org/".parse().unwrap());
+        }
         d if d.contains("xiaohongshu") | d.contains("xhs") => {
             headers.insert(reqwest::header::REFERER,
                 "https://www.xiaohongshu.com/".parse().unwrap());
@@ -1131,6 +1680,10 @@ fn build_user_agent(domain: &str) -> String {
         d if d.contains("baidu") | d.contains("baijiahao") => {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36".to_string()
         }
+        // WeChat articles require a MicroMessenger UA — any other UA gets a block page.
+        d if d.contains("mp.weixin") => {
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 26_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.70(0x18004629) NetType/WIFI Language/zh_CN".to_string()
+        }
         _ => {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36".to_string()
         }
@@ -1146,6 +1699,9 @@ fn detect_site(domain: &str) -> String {
     else if domain.contains("xiaohongshu") { "小红书".to_string() }
     else if domain.contains("baijiahao") { "百家号".to_string() }
     else if domain.contains("baidu") { "百度".to_string() }
+    else if domain.contains("mp.weixin") { "微信公众号".to_string() }
+    else if domain.contains("weixin.sogou") { "搜狗微信".to_string() }
+    else if domain.contains("arxiv") { "arXiv".to_string() }
     else if domain.contains("github") { "GitHub".to_string() }
     else if domain.contains("zhuanlan") { "知乎专栏".to_string() }
     else if domain.contains("linuxdo") { "LinuxDo".to_string() }

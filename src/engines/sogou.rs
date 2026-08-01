@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use scraper::{Html, Selector};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
@@ -8,13 +10,93 @@ pub struct SogouEngine;
 
 const SOGOU_URL: &str = "https://www.sogou.com/web";
 
+/// Minimum interval between Sogou requests (community consensus: >= 3s,
+/// see 2026 Sogou anti-bot reports; 5s is safer for repeated searches).
+const MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Process-level client: keeps the SNUID/SUID cookie session alive ACROSS
+/// searches. A fresh client per search looks like "frequent access without
+/// cookies" — a high-risk signal that triggers the captcha (zhu327, 2015;
+/// WechatSogou caches SNUID the same way).
+static SOGOU_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// Timestamp of the last request to sogou.com, shared across searches so
+/// consecutive tool calls are spaced out.
+static LAST_REQUEST: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn get_sogou_client(config: &Config) -> Result<&'static reqwest::Client, SearchError> {
+    Ok(SOGOU_CLIENT.get_or_init(|| {
+        // Sogou blocks proxy/datacenter IPs with captchas — bypass proxy by
+        // default (controlled via DIRECT_DOMAINS).
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+            .cookie_store(true);
+
+        if !config.should_bypass_proxy("www.sogou.com") {
+            if let Some(ref url) = config.proxy_url {
+                if let Ok(proxy) = reqwest::Proxy::all(url) {
+                    builder = builder.proxy(proxy);
+                }
+            }
+        }
+
+        builder.build().expect("failed to build sogou client")
+    }))
+}
+
+/// Space out requests: sleep until MIN_REQUEST_INTERVAL has elapsed since
+/// the last request to sogou.com.
+async fn polite_wait() {
+    // Compute the wait outside the lock, then release it before awaiting.
+    let wait = {
+        let last = LAST_REQUEST.lock().unwrap();
+        match *last {
+            Some(t) => {
+                let elapsed = t.elapsed();
+                if elapsed < MIN_REQUEST_INTERVAL {
+                    Some(MIN_REQUEST_INTERVAL - elapsed)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(d) = wait {
+        tokio::time::sleep(d).await;
+    }
+    *LAST_REQUEST.lock().unwrap() = Some(Instant::now());
+}
+
+/// Random 1-3s delay between result pages (jaryee's approach).
+async fn page_delay() {
+    let secs = 1 + (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() % 3)
+        .unwrap_or(1) as u64);
+    tokio::time::sleep(Duration::from_secs(secs)).await;
+}
+
 #[async_trait]
 impl SearchEngine for SogouEngine {
     fn name(&self) -> &'static str { "sogou" }
 
     async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
-        let client = config.build_reqwest_client()
-            .map_err(|e| SearchError::Http(e.to_string()))?;
+        let client = get_sogou_client(config)?;
+
+        // First use: warm up the homepage so sogou.com issues session
+        // cookies (SUV/SNUID) before we hit the search endpoint.
+        if LAST_REQUEST.lock().unwrap().is_none() {
+            let _ = client.get("https://www.sogou.com/")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .send()
+                .await;
+        }
+
+        let headers = build_sogou_headers();
 
         let mut all_results = Vec::new();
         let mut seen_urls = std::collections::HashSet::new();
@@ -23,20 +105,22 @@ impl SearchEngine for SogouEngine {
         for page in 1..=max_page {
             if all_results.len() >= limit { break; }
 
+            // Space out requests (across searches AND pages).
+            polite_wait().await;
+
             let url = format!("{}?query={}&page={}&ie=utf8", SOGOU_URL, url_encode(query), page);
 
             let resp = client.get(&url)
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-                .header("Referer", "https://www.sogou.com/")
+                .headers(headers.clone())
                 .send()
                 .await
                 .map_err(|e| SearchError::Http(format!("Sogou request failed: {}", e)))?;
 
+            let final_url = resp.url().to_string();
             let html = resp.text().await
                 .map_err(|e| SearchError::Http(format!("Sogou read body failed: {}", e)))?;
 
-            check_sogou_challenge(&html)?;
+            check_sogou_challenge(&final_url, &html)?;
 
             let results = parse_sogou_results(&html);
             for r in results {
@@ -45,20 +129,56 @@ impl SearchEngine for SogouEngine {
                     if all_results.len() >= limit { break; }
                 }
             }
+
+            if page < max_page && all_results.len() < limit {
+                page_delay().await;
+            }
         }
 
         Ok(all_results)
     }
 }
 
-fn check_sogou_challenge(html: &str) -> Result<(), SearchError> {
+/// Full browser-like headers (sec-ch-ua family) to reduce Sogou anti-bot
+/// false positives — requests missing these are more likely flagged as bots.
+fn build_sogou_headers() -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert(reqwest::header::ACCEPT,
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7".parse().unwrap());
+    h.insert(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8".parse().unwrap());
+    h.insert(reqwest::header::ACCEPT_ENCODING, "gzip, deflate, br".parse().unwrap());
+    h.insert(reqwest::header::REFERER, "https://www.sogou.com/".parse().unwrap());
+    h.insert(reqwest::header::HeaderName::from_static("sec-ch-ua"),
+        "\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not?A_Brand\";v=\"99\"".parse().unwrap());
+    h.insert(reqwest::header::HeaderName::from_static("sec-ch-ua-mobile"), "?0".parse().unwrap());
+    h.insert(reqwest::header::HeaderName::from_static("sec-ch-ua-platform"), "\"Windows\"".parse().unwrap());
+    h.insert(reqwest::header::HeaderName::from_static("sec-fetch-site"), "same-origin".parse().unwrap());
+    h.insert(reqwest::header::HeaderName::from_static("sec-fetch-mode"), "navigate".parse().unwrap());
+    h.insert(reqwest::header::HeaderName::from_static("sec-fetch-user"), "?1".parse().unwrap());
+    h.insert(reqwest::header::HeaderName::from_static("sec-fetch-dest"), "document".parse().unwrap());
+    h.insert(reqwest::header::UPGRADE_INSECURE_REQUESTS, "1".parse().unwrap());
+    h
+}
+
+/// Detect Sogou's anti-bot verification page.
+///
+/// Checks both the final URL (Sogou redirects blocked requests to
+/// `/antispider/?...`) and page markers.
+fn check_sogou_challenge(final_url: &str, html: &str) -> Result<(), SearchError> {
     let lower = html.to_lowercase();
-    if lower.contains("antispider")
+    if final_url.contains("antispider")
+        || lower.contains("antispider")
         || lower.contains("输入验证码")
         || lower.contains("过于频繁")
         || lower.contains("搜狗搜索验证")
+        || lower.contains("seccoderight")
+        || lower.contains("seccodeinput")
+        || lower.contains("请依次点击")
+        || lower.contains("验证码")
     {
-        return Err(SearchError::Blocked("Sogou returned a verification page".to_string()));
+        return Err(SearchError::Blocked(
+            "Sogou returned a verification page; slow down requests or retry later".to_string(),
+        ));
     }
     Ok(())
 }
