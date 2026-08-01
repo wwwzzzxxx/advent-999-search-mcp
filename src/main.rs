@@ -185,7 +185,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
     let search_tool = serde_json::json!({
         "name": "web",
         "description": format!(
-            "Search the web using these engines: {} (no API key required). searchMode meanings: omit or set auto to use the server configured SEARCH_MODE; request forces request-based search; playwright forces browser-based search.",
+            "Search the web using these engines: {} (no API key required). Academic search tips: use dblp for CS papers, cnki for Chinese papers; then pass any arXiv ID / URL or paper links from results to get_page to read the full text. WeChat article results (weixin.sogou.com/link?url=...) can also be passed directly to get_page. searchMode meanings: omit or set auto to use the server configured SEARCH_MODE; request forces request-based search; playwright forces browser-based search.",
             engines_desc
         ),
         "inputSchema": {
@@ -253,7 +253,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
 
     let fetch_tool = serde_json::json!({
         "name": "get_page",
-        "description": "Fetch the content of a web page and extract its readable text. Supports Chinese websites like Zhihu, CSDN, Juejin, Bilibili, WeChat articles (mp.weixin.qq.com), etc. Also accepts an arXiv paper ID (e.g. 2401.12345, arXiv:2401.12345, or an arxiv.org/abs/... URL) and returns the paper's HTML content. Uses proxy if configured. Returns the page title and extracted content as markdown.",
+        "description": "Fetch the content of a web page and extract its readable text. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). For academic papers: search first with web (engines: dblp, cnki, exa), then use this tool to read the full text. Uses proxy if configured. Returns the page title and extracted content as markdown.",
         "inputSchema": {
             "type": "object",
             "properties": {
