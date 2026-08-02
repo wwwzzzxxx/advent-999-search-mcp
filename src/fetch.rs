@@ -479,6 +479,13 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
         // Normal site → try direct first, fallback to Jina
         match fetch_direct(url, config).await {
             Ok(r) => return Ok(r),
+            Err(FetchError::PdfDetected(_)) => {
+                // PDF detected — Jina Reader converts PDFs to markdown.
+                match fetch_via_jina(url, config).await {
+                    Ok(r) => Ok(r),
+                    Err(jina_err) => Err(jina_err),
+                }
+            }
             Err(FetchError::LowQuality(_, _)) | Err(_) => {
                 // Low quality or other error → try Jina as fallback
                 match fetch_via_jina(url, config).await {
@@ -675,6 +682,23 @@ fn extract_arxiv_content(html: &str) -> String {
         }
     }
     extract_general_content(&doc)
+}
+
+/// Detect a PDF (or other binary document) response.
+///
+/// Checks the Content-Type header and the `%PDF-` magic bytes. Binary
+/// documents must not be fed through the HTML pipeline — callers should
+/// fall back to a PDF-capable reader (Jina Reader converts PDFs to markdown).
+fn is_pdf_response(content_type: &str, bytes: &[u8]) -> bool {
+    let ct = content_type.to_lowercase();
+    if ct.contains("application/pdf") || ct.contains("application/octet-stream") {
+        return true;
+    }
+    // Magic bytes check: %PDF- at the start (allow BOM / leading whitespace)
+    let head = &bytes[..bytes.len().min(16)];
+    let head_str = String::from_utf8_lossy(head);
+    let trimmed = head_str.trim_start_matches('\u{feff}').trim_start();
+    trimmed.starts_with("%PDF-")
 }
 
 // ─── Discourse API Fetcher ───
@@ -1133,6 +1157,16 @@ async fn fetch_direct(url: &str, config: &Config) -> Result<FetchResult, FetchEr
 
     let bytes = resp.bytes().await
         .map_err(|e| FetchError::Http(format!("Failed to read body: {}", e)))?;
+
+    // PDF (or other binary document) detection: check the Content-Type and
+    // the %PDF magic bytes. Treating PDF bytes as HTML produces garbage,
+    // so signal a PdfDetected error to trigger the Jina Reader fallback
+    // (r.jina.ai parses PDFs into markdown).
+    if is_pdf_response(&content_type, &bytes) {
+        return Err(FetchError::PdfDetected(
+            "the target returned a PDF document; retrying via PDF-capable reader".to_string(),
+        ));
+    }
 
     let html = decode_html(&bytes, &content_type);
 
@@ -2105,6 +2139,9 @@ pub enum FetchError {
     LowQuality(String, String), // (message, partial_content)
     Blocked(String),
     Config(String),
+    /// The response is a PDF (or other binary document) — not HTML.
+    /// Callers should retry via a PDF-capable fallback (e.g. Jina Reader).
+    PdfDetected(String),
 }
 
 impl std::fmt::Display for FetchError {
@@ -2120,6 +2157,7 @@ impl std::fmt::Display for FetchError {
             FetchError::LowQuality(msg, _) => write!(f, "Low quality content: {}", msg),
             FetchError::Blocked(msg) => write!(f, "Blocked: {}", msg),
             FetchError::Config(msg) => write!(f, "Configuration error: {}", msg),
+            FetchError::PdfDetected(msg) => write!(f, "PDF document detected: {}", msg),
         }
     }
 }
