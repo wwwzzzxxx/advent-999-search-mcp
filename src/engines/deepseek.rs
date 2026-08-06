@@ -11,15 +11,15 @@ use super::SearchEngine;
 /// - **official**: DeepSeek official API key (`sk-` + 32 hex, 35 chars)
 ///   → `https://api.deepseek.com/anthropic/v1/messages` (direct, mainland,
 ///   plain reqwest works — no Cloudflare fingerprint check)
-/// - **go**: OpenCode Go subscription key (`sk-` + 64 chars, e.g. from
-///   `~/.local/share/opencode/auth.json`)
+/// - **go**: OpenCode Go subscription key (`sk-` + 64 chars)
 ///   → `https://opencode.ai/zen/go/v1/messages` (via proxy). opencode.ai
 ///   sits behind Cloudflare which blocks reqwest/curl TLS fingerprints, so
 ///   this backend spawns the embedded Python runtime (requests/urllib3
 ///   fingerprint passes).
 ///
-/// Override detection with `DEEPSEEK_API_MODE=official|go`.
-/// Disabled entirely when no key is present.
+/// The key always comes from the `DEEPSEEK_API_KEY` env var (never read
+/// from any file). Override detection with `DEEPSEEK_API_MODE=official|go`.
+/// Disabled entirely when the env var is not set.
 pub struct DeepseekEngine;
 
 const OFFICIAL_BASE: &str = "https://api.deepseek.com/anthropic";
@@ -29,13 +29,13 @@ const SEARCH_TIMEOUT_SECS: u64 = 120;
 
 /// Python search script for the go backend. Runs with `python -c`, query on
 /// stdin, prints one JSON line: {"status": N, "results": [...], "summary": "..."}.
+/// The key is passed via env (DEEPSEEK_API_KEY), never read from a file.
 const GO_SEARCH_SCRIPT: &str = r#"
 import json, os, sys
 import requests
 
 query = sys.stdin.read()
-with open(os.path.expanduser("~/.local/share/opencode/auth.json"), encoding="utf-8") as f:
-    key = json.load(f)["opencode-go"]["key"]
+key = os.environ["DEEPSEEK_API_KEY"]
 
 body = {
     "model": os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
@@ -172,6 +172,7 @@ impl DeepseekEngine {
             .map_err(|e| SearchError::Engine(format!("embedded python unavailable: {}", e)))?;
 
         // Spawn on a blocking thread: std::process::Command is blocking.
+        // Python child inherits env, so DEEPSEEK_API_KEY reaches the script.
         let py_clone = py.clone();
         let query_owned = query.to_string();
         let output = tokio::task::spawn_blocking(move || {
@@ -211,7 +212,7 @@ impl DeepseekEngine {
         if let Some(status) = data["status"].as_u64() {
             match status {
                 401 | 403 => return Err(SearchError::Blocked(
-                    "opencode.ai rejected the key (401/403); check auth.json / OPENCODE_GO_KEY".to_string()
+                    "opencode.ai rejected the key (401/403); check DEEPSEEK_API_KEY".to_string()
                 )),
                 429 => return Err(SearchError::Blocked(
                     "opencode.ai rate limited (429); slow down requests".to_string()

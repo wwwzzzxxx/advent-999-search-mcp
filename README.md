@@ -92,9 +92,8 @@ EXA_API_KEY=your_key_here
 # Accepts EITHER a DeepSeek official API key (sk- + 32 hex, 35 chars,
 # https://platform.deepseek.com) OR an OpenCode Go subscription key
 # (sk- + 64 chars). The backend is auto-detected from the key format;
-# override with DEEPSEEK_API_MODE=official|go.
-# If unset, the OpenCode Go key is auto-loaded from
-# ~/.local/share/opencode/auth.json. Model override: DEEPSEEK_MODEL
+# override with DEEPSEEK_API_MODE=official|go. The key is read ONLY
+# from this env var (never from any file). Model override: DEEPSEEK_MODEL
 # (default deepseek-v4-flash).
 DEEPSEEK_API_KEY=your_key_here
 DEEPSEEK_API_MODE=official   # optional: force backend
@@ -169,7 +168,7 @@ Edit `opencode.json`:
 | `USE_PROXY` | No | `true` | Enable/disable proxy |
 | `DIRECT_DOMAINS` | No | *mainland list* | Domains that bypass the proxy (direct). Default: `sogou,weixin,baidu,bilibili,zhihu,csdn,juejin,xiaohongshu`. Set `none` to proxy everything |
 | `EXA_API_KEY` | No | — | Exa API key — get one [here](https://dashboard.exa.ai/api-keys) |
-| `DEEPSEEK_API_KEY` | No | — | DeepSeek web-search key — official API key or OpenCode Go subscription key (auto-detected; if unset, loaded from `~/.local/share/opencode/auth.json`) — enables the `deepseek` engine |
+| `DEEPSEEK_API_KEY` | No | — | DeepSeek web-search key — official API key or OpenCode Go subscription key (auto-detected) — enables the `deepseek` engine |
 | `DEEPSEEK_API_MODE` | No | *(auto)* | Force backend: `official` (api.deepseek.com) or `go` (opencode.ai) |
 | `DEEPSEEK_MODEL` | No | `deepseek-v4-flash` | Model used by the deepseek engine |
 | `FETCH_COOKIES` | No | — | Browser cookies for authenticated pages. Format: `key=value; key2=value2` |
@@ -196,7 +195,7 @@ Supported engines (10 total, all tested): Exa (default), Bing, CSDN, Juejin, Sta
 Credential-gated engines (implemented, hidden until key set — appear automatically in `tools/list` when the env var is present):
 - **`deepseek`** — LLM-backed web search via the Anthropic-compatible Messages API with the server-side `web_search_20250305` tool. Two backends auto-detected from key format:
   - **official** — DeepSeek official API key (`sk-`+32 hex) → `api.deepseek.com` (direct, no proxy needed)
-  - **go** — OpenCode Go subscription key (`sk-`+64 chars, or auto-loaded from `~/.local/share/opencode/auth.json`) → `opencode.ai` via proxy. Runs on the embedded Python runtime (see build note). Returns an AI summary attached to the first result (`summary` field).
+  - **go** — OpenCode Go subscription key (`sk-`+64 chars) → `opencode.ai` via proxy. Runs on the embedded Python runtime (see build note). Returns an AI summary attached to the first result (`summary` field).
 
 When the key is set via the env var, the engine is automatically listed in `tools/list`; without the key it stays hidden.
 

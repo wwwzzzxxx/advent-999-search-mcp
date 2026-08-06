@@ -89,7 +89,7 @@ EXA_API_KEY=你的密钥
 # 支持两种 key 之一：DeepSeek 官方 API key（sk-+32 位十六进制，35 字符，
 # 申请：https://platform.deepseek.com）或 OpenCode Go 订阅 key（sk-+64 字符）。
 # 后端自动按 key 格式检测；也可用 DEEPSEEK_API_MODE=official|go 强制指定。
-# 未设置时自动从 ~/.local/share/opencode/auth.json 读取 Go 订阅 key。
+# key 只从该环境变量读取（绝不读任何文件）。
 DEEPSEEK_API_KEY=你的密钥
 DEEPSEEK_API_MODE=official   # 可选：强制后端
 DEEPSEEK_MODEL=deepseek-v4-flash  # 可选：覆盖模型
@@ -163,7 +163,7 @@ EVERYTHING_ES_PATH=C:\path\to\es.exe
 | `USE_PROXY` | 否 | `true` | 是否启用代理 |
 | `DIRECT_DOMAINS` | 否 | *大陆列表* | 绕过代理直连的域名。默认：`sogou,weixin,baidu,bilibili,zhihu,csdn,juejin,xiaohongshu`。设为 `none` 则全部走代理 |
 | `EXA_API_KEY` | 否 | — | Exa API 密钥，[点此申请](https://dashboard.exa.ai/api-keys) |
-| `DEEPSEEK_API_KEY` | 否 | — | DeepSeek 搜索密钥——官方 API key 或 OpenCode Go 订阅 key（自动检测；未设置时自动读 `~/.local/share/opencode/auth.json`）——启用 `deepseek` 引擎 |
+| `DEEPSEEK_API_KEY` | 否 | — | DeepSeek 搜索密钥——官方 API key 或 OpenCode Go 订阅 key（自动检测）——启用 `deepseek` 引擎 |
 | `DEEPSEEK_API_MODE` | 否 | 自动 | 强制后端：`official`（api.deepseek.com）或 `go`（opencode.ai） |
 | `DEEPSEEK_MODEL` | 否 | `deepseek-v4-flash` | deepseek 引擎使用的模型 |
 | `FETCH_COOKIES` | 否 | — | 浏览器 Cookie。格式：`key=value; key2=value2` |
@@ -190,7 +190,7 @@ searchMode (string)             — "request" | "auto" | "playwright"
 凭据门控引擎（已实现，设置密钥前隐藏——配置环境变量后自动出现在 `tools/list`）：
 - **`deepseek`** — 基于 LLM 的搜索，通过 Anthropic 兼容 Messages API 调用服务端 `web_search_20250305` 工具。按 key 格式自动检测后端：
   - **official** — DeepSeek 官方 API key（`sk-`+32 位十六进制）→ `api.deepseek.com`（国内直连，无需代理）
-  - **go** — OpenCode Go 订阅 key（`sk-`+64 字符，或自动读 `~/.local/share/opencode/auth.json`）→ `opencode.ai`（走代理）。使用内置 Python 运行时（见构建说明）。返回的 AI 总结会附加到第一条结果的 `summary` 字段。
+  - **go** — OpenCode Go 订阅 key（`sk-`+64 字符）→ `opencode.ai`（走代理）。使用内置 Python 运行时（见构建说明）。返回的 AI 总结会附加到第一条结果的 `summary` 字段。
 
 通过环境变量设置密钥后，引擎会自动出现在 `tools/list` 中；未设置密钥时保持隐藏。
 

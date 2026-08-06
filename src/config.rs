@@ -69,12 +69,10 @@ impl Config {
             .unwrap_or(30);
 
         // Optional API keys — engines are disabled when unset.
-        // DeepSeek: env key first, else fall back to OpenCode's auth.json
-        // (standard location for the Go subscription key — never hardcoded).
+        // DeepSeek: key comes ONLY from the DEEPSEEK_API_KEY env var.
         let deepseek_api_key = env::var("DEEPSEEK_API_KEY")
             .ok()
-            .filter(|k| !k.trim().is_empty())
-            .or_else(load_opencode_go_key);
+            .filter(|k| !k.trim().is_empty());
         let deepseek_api_mode = env::var("DEEPSEEK_API_MODE")
             .ok().filter(|m| !m.trim().is_empty());
 
@@ -106,7 +104,7 @@ impl Config {
         }
     }
 
-    /// Whether the DeepSeek engine is available (env key or OpenCode auth.json).
+    /// Whether the DeepSeek engine is available (DEEPSEEK_API_KEY env var set).
     pub fn has_deepseek_key(&self) -> bool { self.deepseek_api_key.is_some() }
 
     /// Whether requests to this host must bypass the proxy entirely.
@@ -178,21 +176,3 @@ impl Config {
     }
 }
 
-/// Read the OpenCode Go subscription key from the standard auth.json
-/// (fallback when DEEPSEEK_API_KEY is not set). The key itself is never
-/// hardcoded in the source — it lives in the user's own config file.
-fn load_opencode_go_key() -> Option<String> {
-    // Windows has no HOME; USERPROFILE is the canonical home there.
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    let path = std::path::PathBuf::from(home)
-        .join(".local/share/opencode/auth.json");
-    if !path.exists() {
-        return None;
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let key = json["opencode-go"]["key"].as_str()?.trim();
-    if key.is_empty() { None } else { Some(key.to_string()) }
-}
