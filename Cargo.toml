@@ -23,3 +23,4 @@ url = "2"
 zhihu_sign = "0.1"
 aes = "0.8"
 cipher = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }

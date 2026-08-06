@@ -217,6 +217,7 @@ fn parse_sogou_results(html: &str) -> Vec<SearchResult> {
                 description: desc.chars().take(400).collect(),
                 source: source.chars().take(200).collect(),
                 engine: "sogou".to_string(),
+                summary: None,
             });
         }
     }

@@ -163,6 +163,7 @@ impl SearchEngine for CnkiEngine {
                 description: description.chars().take(400).collect(),
                 source: source.chars().take(200).collect(),
                 engine: "cnki".to_string(),
+                summary: None,
             });
 
             if results.len() >= limit { break; }

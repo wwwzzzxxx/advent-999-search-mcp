@@ -51,6 +51,7 @@ impl SearchEngine for CsdnEngine {
                     description,
                     source,
                     engine: "csdn".to_string(),
+                    summary: None,
                 });
 
                 if all_results.len() >= limit { break; }

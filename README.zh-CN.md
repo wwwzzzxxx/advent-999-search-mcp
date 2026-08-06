@@ -2,13 +2,13 @@
 
 基于 Rust 的 MCP 服务器，为你的 AI 助手提供**网络搜索**、**本地文件搜索**和**网页抓取**能力。
 
-- **`web`** — 多引擎搜索（Exa、Bing、CSDN、掘金、Startpage、搜狗）
+- **`web`** — 10 个搜索引擎（Exa、Bing、CSDN、掘金、Startpage、搜狗、微信、DBLP、知网 + 凭据门控的 DeepSeek）
 - **`local`** — 通过 Everything (voidtools) 搜索本地文件
 - **`get_page`** — 抓取任意网页并提取可读内容
 
 ### 为什么选 advent？
 
-- 🪶 **极低内存占用** — 使用 Rust 编写，二进制仅 ~5 MB，运行时内存占用极小
+- 🪶 **极低内存占用** — 使用 Rust 编写，单文件 exe 仅 ~17 MB（内置 Python 运行时），运行时内存占用极小
 - ⚙️ **轻量化配置** — 开箱即用，无需繁琐依赖
 - 🌐 **智能 `get_page`** — 能抓取并渲染几乎所有网站：支持 JS 渲染页面、需登录页面（知乎、Discourse）、复杂 HTML，自动降级策略保证成功率
 
@@ -27,9 +27,20 @@
 ```bash
 git clone https://github.com/wwwzzzxxx/advent-999-search-mcp.git
 cd advent-999-search-mcp
+
+# 第 1 步（必需）：生成内置 Python 运行时 zip
+# （下载 Python 3.12 embeddable + 安装 requests，约 12 MB，产物已被 gitignore）
+./scripts/prepare_python_embed.ps1
+
+# 第 2 步：编译
 cargo build --release
-# 编译产物：target/release/advent-999-search-mcp.exe
+# 编译产物：target/release/advent-999-search-mcp.exe（约 17 MB）
 ```
+
+> **为什么内置 Python？** `deepseek` 引擎的 OpenCode Go 后端调用
+> `opencode.ai`，该站有 Cloudflare TLS 指纹检测——会拦截 reqwest/curl 的
+> 指纹，但放行 Python urllib3/OpenSSL 的指纹。内置运行时（首次使用自动解压到
+> `%LOCALAPPDATA%\advent-mcp-python`）让这一切无需额外安装 Python 即可工作。
 
 ### 2. （可选）安装 Everything 以启用本地搜索
 
@@ -73,6 +84,20 @@ DIRECT_DOMAINS=sogou,weixin,baidu
 # （可选）Exa API 密钥，每月免费 $10
 # 申请地址：https://dashboard.exa.ai/api-keys
 EXA_API_KEY=你的密钥
+
+# （可选）DeepSeek 搜索密钥（启用 deepseek 引擎）
+# 支持两种 key 之一：DeepSeek 官方 API key（sk-+32 位十六进制，35 字符，
+# 申请：https://platform.deepseek.com）或 OpenCode Go 订阅 key（sk-+64 字符）。
+# 后端自动按 key 格式检测；也可用 DEEPSEEK_API_MODE=official|go 强制指定。
+# 未设置时自动从 ~/.local/share/opencode/auth.json 读取 Go 订阅 key。
+DEEPSEEK_API_KEY=你的密钥
+DEEPSEEK_API_MODE=official   # 可选：强制后端
+DEEPSEEK_MODEL=deepseek-v4-flash  # 可选：覆盖模型
+
+# （可选）限制可用引擎（逗号分隔）
+# 重要：如果设置了这个变量，务必把想用的引擎都写进去——
+# 包括配置了 key 后的 deepseek：
+ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,deepseek
 
 # （可选）浏览器 Cookie，用于抓取需登录的页面（如知乎）
 # 格式与 HTTP 的 Cookie 请求头相同：
@@ -138,8 +163,9 @@ EVERYTHING_ES_PATH=C:\path\to\es.exe
 | `USE_PROXY` | 否 | `true` | 是否启用代理 |
 | `DIRECT_DOMAINS` | 否 | *大陆列表* | 绕过代理直连的域名。默认：`sogou,weixin,baidu,bilibili,zhihu,csdn,juejin,xiaohongshu`。设为 `none` 则全部走代理 |
 | `EXA_API_KEY` | 否 | — | Exa API 密钥，[点此申请](https://dashboard.exa.ai/api-keys) |
-| `IEEE_API_KEY` | 否 | — | IEEE Xplore API 密钥（[developer.ieee.org](https://developer.ieee.org)），设置后启用 `ieee` 引擎 |
-| `SEMANTIC_SCHOLAR_API_KEY` | 否 | — | Semantic Scholar API 密钥（[semanticscholar.org/product/api](https://www.semanticscholar.org/product/api)），设置后启用 `semantic_scholar` 引擎 |
+| `DEEPSEEK_API_KEY` | 否 | — | DeepSeek 搜索密钥——官方 API key 或 OpenCode Go 订阅 key（自动检测；未设置时自动读 `~/.local/share/opencode/auth.json`）——启用 `deepseek` 引擎 |
+| `DEEPSEEK_API_MODE` | 否 | 自动 | 强制后端：`official`（api.deepseek.com）或 `go`（opencode.ai） |
+| `DEEPSEEK_MODEL` | 否 | `deepseek-v4-flash` | deepseek 引擎使用的模型 |
 | `FETCH_COOKIES` | 否 | — | 浏览器 Cookie。格式：`key=value; key2=value2` |
 | `EVERYTHING_ES_PATH` | 否 | — | ES.exe 路径（必须设置才能启用本地搜索） |
 | `DEFAULT_SEARCH_ENGINE` | 否 | `exa` | 默认搜索引擎 |
@@ -159,11 +185,12 @@ engines    (string[])           — 使用的搜索引擎
 searchMode (string)             — "request" | "auto" | "playwright"
 ```
 
-支持的搜索引擎（9 个，均已实测）：Exa（默认）、Bing、CSDN、掘金、Startpage、搜狗、微信（公众号文章）、DBLP（计算机文献）、知网。
+支持的搜索引擎（10 个，均已实测）：Exa（默认）、Bing、CSDN、掘金、Startpage、搜狗、微信（公众号文章）、DBLP（计算机文献）、知网、DeepSeek（LLM 搜索，需密钥）。
 
-规划中的引擎（已实现但暂未暴露，等待 API 密钥）：
-- **`ieee`** — IEEE Xplore 论文（需 [developer.ieee.org](https://developer.ieee.org) 申请的 `IEEE_API_KEY`，审核需数个工作日）
-- **`semantic_scholar`** — 带引用数的论文搜索（需 [semanticscholar.org/product/api](https://www.semanticscholar.org/product/api) 的 `SEMANTIC_SCHOLAR_API_KEY`，注册后邮件发送）
+凭据门控引擎（已实现，设置密钥前隐藏——配置环境变量后自动出现在 `tools/list`）：
+- **`deepseek`** — 基于 LLM 的搜索，通过 Anthropic 兼容 Messages API 调用服务端 `web_search_20250305` 工具。按 key 格式自动检测后端：
+  - **official** — DeepSeek 官方 API key（`sk-`+32 位十六进制）→ `api.deepseek.com`（国内直连，无需代理）
+  - **go** — OpenCode Go 订阅 key（`sk-`+64 字符，或自动读 `~/.local/share/opencode/auth.json`）→ `opencode.ai`（走代理）。使用内置 Python 运行时（见构建说明）。返回的 AI 总结会附加到第一条结果的 `summary` 字段。
 
 通过环境变量设置密钥后，引擎会自动出现在 `tools/list` 中；未设置密钥时保持隐藏。
 

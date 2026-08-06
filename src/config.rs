@@ -12,6 +12,7 @@ const DEFAULT_DIRECT_DOMAINS: &[&str] = &[
     "csdn",        // CSDN
     "juejin",      // 掘金
     "xiaohongshu", // 小红书
+    "deepseek",    // DeepSeek 官方 API (国内直连)
 ];
 
 #[derive(Debug, Clone)]
@@ -24,12 +25,15 @@ pub struct Config {
     pub direct_domains: Vec<String>,
     pub fetch_cookies: String,
     pub fetch_timeout_secs: u64,
-    /// Optional IEEE Xplore API key (https://developer.ieee.org).
-    /// When unset, the `ieee` engine is disabled.
-    pub ieee_api_key: Option<String>,
-    /// Optional Semantic Scholar API key (https://www.semanticscholar.org/product/api).
-    /// When unset, the `semantic_scholar` engine is disabled.
-    pub semantic_scholar_api_key: Option<String>,
+    /// DeepSeek web-search key — either DeepSeek official API key
+    /// (`sk-` + 32 hex, 35 chars) or an OpenCode Go subscription key
+    /// (`sk-` + 64 chars). Auto-detected by format; override with
+    /// `DEEPSEEK_API_MODE=official|go`. When unset (and no OpenCode
+    /// auth.json), the `deepseek` engine is disabled.
+    pub deepseek_api_key: Option<String>,
+    /// Optional override for DeepSeek key format detection:
+    /// "official" (api.deepseek.com) or "go" (opencode.ai/zen/go).
+    pub deepseek_api_mode: Option<String>,
 }
 
 impl Config {
@@ -65,15 +69,28 @@ impl Config {
             .unwrap_or(30);
 
         // Optional API keys — engines are disabled when unset.
-        let ieee_api_key = env::var("IEEE_API_KEY").ok().filter(|k| !k.trim().is_empty());
-        let semantic_scholar_api_key = env::var("SEMANTIC_SCHOLAR_API_KEY")
-            .ok().filter(|k| !k.trim().is_empty());
+        // DeepSeek: env key first, else fall back to OpenCode's auth.json
+        // (standard location for the Go subscription key — never hardcoded).
+        let deepseek_api_key = env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .or_else(load_opencode_go_key);
+        let deepseek_api_mode = env::var("DEEPSEEK_API_MODE")
+            .ok().filter(|m| !m.trim().is_empty());
 
-        if ieee_api_key.is_some() {
-            eprintln!("🔑 IEEE_API_KEY set, ieee engine enabled");
-        }
-        if semantic_scholar_api_key.is_some() {
-            eprintln!("🔑 SEMANTIC_SCHOLAR_API_KEY set, semantic_scholar engine enabled");
+        if let Some(k) = &deepseek_api_key {
+            let mode = match deepseek_api_mode.as_deref() {
+                Some("official") => "official (forced)",
+                Some("go") => "go (forced)",
+                _ => {
+                    if k.len() == 35 && k.starts_with("sk-") {
+                        "official (auto)"
+                    } else {
+                        "go (auto)"
+                    }
+                }
+            };
+            eprintln!("🔑 DEEPSEEK_API_KEY set, deepseek engine enabled ({})", mode);
         }
 
         Self {
@@ -84,14 +101,13 @@ impl Config {
             direct_domains,
             fetch_cookies,
             fetch_timeout_secs: fetch_timeout,
-            ieee_api_key,
-            semantic_scholar_api_key,
+            deepseek_api_key,
+            deepseek_api_mode,
         }
     }
 
-    /// Whether an engine requiring credentials is available.
-    pub fn has_ieee_key(&self) -> bool { self.ieee_api_key.is_some() }
-    pub fn has_semantic_scholar_key(&self) -> bool { self.semantic_scholar_api_key.is_some() }
+    /// Whether the DeepSeek engine is available (env key or OpenCode auth.json).
+    pub fn has_deepseek_key(&self) -> bool { self.deepseek_api_key.is_some() }
 
     /// Whether requests to this host must bypass the proxy entirely.
     ///
@@ -160,4 +176,23 @@ impl Config {
             filtered
         }
     }
+}
+
+/// Read the OpenCode Go subscription key from the standard auth.json
+/// (fallback when DEEPSEEK_API_KEY is not set). The key itself is never
+/// hardcoded in the source — it lives in the user's own config file.
+fn load_opencode_go_key() -> Option<String> {
+    // Windows has no HOME; USERPROFILE is the canonical home there.
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let path = std::path::PathBuf::from(home)
+        .join(".local/share/opencode/auth.json");
+    if !path.exists() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let key = json["opencode-go"]["key"].as_str()?.trim();
+    if key.is_empty() { None } else { Some(key.to_string()) }
 }

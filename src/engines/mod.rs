@@ -16,20 +16,16 @@ pub mod startpage;
 pub mod sogou;
 pub mod weixin;
 pub mod dblp;
-pub mod semantic_scholar;
-pub mod ieee;
 pub mod cnki;
+pub mod deepseek;
 
 /// Engines that require an API key / cookie from the environment.
 /// They are only added to the engine map when the credential is present;
 /// otherwise they are disabled entirely (not listed, not callable).
 fn credential_gated_engines(config: &Config) -> Vec<Box<dyn SearchEngine>> {
     let mut engines: Vec<Box<dyn SearchEngine>> = Vec::new();
-    if config.has_semantic_scholar_key() {
-        engines.push(Box::new(semantic_scholar::SemanticScholarEngine));
-    }
-    if config.has_ieee_key() {
-        engines.push(Box::new(ieee::IeeeEngine));
+    if config.has_deepseek_key() {
+        engines.push(Box::new(deepseek::DeepseekEngine));
     }
     engines
 }

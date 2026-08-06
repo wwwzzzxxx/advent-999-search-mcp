@@ -184,6 +184,7 @@ fn parse_weixin_results(html: &str) -> Vec<SearchResult> {
             description: description.chars().take(400).collect(),
             source: source.chars().take(200).collect(),
             engine: "weixin".to_string(),
+            summary: None,
         });
     }
 

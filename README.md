@@ -4,13 +4,13 @@
 
 A Rust-based MCP server that gives your AI assistant **web search**, **local file search**, and **web page fetching** abilities.
 
-- **`web`** — Search with Exa, Bing, CSDN, Juejin, Startpage, Sogou
+- **`web`** — Search with 10 engines (Exa, Bing, CSDN, Juejin, Startpage, Sogou, Weixin, DBLP, CNKI + credential-gated DeepSeek)
 - **`local`** — Search your local files via Everything (voidtools)
 - **`get_page`** — Fetch and extract readable content from any web page
 
 ### Why advent?
 
-- 🪶 **Extremely low memory** — Written in Rust, ~5 MB binary, minimal runtime footprint
+- 🪶 **Extremely low memory** — Written in Rust, ~17 MB single binary (includes embedded Python runtime), minimal runtime footprint
 - ⚙️ **Minimal configuration** — Works out of the box with sensible defaults, no heavy dependencies
 - 🌐 **Smart `get_page`** — Fetches and renders content from almost any site: handles JS-rendered pages, authenticated pages (Zhihu, Discourse), and complex HTML, all with automatic fallback strategies
 
@@ -29,9 +29,21 @@ A Rust-based MCP server that gives your AI assistant **web search**, **local fil
 ```bash
 git clone https://github.com/wwwzzzxxx/advent-999-search-mcp.git
 cd advent-999-search-mcp
+
+# Step 1 (required): build the embedded Python runtime zip (downloads Python
+# 3.12 embeddable + installs requests, ~12 MB, output is gitignored)
+./scripts/prepare_python_embed.ps1
+
+# Step 2: build
 cargo build --release
-# Binary at: target/release/advent-999-search-mcp.exe
+# Binary at: target/release/advent-999-search-mcp.exe (~17 MB)
 ```
+
+> **Why the embedded Python?** The `deepseek` engine's OpenCode Go backend calls
+> `opencode.ai`, which sits behind Cloudflare TLS-fingerprint detection — it
+> blocks reqwest/curl fingerprints but passes Python's urllib3/OpenSSL one.
+> The embedded runtime (auto-extracted to `%LOCALAPPDATA%\advent-mcp-python`
+> on first use) makes this work with zero external Python installation.
 
 ### 2. (Optional) Install Everything for local file search
 
@@ -75,6 +87,23 @@ DIRECT_DOMAINS=sogou,weixin,baidu
 
 # Optional — Exa API key (free $10/month at https://dashboard.exa.ai/api-keys)
 EXA_API_KEY=your_key_here
+
+# Optional — DeepSeek web-search key (enables the `deepseek` engine).
+# Accepts EITHER a DeepSeek official API key (sk- + 32 hex, 35 chars,
+# https://platform.deepseek.com) OR an OpenCode Go subscription key
+# (sk- + 64 chars). The backend is auto-detected from the key format;
+# override with DEEPSEEK_API_MODE=official|go.
+# If unset, the OpenCode Go key is auto-loaded from
+# ~/.local/share/opencode/auth.json. Model override: DEEPSEEK_MODEL
+# (default deepseek-v4-flash).
+DEEPSEEK_API_KEY=your_key_here
+DEEPSEEK_API_MODE=official   # optional: force backend
+DEEPSEEK_MODEL=deepseek-v4-flash  # optional: override model
+
+# Optional — restrict which engines are available (comma-separated).
+# IMPORTANT: if you set this, include every engine you want — including
+# deepseek once its key is configured:
+ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,deepseek
 
 # Optional — browser cookies for fetching authenticated pages (e.g. zhihu.com)
 # Same format as the HTTP Cookie header:
@@ -140,8 +169,9 @@ Edit `opencode.json`:
 | `USE_PROXY` | No | `true` | Enable/disable proxy |
 | `DIRECT_DOMAINS` | No | *mainland list* | Domains that bypass the proxy (direct). Default: `sogou,weixin,baidu,bilibili,zhihu,csdn,juejin,xiaohongshu`. Set `none` to proxy everything |
 | `EXA_API_KEY` | No | — | Exa API key — get one [here](https://dashboard.exa.ai/api-keys) |
-| `IEEE_API_KEY` | No | — | IEEE Xplore API key ([developer.ieee.org](https://developer.ieee.org)) — enables the `ieee` engine |
-| `SEMANTIC_SCHOLAR_API_KEY` | No | — | Semantic Scholar API key ([semanticscholar.org/product/api](https://www.semanticscholar.org/product/api)) — enables the `semantic_scholar` engine |
+| `DEEPSEEK_API_KEY` | No | — | DeepSeek web-search key — official API key or OpenCode Go subscription key (auto-detected; if unset, loaded from `~/.local/share/opencode/auth.json`) — enables the `deepseek` engine |
+| `DEEPSEEK_API_MODE` | No | *(auto)* | Force backend: `official` (api.deepseek.com) or `go` (opencode.ai) |
+| `DEEPSEEK_MODEL` | No | `deepseek-v4-flash` | Model used by the deepseek engine |
 | `FETCH_COOKIES` | No | — | Browser cookies for authenticated pages. Format: `key=value; key2=value2` |
 | `EVERYTHING_ES_PATH` | No | — | Path to ES.exe (required to enable local search) |
 | `DEFAULT_SEARCH_ENGINE` | No | `exa` | Default search engine |
@@ -161,11 +191,12 @@ engines    (string[])           — Which engine(s) to use
 searchMode (string)             — "request" | "auto" | "playwright"
 ```
 
-Supported engines (9, all tested): Exa (default), Bing, CSDN, Juejin, Startpage, Sogou, Weixin (WeChat articles), DBLP (CS bibliography), CNKI (知网).
+Supported engines (10 total, all tested): Exa (default), Bing, CSDN, Juejin, Startpage, Sogou, Weixin (WeChat articles), DBLP (CS bibliography), CNKI (知网), DeepSeek (LLM-backed, requires key).
 
-Planned engines (implemented but NOT exposed yet — awaiting API keys):
-- **`ieee`** — IEEE Xplore papers (needs `IEEE_API_KEY` from [developer.ieee.org](https://developer.ieee.org); approval takes a few business days)
-- **`semantic_scholar`** — papers with citation counts (needs `SEMANTIC_SCHOLAR_API_KEY` from [semanticscholar.org/product/api](https://www.semanticscholar.org/product/api); key is delivered by email)
+Credential-gated engines (implemented, hidden until key set — appear automatically in `tools/list` when the env var is present):
+- **`deepseek`** — LLM-backed web search via the Anthropic-compatible Messages API with the server-side `web_search_20250305` tool. Two backends auto-detected from key format:
+  - **official** — DeepSeek official API key (`sk-`+32 hex) → `api.deepseek.com` (direct, no proxy needed)
+  - **go** — OpenCode Go subscription key (`sk-`+64 chars, or auto-loaded from `~/.local/share/opencode/auth.json`) → `opencode.ai` via proxy. Runs on the embedded Python runtime (see build note). Returns an AI summary attached to the first result (`summary` field).
 
 When the key is set via the env var, the engine is automatically listed in `tools/list`; without the key it stays hidden.
 

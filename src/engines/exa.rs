@@ -82,6 +82,7 @@ impl SearchEngine for ExaEngine {
                 description: description.trim().to_string(),
                 source,
                 engine: "exa".to_string(),
+                summary: None,
             });
 
             if results.len() >= limit { break; }

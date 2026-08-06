@@ -110,6 +110,7 @@ impl SearchEngine for DblpEngine {
                 description: description.chars().take(400).collect(),
                 source: venue.to_string(),
                 engine: "dblp".to_string(),
+                summary: None,
             });
 
             if results.len() >= limit { break; }

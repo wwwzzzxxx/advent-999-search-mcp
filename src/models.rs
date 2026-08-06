@@ -9,6 +9,10 @@ pub struct SearchResult {
     pub description: String,
     pub source: String,
     pub engine: String,
+    /// Optional AI-synthesized summary (only populated by LLM-backed
+    /// engines like deepseek; omitted from JSON when absent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// Partial failure for an engine

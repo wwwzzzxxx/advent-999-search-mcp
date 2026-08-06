@@ -187,7 +187,7 @@ fn parse_results(html: &str) -> Vec<SearchResult> {
                 .unwrap_or_default();
 
             let source = extract_hostname(&url).unwrap_or_default();
-            results.push(SearchResult { title, url, description, source, engine: "startpage".to_string() });
+            results.push(SearchResult { title, url, description, source, engine: "startpage".to_string(), summary: None });
         }
     }
 
@@ -213,6 +213,7 @@ fn parse_results(html: &str) -> Vec<SearchResult> {
                 description: String::new(),
                 url: url.clone(),
                 engine: "startpage".to_string(),
+                summary: None,
             });
             if results.len() >= 10 { break; }
         }

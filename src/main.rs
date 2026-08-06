@@ -3,6 +3,7 @@ mod models;
 mod engines;
 mod local_search;
 mod fetch;
+mod python_embed;
 
 use config::Config;
 use models::{SearchResponse, PartialFailure, normalize_engine};

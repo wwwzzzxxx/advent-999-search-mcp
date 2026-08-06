@@ -123,6 +123,7 @@ fn parse_bing_results(html: &str, limit: usize) -> Vec<SearchResult> {
                 description: description.chars().take(400).collect(),
                 source: source.chars().take(200).collect(),
                 engine: "bing".to_string(),
+                summary: None,
             });
         }
     }

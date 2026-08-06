@@ -81,6 +81,7 @@ impl SearchEngine for JuejinEngine {
                     description,
                     source: user_name.to_string(),
                     engine: "juejin".to_string(),
+                    summary: None,
                 });
 
                 if all_results.len() >= limit { break; }
