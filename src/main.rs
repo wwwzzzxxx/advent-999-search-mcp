@@ -76,7 +76,7 @@ async fn main() {
                         },
                         "serverInfo": {
                             "name": "advent-999-search-mcp",
-                            "version": "0.3.0"
+                            "version": "0.3.1"
                         }
                     }
                 });
@@ -254,7 +254,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
 
     let fetch_tool = serde_json::json!({
         "name": "get_page",
-        "description": "Fetch the content of a web page and extract its readable text. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). For academic papers: search first with web (engines: dblp, cnki, exa), then use this tool to read the full text. To read long content in chunks, pass startChar/endChar (0-based character offsets; the response includes totalLength so you can continue with startChar=endChar of the previous call). Uses proxy if configured. Returns the page title and extracted content as markdown.",
+        "description": "Fetch the content of a web page and extract its readable text. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). For academic papers: search first with web (engines: dblp, cnki, exa), then use this tool to read the full text. To read long content in chunks, pass startChar/endChar (0-based character offsets; the response includes totalLength so you can continue with startChar=endChar of the previous call). The response includes statusCode — non-200 (e.g. 404) means the target returned an error page. XML (RSS/Atom/sitemap) and text/plain (markdown/robots.txt) are returned verbatim without HTML extraction. Uses proxy if configured. Returns the page title and extracted content as markdown.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -441,7 +441,15 @@ async fn handle_fetch(args: &Value, config: &Config) -> String {
 
     eprintln!("🌐 Fetching URL: {}", url);
 
-    match fetch::fetch_url(&url, config).await {
+    // One automatic retry on timeout — Sogou redirect chains occasionally
+    // exceed the fetch timeout on the first attempt.
+    let mut fetch_result = fetch::fetch_url(&url, config).await;
+    if matches!(fetch_result, Err(fetch::FetchError::Timeout)) {
+        eprintln!("⏱️ Timeout on first attempt, retrying once...");
+        fetch_result = fetch::fetch_url(&url, config).await;
+    }
+
+    match fetch_result {
         Ok(result) => {
             let full = result.content;
             let total = full.chars().count();
@@ -479,6 +487,7 @@ async fn handle_fetch(args: &Value, config: &Config) -> String {
                 "site": result.site_name,
                 "content": content,
                 "contentType": result.content_type,
+                "statusCode": result.status_code,
                 "startChar": start,
                 "endChar": actual_end,
                 "totalLength": total,

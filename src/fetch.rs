@@ -350,6 +350,9 @@ pub struct FetchResult {
     pub content: String,
     pub content_type: String,
     pub site_name: String,
+    /// HTTP status code of the response. 200 on success; 404/410/451 carry
+    /// the error-page body so callers can distinguish "page gone" from content.
+    pub status_code: u16,
     #[allow(dead_code)]
     pub via: String, // "direct" or "jina"
 }
@@ -661,6 +664,7 @@ async fn fetch_arxiv_page(
         content,
         content_type,
         site_name: "arXiv".to_string(),
+        status_code: 200,
         via: "direct".into(),
     })
 }
@@ -699,6 +703,33 @@ fn is_pdf_response(content_type: &str, bytes: &[u8]) -> bool {
     let head_str = String::from_utf8_lossy(head);
     let trimmed = head_str.trim_start_matches('\u{feff}').trim_start();
     trimmed.starts_with("%PDF-")
+}
+
+/// True for XML content types (RSS/Atom/sitemap/...). These must be returned
+/// verbatim — running them through the HTML extractor destroys their structure.
+fn is_xml_content_type(content_type: &str) -> bool {
+    let ct = content_type.to_lowercase();
+    ct.starts_with("text/xml")
+        || ct.starts_with("application/xml")
+        || ct.starts_with("application/rss+xml")
+        || ct.starts_with("application/atom+xml")
+        || ct.ends_with("+xml")
+}
+
+/// True for raw text content types (text/plain). Returned verbatim to keep
+/// line structure and markdown link definitions intact.
+fn is_plain_text_type(content_type: &str) -> bool {
+    content_type.to_lowercase().starts_with("text/plain")
+}
+
+/// Strip CDATA wrappers from XML titles (e.g. `<![CDATA[BBC Chinese]]>`).
+fn clean_cdata(s: &str) -> String {
+    let t = s.trim();
+    if t.starts_with("<![CDATA[") && t.ends_with("]]>") {
+        t[9..t.len() - 3].to_string()
+    } else {
+        t.to_string()
+    }
 }
 
 // ─── Discourse API Fetcher ───
@@ -751,6 +782,7 @@ async fn fetch_discourse(url: &str, host: &str, config: &Config) -> Result<Fetch
             content,
             content_type: "text/markdown".into(),
             site_name,
+            status_code: 200,
             via: "discourse-api".into(),
         })
     } else {
@@ -765,6 +797,7 @@ async fn fetch_discourse(url: &str, host: &str, config: &Config) -> Result<Fetch
             content,
             content_type: "text/markdown".into(),
             site_name,
+            status_code: 200,
             via: "discourse-api".into(),
         })
     }
@@ -1065,6 +1098,7 @@ async fn fetch_zhihu(url: &str, host: &str, config: &Config) -> Result<FetchResu
         content,
         content_type: "text/markdown".into(),
         site_name,
+        status_code: 200,
         via: "zhihu-api".into(),
     })
 }
@@ -1118,7 +1152,7 @@ async fn fetch_csdn(url: &str, host: &str, config: &Config) -> Result<FetchResul
 
     let content = post_process_content(&content, host);
 
-    Ok(FetchResult { url: url.to_string(), title, content, content_type, site_name, via: "csdn-direct".into() })
+    Ok(FetchResult { url: url.to_string(), title, content, content_type, site_name, status_code: 200, via: "csdn-direct".into() })
 }
 
 async fn fetch_direct(url: &str, config: &Config) -> Result<FetchResult, FetchError> {
@@ -1145,9 +1179,7 @@ async fn fetch_direct(url: &str, config: &Config) -> Result<FetchResult, FetchEr
     })?;
 
     let status = resp.status();
-    if !status.is_success() {
-        return Err(FetchError::HttpStatus(status.as_u16(), status.as_str().to_string()));
-    }
+    let status_code = status.as_u16();
 
     let content_type = resp.headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1166,6 +1198,47 @@ async fn fetch_direct(url: &str, config: &Config) -> Result<FetchResult, FetchEr
         return Err(FetchError::PdfDetected(
             "the target returned a PDF document; retrying via PDF-capable reader".to_string(),
         ));
+    }
+
+    // Non-2xx: definitive client errors (404/410/451) return the body together
+    // with the status code, so callers can tell "page gone" from real content.
+    // Anti-bot statuses (403/429/5xx) keep the Jina Reader fallback path.
+    if !status.is_success() {
+        if matches!(status_code, 404 | 410 | 451) {
+            let raw = decode_html(&bytes, &content_type);
+            let title = clean_cdata(&extract_title(&raw));
+            let content = if is_xml_content_type(&content_type) || is_plain_text_type(&content_type) {
+                raw
+            } else {
+                extract_readable_content(&raw, &domain)
+            };
+            return Ok(FetchResult {
+                url: url.to_string(),
+                title,
+                content,
+                content_type,
+                site_name,
+                status_code,
+                via: "direct".into(),
+            });
+        }
+        return Err(FetchError::HttpStatus(status_code, status.as_str().to_string()));
+    }
+
+    // Structured/raw responses bypass the HTML extraction pipeline:
+    // XML (RSS/Atom/sitemap) and text/plain (markdown, robots.txt) would
+    // lose their structure or line layout to HTML parsing.
+    if is_xml_content_type(&content_type) || is_plain_text_type(&content_type) {
+        let raw = decode_html(&bytes, &content_type);
+        return Ok(FetchResult {
+            url: url.to_string(),
+            title: clean_cdata(&extract_title(&raw)),
+            content: raw,
+            content_type,
+            site_name,
+            status_code,
+            via: "direct".into(),
+        });
     }
 
     let html = decode_html(&bytes, &content_type);
@@ -1199,7 +1272,7 @@ async fn fetch_direct(url: &str, config: &Config) -> Result<FetchResult, FetchEr
     // Clean nav/sidebar junk from extracted content
     let content = post_process_content(&content, &domain);
 
-    Ok(FetchResult { url: url.to_string(), title, content, content_type, site_name, via: "direct".into() })
+    Ok(FetchResult { url: url.to_string(), title, content, content_type, site_name, status_code, via: "direct".into() })
 }
 
 // ─── WeChat Official Account (mp.weixin.qq.com) Fetcher ───
@@ -1279,6 +1352,7 @@ async fn fetch_weixin_article(url: &str, config: &Config) -> Result<FetchResult,
         content,
         content_type,
         site_name,
+        status_code: 200,
         via: "direct".into(),
     })
 }
@@ -1588,6 +1662,7 @@ async fn fetch_via_jina(url: &str, config: &Config) -> Result<FetchResult, Fetch
         content,
         content_type: "text/markdown".into(),
         site_name,
+        status_code: 200,
         via: "jina".into(),
     })
 }

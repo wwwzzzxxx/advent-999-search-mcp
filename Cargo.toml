@@ -1,6 +1,6 @@
 [package]
 name = "advent-999-search-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "advent-999-search-mcp MCP: web search + local file search (Everything)"
 edition = "2021"
 
