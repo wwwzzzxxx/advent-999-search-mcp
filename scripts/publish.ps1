@@ -201,6 +201,10 @@ function Invoke-GiteeJson {
   if ($LASTEXITCODE -ne 0) { Fail "Gitee API 请求失败: $out" }
   if (-not $out -or $out -eq "null") { return $null }
   $obj = $out | ConvertFrom-Json
+  # Gitee 列表类 API（如 /releases、/attach_files）返回 JSON 数组。
+  # 数组不是错误响应——若不加保护，成员枚举 $obj.message 会得到非空
+  # 数组（truthy）而误判为 API 错误。
+  if ($obj -is [System.Array]) { return $obj }
   if ($obj.message) { Fail "Gitee API 错误: $($obj.message) $($obj.messages -join ';')" }
   return $obj
 }
