@@ -37,11 +37,24 @@ import requests
 query = sys.stdin.read()
 key = os.environ["DEEPSEEK_API_KEY"]
 
+# Body must mirror build_body() used by the official backend — only the
+# endpoint and key differ between backends.
 body = {
     "model": os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
     "max_tokens": 2048,
+    "messages": [
+        {"role": "system", "content":
+            "You are a web search assistant. Use the web_search tool to find "
+            "up-to-date information, then summarize what you found in 2-4 "
+            "sentences in the same language as the query. Do not repeat "
+            "search results; just summarize."},
+        {"role": "user", "content": query}
+    ],
+    # `name` is REQUIRED — the OpenCode Go gateway 400s without it
+    # (the plain Anthropic standard form does not work there).
     "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-    "messages": [{"role": "user", "content": query}],
+    "tool_choice": {"type": "auto"},
+    "thinking": {"type": "disabled"}
 }
 r = requests.post("https://opencode.ai/zen/go/v1/messages",
                   headers={"x-api-key": key, "anthropic-version": "2023-06-01"},

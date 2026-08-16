@@ -1,5 +1,11 @@
 # advent-999-search-mcp 🔍
 
+> [English Docs](README.md)
+
+[![GitHub](https://img.shields.io/badge/GitHub-wwwzzzxxx%2Fadvent--999--search--mcp-181717?logo=github&style=flat)](https://github.com/wwwzzzxxx/advent-999-search-mcp)
+[![Gitee](https://img.shields.io/badge/Gitee-pzwzx%2Fadvent--999--search--mcp-C71D23?logo=gitee&style=flat)](https://gitee.com/pzwzx/advent-999-search-mcp)
+[![Release](https://img.shields.io/github/v/release/wwwzzzxxx/advent-999-search-mcp?label=Release)](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases)
+
 基于 Rust 的 MCP 服务器，为你的 AI 助手提供**网络搜索**、**本地文件搜索**和**网页抓取**能力。
 
 - **`web`** — 10 个搜索引擎（Exa、Bing、CSDN、掘金、Startpage、搜狗、微信、DBLP、知网 + 凭据门控的 DeepSeek）
@@ -8,7 +14,7 @@
 
 ### 为什么选 advent？
 
-- 🪶 **极低内存占用** — 使用 Rust 编写，单文件 exe 仅 ~17 MB（内置 Python 运行时），运行时内存占用极小
+- 🪶 **极低内存占用** — 使用 Rust 编写，单文件二进制：Windows 约 18 MB（内置 Python 运行时），Linux/macOS 约 7 MB（使用系统 Python 3），运行时内存占用极小
 - ⚙️ **轻量化配置** — 开箱即用，无需繁琐依赖
 - 🌐 **智能 `get_page`** — 能抓取并渲染几乎所有网站：支持 JS 渲染页面、需登录页面（知乎、Discourse）、复杂 HTML，自动降级策略保证成功率
 
@@ -20,7 +26,9 @@
 
 ### 1. 获取可执行文件
 
-**方式一：直接下载**（推荐）：从 [Releases 页面](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases) 下载最新的 `.exe`。
+**方式一：直接下载**（推荐）：从 [Releases 页面](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases) 下载对应平台的二进制：
+- `advent-999-search-mcp.exe` — Windows
+- `advent-999-search-mcp-linux` — Linux（下载后执行 `chmod +x` 赋予可执行权限）
 
 **方式二：从源码编译**：
 
@@ -28,21 +36,35 @@
 git clone https://github.com/wwwzzzxxx/advent-999-search-mcp.git
 cd advent-999-search-mcp
 
-# 第 1 步（必需）：生成内置 Python 运行时 zip
+# 仅 Windows（第 1 步，必需）：生成内置 Python 运行时 zip
 # （下载 Python 3.12 embeddable + 安装 requests，约 12 MB，产物已被 gitignore）
 ./scripts/prepare_python_embed.ps1
 
 # 第 2 步：编译
 cargo build --release
-# 编译产物：target/release/advent-999-search-mcp.exe（约 17 MB）
+# 编译产物：target/release/advent-999-search-mcp.exe（约 18 MB）
+```
+
+**Linux/macOS 编译**：无需内置 Python zip（二进制不会嵌入）。安装编译依赖后正常编译：
+
+```bash
+sudo apt install pkg-config libssl-dev   # Debian/Ubuntu，其他发行版请自行调整
+cargo build --release
+# 编译产物：target/release/advent-999-search-mcp（约 7 MB）
 ```
 
 > **为什么内置 Python？** `deepseek` 引擎的 OpenCode Go 后端调用
 > `opencode.ai`，该站有 Cloudflare TLS 指纹检测——会拦截 reqwest/curl 的
-> 指纹，但放行 Python urllib3/OpenSSL 的指纹。内置运行时（首次使用自动解压到
-> `%LOCALAPPDATA%\advent-mcp-python`）让这一切无需额外安装 Python 即可工作。
+> 指纹，但放行 Python urllib3/OpenSSL 的指纹。
+> **Windows**：内置运行时（首次使用自动解压到 `%LOCALAPPDATA%\advent-mcp-python`）
+> 让这一切无需额外安装 Python 即可工作。
+> **Linux/macOS**：二进制改用**系统 `python3`** —— 只需确保系统装有 Python 3 及
+> `requests` 库（`apt install python3-requests` 或 `pip install requests`）。
+> 若缺失，go 后端会报错并提示安装方法。
 
 ### 2. （可选）安装 Everything 以启用本地搜索
+
+> **仅 Windows** — Everything 没有 Linux/macOS 版本；在这些平台上（未设置 `EVERYTHING_ES_PATH` 时）`local` 工具会自动隐藏。
 
 如果需要本地文件搜索功能，请安装 voidtools 的 Everything：
 
@@ -190,7 +212,7 @@ searchMode (string)             — "request" | "auto" | "playwright"
 凭据门控引擎（已实现，设置密钥前隐藏——配置环境变量后自动出现在 `tools/list`）：
 - **`deepseek`** — 基于 LLM 的搜索，通过 Anthropic 兼容 Messages API 调用服务端 `web_search_20250305` 工具。按 key 格式自动检测后端：
   - **official** — DeepSeek 官方 API key（`sk-`+32 位十六进制）→ `api.deepseek.com`（国内直连，无需代理）
-  - **go** — OpenCode Go 订阅 key（`sk-`+64 字符）→ `opencode.ai`（走代理）。使用内置 Python 运行时（见构建说明）。返回的 AI 总结会附加到第一条结果的 `summary` 字段。
+  - **go** — OpenCode Go 订阅 key（`sk-`+64 字符）→ `opencode.ai`（走代理）。通过 Python 调用（Windows 用内置运行时，Linux/macOS 用系统 `python3`，见编译说明）。返回的 AI 总结会附加到第一条结果的 `summary` 字段。
 
 通过环境变量设置密钥后，引擎会自动出现在 `tools/list` 中；未设置密钥时保持隐藏。
 

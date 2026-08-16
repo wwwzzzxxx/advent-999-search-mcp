@@ -76,7 +76,7 @@ async fn main() {
                         },
                         "serverInfo": {
                             "name": "advent-999-search-mcp",
-                            "version": "0.3.1"
+                            "version": "0.4.0"
                         }
                     }
                 });

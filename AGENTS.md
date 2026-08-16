@@ -27,13 +27,13 @@ cargo build --release                # 产物 target/release/advent-999-search-m
 | 文件 | 职责 |
 |------|------|
 | `src/main.rs` | MCP 入口，JSON-RPC 消息循环，工具分发 |
-| `src/config.rs` | 全部配置均来自环境变量；`DEFAULT_DIRECT_DOMAINS` 默认国内直连域名表。完整环境变量清单（含 `DEFAULT_SEARCH_ENGINE`、`FETCH_TIMEOUT`、`FETCH_COOKIES` 等）见 [README.md 第 3 节](README.md) |
+| `src/config.rs` | 全部配置均来自环境变量；`DEFAULT_DIRECT_DOMAINS` 默认国内直连域名表。完整环境变量清单见 [README.md 第 3 节](README.md)。门控要点：`EXA_API_KEY` 开 exa、`DEEPSEEK_API_KEY` 开 deepseek、`EVERYTHING_ES_PATH` 开 local 工具（未设置则 local 工具不注册）、`DEEPSEEK_MODEL` 覆盖模型名 |
 | `src/models.rs` | `SearchResult`（含 `summary: Option<String>`，序列化时跳过 None）、`SearchError` 等 |
 | `src/engines/mod.rs` | `SearchEngine` trait、`create_engine_map()`、`credential_gated_engines()` |
 | `src/engines/*.rs` | 各引擎实现 |
-| `src/fetch.rs` | HTTP 抓取与正文提取：代理/直连分流、cookie、超时。**~2300 行大文件**，含 ElementRef→markdown 转换管线、zhihu 签名抓取（zhihu_sign）、反爬回退策略。改动前务必通读相关段落，勿盲目重写 |
-| `src/local_search.rs` | Everything 本地搜索 |
-| `src/python_embed.rs` | 内嵌 Python 运行时的解压与定位 |
+| `src/fetch.rs` | HTTP 抓取与正文提取：代理/直连分流、cookie、超时。**~2300 行大文件**，含 ElementRef→markdown 转换管线、zhihu 签名抓取（zhihu_sign）、反爬回退策略。改动前务必通读相关段落，勿盲目重写。定位入口：`fetch_url` 按域名分流——zhihu → `fetch_zhihu`（需 `FETCH_COOKIES` + `d_c0` 签名）、weixin → `fetch_weixin_article`、sogou 微信跳转 → `fetch_sogou_weixin_link`、其他 → `fetch_direct` 失败/低质量再 `fetch_via_jina` |
+| `src/local_search.rs` | Everything 本地搜索（es.exe）——Windows 专属；Linux/macOS 上无 es.exe，`EVERYTHING_ES_PATH` 未设置时 local 工具自动不注册 |
+| `src/python_embed.rs` | 内嵌 Python 运行时（**Windows**：解压 `python-embed.zip` 到 `%LOCALAPPDATA%`；**Linux/macOS**：直接返回系统 `python3`，需装 requests，不嵌入 zip） |
 | `scripts/prepare_python_embed.ps1` | 下载 Python 3.12 embeddable + 安装 requests，重打包为 `python-embed.zip` |
 | `scripts/publish.ps1` | 构建 → 打 tag → 推送 → 双平台 Release + 附件上传 |
 
@@ -56,8 +56,14 @@ cargo build --release                # 产物 target/release/advent-999-search-m
 - **go**：OpenCode Go 订阅（`opencode.ai/zen/go/v1/messages`），**必须走内嵌 Python** 调用——opencode.ai 在 Cloudflare 后面，检测 TLS 指纹，reqwest/curl 被 500 拦截，Python urllib3 可通过
 - 后端按 key 格式自动识别：`sk-`+32hex（35 字符）= official；`sk-`+64 字符（67 字符）= go；`DEEPSEEK_API_MODE=official|go` 可强制
 
-### 5. 内嵌 Python
-`python-embed.zip` 通过 `include_bytes!` 编译进 exe；首次运行解压到 `%LOCALAPPDATA%\advent-mcp-python`，`.version` marker 控制版本（改 zip 后必须 bump `PYTHON_EMBED_VERSION`）。go 后端用 `spawn_blocking` 启动 `python.exe`，脚本以 stdin 传 query、从 `os.environ` 读 key，输出 JSON。
+### 5. 内嵌 Python（跨平台）
+`python-embed.zip` 通过 `include_bytes!` 编译进 **Windows** exe；首次运行解压到 `%LOCALAPPDATA%\advent-mcp-python`，`.version` marker 控制版本（改 zip 后必须 bump `PYTHON_EMBED_VERSION`）。go 后端用 `spawn_blocking` 启动 `python.exe`，脚本以 stdin 传 query、从 `os.environ` 读 key，输出 JSON。
+**Linux/macOS**：`python_exe()` 返回系统 `python3`（每次调用前探测 `import requests`，失败给出安装提示），脚本相同；Windows 专有符号全部 `#[cfg(target_os = "windows")]` 隔离，Linux 二进制不嵌入 zip（体积 ~7MB vs Windows ~18MB）。
+
+### 6. Linux 构建与运行要点（WSL 实测 2026-08-16）
+- 依赖：`apt install pkg-config libssl-dev`；target 目录建议放 WSL 内（如 `CARGO_TARGET_DIR=/home/user/advent-target`），避免 /mnt/c 9P 文件系统拖慢编译
+- `local` 工具在 Linux 自动隐藏（无 Everything）；Jina fallback（r.jina.ai）在无代理时被 DNS 污染不可达，**必须配 `PROXY_URL` 才能用 get_page 的 Jina 兜底**（普通直连抓取不受影响）
+- dblp 引擎：服务器对 `Accept-Encoding: gzip, deflate, br` 返回 500，dblp.rs 已显式覆盖为 `gzip`（Windows 同样受益）
 
 ## 添加新引擎的工作流
 
@@ -73,6 +79,7 @@ cargo build --release                # 产物 target/release/advent-999-search-m
 - 启动日志走 stderr（引擎列表、代理/直连域、deepseek 模式识别都会打印）
 - 手动测试：`echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"web","arguments":{"query":"test"}}}' | target\release\advent-999-search-mcp.exe`
 - 注意区分引擎无结果（正常）与引擎报错（`SearchError`），两种都算"搜索完成"
+- **无自动化测试**（无 tests/ 目录、无 `#[test]`）：所有验证都靠手工 JSON-RPC 喂 stdin + stderr 日志，改代码后必须按下方流程实测
 
 ### 编译与替换 exe 的硬性流程（变更代码后必须遵守）
 
@@ -92,11 +99,12 @@ cargo build --release                # 产物 target/release/advent-999-search-m
 - ❌ 删除或 gitignore 变更 `python-embed.zip`（构建必需，已 gitignore）
 - ❌ 随意改 `DEFAULT_DIRECT_DOMAINS` 默认值（影响所有国内用户的反验证码策略）
 - ❌ 未经测试验证直接替换正在运行的 MCP 二进制（exe 进程经常有 agent 程序在使用；会中断用户上下文，成本高）
+- ❌ 提交 `vendor/` 变更（`Everything.ini` / `es.exe` / Setup.exe 含本机配置，目前未 gitignore，建议加入 .gitignore 或移出仓库）
 - ❌ 编译测试时直接 `cargo build --release` 覆盖运行中的 exe（会失败并可能中断会话）——先用 debug 构建在 `target\debug\` 验证，通过后再替换
 
 ## 发布流程（publish.ps1 已封装）
 
 1. 更新 `Cargo.toml` 版本号 + `src/main.rs` serverInfo
-2. 构建 release，确认二进制字节数（当前 v0.3.0 = 17,812,480 bytes）
+2. 构建 release，确认二进制字节数（当前版本 v0.3.1，字节数以实际构建为准）
 3. `./scripts/publish.ps1`：push 双 remote（GitHub `wwwzzzxxx` + Gitee `pzwzx`）→ 两平台创建/更新 Release → 上传附件
 4. 验证两平台附件字节数一致（Gitee API 需要 `target_commitish` 字段）

@@ -30,6 +30,9 @@ impl SearchEngine for DblpEngine {
                 ("f", "0"),
             ])
             .header("Accept", "application/json")
+            // Override the client default `Accept-Encoding: gzip, deflate, br`:
+            // dblp.org's server returns HTTP 500 when `br` (brotli) is offered.
+            .header(reqwest::header::ACCEPT_ENCODING, "gzip")
             .send()
             .await
             .map_err(|e| SearchError::Http(format!("DBLP request failed: {}", e)))?;

@@ -2,6 +2,10 @@
 
 > [中文文档](README.zh-CN.md)
 
+[![GitHub](https://img.shields.io/badge/GitHub-wwwzzzxxx%2Fadvent--999--search--mcp-181717?logo=github&style=flat)](https://github.com/wwwzzzxxx/advent-999-search-mcp)
+[![Gitee](https://img.shields.io/badge/Gitee-pzwzx%2Fadvent--999--search--mcp-C71D23?logo=gitee&style=flat)](https://gitee.com/pzwzx/advent-999-search-mcp)
+[![Release](https://img.shields.io/github/v/release/wwwzzzxxx/advent-999-search-mcp?label=Release)](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases)
+
 A Rust-based MCP server that gives your AI assistant **web search**, **local file search**, and **web page fetching** abilities.
 
 - **`web`** — Search with 10 engines (Exa, Bing, CSDN, Juejin, Startpage, Sogou, Weixin, DBLP, CNKI + credential-gated DeepSeek)
@@ -10,7 +14,7 @@ A Rust-based MCP server that gives your AI assistant **web search**, **local fil
 
 ### Why advent?
 
-- 🪶 **Extremely low memory** — Written in Rust, ~17 MB single binary (includes embedded Python runtime), minimal runtime footprint
+- 🪶 **Extremely low memory** — Written in Rust. Single binary: ~18 MB on Windows (includes embedded Python runtime), ~7 MB on Linux/macOS (uses system Python 3). Minimal runtime footprint
 - ⚙️ **Minimal configuration** — Works out of the box with sensible defaults, no heavy dependencies
 - 🌐 **Smart `get_page`** — Fetches and renders content from almost any site: handles JS-rendered pages, authenticated pages (Zhihu, Discourse), and complex HTML, all with automatic fallback strategies
 
@@ -22,7 +26,9 @@ A Rust-based MCP server that gives your AI assistant **web search**, **local fil
 
 ### 1. Get the binary
 
-**Option A — Download** (recommended): Get the latest `.exe` from the [Releases page](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases).
+**Option A — Download** (recommended): Get the binary for your platform from the [Releases page](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases):
+- `advent-999-search-mcp.exe` — Windows
+- `advent-999-search-mcp-linux` — Linux (make it executable with `chmod +x`)
 
 **Option B — Build from source**:
 
@@ -30,22 +36,35 @@ A Rust-based MCP server that gives your AI assistant **web search**, **local fil
 git clone https://github.com/wwwzzzxxx/advent-999-search-mcp.git
 cd advent-999-search-mcp
 
-# Step 1 (required): build the embedded Python runtime zip (downloads Python
-# 3.12 embeddable + installs requests, ~12 MB, output is gitignored)
+# Windows only (Step 1, required): build the embedded Python runtime zip
+# (downloads Python 3.12 embeddable + installs requests, ~12 MB, gitignored)
 ./scripts/prepare_python_embed.ps1
 
 # Step 2: build
 cargo build --release
-# Binary at: target/release/advent-999-search-mcp.exe (~17 MB)
+# Binary at: target/release/advent-999-search-mcp.exe (~18 MB)
+```
+
+**Linux/macOS build**: no embedded Python zip is needed (the binary does not embed it). Install build deps and build normally:
+
+```bash
+sudo apt install pkg-config libssl-dev   # Debian/Ubuntu; adjust for your distro
+cargo build --release
+# Binary at: target/release/advent-999-search-mcp (~7 MB)
 ```
 
 > **Why the embedded Python?** The `deepseek` engine's OpenCode Go backend calls
 > `opencode.ai`, which sits behind Cloudflare TLS-fingerprint detection — it
 > blocks reqwest/curl fingerprints but passes Python's urllib3/OpenSSL one.
-> The embedded runtime (auto-extracted to `%LOCALAPPDATA%\advent-mcp-python`
+> **Windows**: the embedded runtime (auto-extracted to `%LOCALAPPDATA%\advent-mcp-python`
 > on first use) makes this work with zero external Python installation.
+> **Linux/macOS**: the binary uses the **system `python3`** instead — just make sure
+> Python 3 with the `requests` library is installed (`apt install python3-requests`
+> or `pip install requests`). The go backend is disabled with an install hint if missing.
 
 ### 2. (Optional) Install Everything for local file search
+
+> **Windows only** — Everything has no Linux/macOS version; the `local` tool is automatically hidden on those platforms (when `EVERYTHING_ES_PATH` is unset).
 
 If you want local file search, install Everything by voidtools:
 
@@ -195,7 +214,7 @@ Supported engines (10 total, all tested): Exa (default), Bing, CSDN, Juejin, Sta
 Credential-gated engines (implemented, hidden until key set — appear automatically in `tools/list` when the env var is present):
 - **`deepseek`** — LLM-backed web search via the Anthropic-compatible Messages API with the server-side `web_search_20250305` tool. Two backends auto-detected from key format:
   - **official** — DeepSeek official API key (`sk-`+32 hex) → `api.deepseek.com` (direct, no proxy needed)
-  - **go** — OpenCode Go subscription key (`sk-`+64 chars) → `opencode.ai` via proxy. Runs on the embedded Python runtime (see build note). Returns an AI summary attached to the first result (`summary` field).
+  - **go** — OpenCode Go subscription key (`sk-`+64 chars) → `opencode.ai` via proxy. Runs via Python (embedded runtime on Windows, system `python3` on Linux/macOS — see build note). Returns an AI summary attached to the first result (`summary` field).
 
 When the key is set via the env var, the engine is automatically listed in `tools/list`; without the key it stays hidden.
 
