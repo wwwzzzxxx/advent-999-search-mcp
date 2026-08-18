@@ -472,6 +472,39 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
         }
     }
 
+    // ── GitHub issue/PR → fetch page + append comments via REST API ──
+    // GitHub renders comments client-side (React), so the HTML page only
+    // contains the issue body. The public REST API (api.github.com) returns
+    // all comments as JSON without authentication (60 req/h unauthenticated),
+    // so we append them to the page content. Comment fetch is best-effort:
+    // failure to get comments never fails the page fetch itself.
+    if let Some((owner, repo, number)) = extract_github_issue(url) {
+        let mut result = if prefer_jina {
+            // JS-heavy site → try Jina first, fallback to direct
+            match fetch_via_jina(url, config).await {
+                Ok(r) => r,
+                Err(_) => fetch_direct(url, config).await?,
+            }
+        } else {
+            // Normal site → try direct first, fallback to Jina
+            match fetch_direct(url, config).await {
+                Ok(r) => r,
+                Err(FetchError::PdfDetected(_)) | Err(_) => {
+                    match fetch_via_jina(url, config).await {
+                        Ok(r) => r,
+                        Err(jina_err) => return Err(jina_err),
+                    }
+                }
+            }
+        };
+        if let Ok(comments) = fetch_github_comments(&owner, &repo, &number, config).await {
+            if !comments.is_empty() {
+                result.content.push_str(&comments);
+            }
+        }
+        return Ok(result);
+    }
+
     if prefer_jina {
         // JS-heavy site → try Jina first, fallback to direct
         match fetch_via_jina(url, config).await {
@@ -498,6 +531,97 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
             }
         }
     }
+}
+
+/// Extract (owner, repo, issue/PR number) from a GitHub issue/PR URL.
+///
+/// Matches `https://github.com/{owner}/{repo}/issues/{n}` and
+/// `https://github.com/{owner}/{repo}/pull/{n}` (with optional query/hash).
+fn extract_github_issue(url: &str) -> Option<(String, String, String)> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    if !host.contains("github.com") {
+        return None;
+    }
+    let segs: Vec<&str> = parsed.path().split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() == 4 && (segs[2] == "issues" || segs[2] == "pull") {
+        let number = segs[3].split(['?', '#']).next().unwrap_or("");
+        if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) {
+            return Some((
+                segs[0].to_string(),
+                segs[1].to_string(),
+                number.to_string(),
+            ));
+        }
+    }
+    None
+}
+
+/// Fetch all comments of a GitHub issue/PR via the public REST API.
+///
+/// Returns a markdown-formatted comment section (empty string when the
+/// issue has no comments). Uses the same proxy/direct routing as other
+/// fetches; api.github.com is not in DIRECT_DOMAINS so it follows the
+/// configured proxy by default.
+async fn fetch_github_comments(
+    owner: &str,
+    repo: &str,
+    number: &str,
+    config: &Config,
+) -> Result<String, FetchError> {
+    let api_url = format!(
+        "https://api.github.com/repos/{}/{}/issues/{}/comments?per_page=100",
+        owner, repo, number
+    );
+    let client = build_fetch_client(config, "api.github.com")?;
+    let resp = client
+        .get(&api_url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(
+            reqwest::header::USER_AGENT,
+            "advent-999-search-mcp (github issue comments fetcher)",
+        )
+        .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| FetchError::Http(format!("GitHub API request failed: {}", e)))?;
+
+    if !resp.status().is_success() {
+        return Err(FetchError::HttpStatus(
+            resp.status().as_u16(),
+            resp.status().as_str().to_string(),
+        ));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| FetchError::Http(format!("Failed to read GitHub API body: {}", e)))?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| FetchError::Http(format!("Failed to parse GitHub API JSON: {}", e)))?;
+
+    let comments = json
+        .as_array()
+        .ok_or_else(|| FetchError::Http("Unexpected GitHub API response".into()))?;
+    if comments.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut out = String::from("\n\n---\n\n## 💬 评论 (Comments)\n\n");
+    for c in comments {
+        let user = c
+            .get("user")
+            .and_then(|u| u.get("login"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let created = c
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!("### {} · {}\n\n{}\n\n", user, created, body));
+    }
+    Ok(out)
 }
 
 // ─── arXiv Paper Fetcher ───

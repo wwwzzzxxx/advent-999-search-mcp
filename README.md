@@ -247,6 +247,7 @@ Smart fetching strategy:
 - **Discourse** forums → JSON API
 - **WeChat articles** (`mp.weixin.qq.com`) → MicroMessenger UA direct fetch
 - **Sogou WeChat links** (`weixin.sogou.com/link?url=...`) → JS-URL resolution + fetch
+- **GitHub issues/PRs** → page body + all comments appended via the public REST API (comments are client-side rendered on the HTML page, so they are fetched from `api.github.com` and appended as markdown)
 - **arXiv papers** → accepts a paper ID (`2401.12345`, `arXiv:2401.12345`, or an `arxiv.org/abs/...` URL) and returns the paper's HTML content (official `arxiv.org/html/` conversion, falling back to ar5iv for older papers)
 - **JS-heavy sites** → Jina Reader fallback
 - **Normal sites** → direct HTTP with HTML-to-Markdown

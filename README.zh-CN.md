@@ -245,6 +245,7 @@ maxLength (number, 最大 200000) — 最大内容长度
 - **Discourse** 论坛 → JSON API
 - **微信公众号**（`mp.weixin.qq.com`）→ 微信 UA 直抓
 - **搜狗微信跳转**（`weixin.sogou.com/link?url=...`）→ JS 拼接 URL 解析 + 抓取
+- **GitHub issue/PR** → 页面正文 + 全部评论（评论在 HTML 页面中是客户端动态渲染的，通过 `api.github.com` REST API 获取并以 Markdown 追加到正文后）
 - **arXiv 论文** → 接受论文号（`2401.12345`、`arXiv:2401.12345` 或 `arxiv.org/abs/...` 链接），返回论文 HTML 内容（优先官方 `arxiv.org/html/` 转换版，老论文自动降级到 ar5iv）
 - **JS 密集型站点** → 自动降级到 Jina Reader
 - **普通站点** → 直接 HTTP + HTML 转 Markdown
