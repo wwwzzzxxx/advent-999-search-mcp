@@ -5,7 +5,9 @@
 Rust 编写的 MCP 服务器，提供三类工具：
 - **`web`** — 网络搜索（10 个引擎：exa, bing, csdn, juejin, startpage, sogou, weixin, dblp, cnki + 凭据门控的 deepseek）
 - **`local`** — 本地文件搜索（Everything / es.exe，未配置时工具不出现）
-- **`get_page`** — 抓取网页正文（自动回退策略，支持需要登录 cookie 的站点）
+- **`get_page`** — 抓取网页正文（自动回退策略，支持需要登录 cookie 的站点；支持 find 服务端子串搜索模式，只返回匹配上下文窗口以省 token）
+- get_page 的 find 模式在 `src/main.rs::handle_fetch` 实现：先正常抓取再做字面子串匹配（默认 ASCII 大小写不敏感）→ 合并重叠窗口 → 只返回 matches 上下文（带绝对字符偏移），忽略 startChar/endChar/maxLength，totalMatches 始终为全量命中数
+- get_page 的 YouTube 字幕在 `src/fetch.rs::fetch_youtube_subtitle` 实现：watch 页取 INNERTUBE_API_KEY → Innertube player API（ANDROID 20.10.38，WEB 会被 POT/BotGuard 拦）→ captionTracks 选轨（手动英文 > 手动任意 > 自动英文 > 首个）→ timedtext json3 转 SRT；强制走代理（不可进 DIRECT_DOMAINS），匿名即可；非视频页（channel/playlist）回落通用抓取
 
 协议：stdio + JSON-RPC 2.0，逐行从 stdin 读入。技术栈：Rust 2021、tokio、reqwest 0.12（json/socks/cookies/gzip/brotli/deflate）、scraper、zip 2.x、aes、zhihu_sign（知乎 x-zse-96 请求签名，SM4）。
 
@@ -31,7 +33,7 @@ cargo build --release                # 产物 target/release/advent-999-search-m
 | `src/models.rs` | `SearchResult`（含 `summary: Option<String>`，序列化时跳过 None）、`SearchError` 等 |
 | `src/engines/mod.rs` | `SearchEngine` trait、`create_engine_map()`、`credential_gated_engines()` |
 | `src/engines/*.rs` | 各引擎实现 |
-| `src/fetch.rs` | HTTP 抓取与正文提取：代理/直连分流、cookie、超时。**~2300 行大文件**，含 ElementRef→markdown 转换管线、zhihu 签名抓取（zhihu_sign）、反爬回退策略。改动前务必通读相关段落，勿盲目重写。定位入口：`fetch_url` 按域名分流——zhihu → `fetch_zhihu`（需 `FETCH_COOKIES` + `d_c0` 签名）、weixin → `fetch_weixin_article`、sogou 微信跳转 → `fetch_sogou_weixin_link`、其他 → `fetch_direct` 失败/低质量再 `fetch_via_jina` |
+| `src/fetch.rs` | HTTP 抓取与正文提取：代理/直连分流、cookie、超时。**~2300 行大文件**，含 ElementRef→markdown 转换管线、zhihu 签名抓取（zhihu_sign）、反爬回退策略。改动前务必通读相关段落，勿盲目重写。定位入口：`fetch_url` 按域名分流——zhihu → `fetch_zhihu`（需 `FETCH_COOKIES` + `d_c0` 签名）、weixin → `fetch_weixin_article`、sogou 微信跳转 → `fetch_sogou_weixin_link`、YouTube 视频（watch/shorts/live/embed/youtu.be）→ `fetch_youtube_subtitle`（Innertube ANDROID client，自建强制走代理的 reqwest client，**不可**用 `build_fetch_client` 因为 youtube 绝不能进 DIRECT_DOMAINS；youtube-nocookie.com 无视频 id，直接回落通用抓取）、bilibili 视频 → `fetch_bilibili_subtitle`（`bilibili_api_get` 浏览器头过 WAF，`finger/spi` 补 buvid3；SESSDATA 缺失时字幕列表为空属正常）、GitHub issue/PR（`github.com/{owner}/{repo}/issues|pull/{n}`）→ 页面抓取后追加 `fetch_github_comments`（公开 REST API 免鉴权 60 req/h，评论是客户端渲染的，best-effort 失败不影响正文）、其他 → `fetch_direct` 失败/低质量再 `fetch_via_jina` |
 | `src/local_search.rs` | Everything 本地搜索（es.exe）——Windows 专属；Linux/macOS 上无 es.exe，`EVERYTHING_ES_PATH` 未设置时 local 工具自动不注册 |
 | `src/python_embed.rs` | 内嵌 Python 运行时（**Windows**：解压 `python-embed.zip` 到 `%LOCALAPPDATA%`；**Linux/macOS**：直接返回系统 `python3`，需装 requests，不嵌入 zip） |
 | `scripts/prepare_python_embed.ps1` | 下载 Python 3.12 embeddable + 安装 requests，重打包为 `python-embed.zip` |
@@ -105,6 +107,6 @@ cargo build --release                # 产物 target/release/advent-999-search-m
 ## 发布流程（publish.ps1 已封装）
 
 1. 更新 `Cargo.toml` 版本号 + `src/main.rs` serverInfo
-2. 构建 release，确认二进制字节数（当前版本 v0.3.1，字节数以实际构建为准）
+2. 构建 release，确认二进制字节数（版本以 `Cargo.toml` 为准，当前 v0.4.1；字节数以实际构建为准）
 3. `./scripts/publish.ps1`：push 双 remote（GitHub `wwwzzzxxx` + Gitee `pzwzx`）→ 两平台创建/更新 Release → 上传附件
 4. 验证两平台附件字节数一致（Gitee API 需要 `target_commitish` 字段）

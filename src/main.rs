@@ -76,7 +76,7 @@ async fn main() {
                         },
                         "serverInfo": {
                             "name": "advent-999-search-mcp",
-                            "version": "0.4.1"
+                            "version": "0.5.0"
                         }
                     }
                 });
@@ -254,7 +254,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
 
     let fetch_tool = serde_json::json!({
         "name": "get_page",
-        "description": "Fetch the content of a web page and extract its readable text. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). For academic papers: search first with web (engines: dblp, cnki, exa), then use this tool to read the full text. To read long content in chunks, pass startChar/endChar (0-based character offsets; the response includes totalLength so you can continue with startChar=endChar of the previous call). The response includes statusCode — non-200 (e.g. 404) means the target returned an error page. XML (RSS/Atom/sitemap) and text/plain (markdown/robots.txt) are returned verbatim without HTML extraction. Uses proxy if configured. Returns the page title and extracted content as markdown.",
+        "description": "Fetch the content of a web page and extract its readable text. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). Bilibili video URLs (bilibili.com/video/BVxxx, optional ?p=N for multi-part videos) return the subtitle track as SRT — requires SESSDATA in FETCH_COOKIES, since Bilibili only serves the subtitle list to logged-in users. YouTube video URLs (youtube.com/watch?v=ID, /shorts/ID, /live/ID, /embed/ID, youtu.be/ID) return the caption track as SRT — anonymous, no login needed (needs proxy egress outside mainland). For academic papers: search first with web (engines: dblp, cnki, exa), then use this tool to read the full text. To read long content in chunks, pass startChar/endChar (0-based character offsets; the response includes totalLength so you can continue with startChar=endChar of the previous call). To avoid reading the full text, pass find (a literal substring): the server searches the fetched text and returns only the matching contexts — much cheaper than pulling the whole page and scanning it yourself. In find mode startChar/endChar/maxLength are ignored; the response carries matches (merged context windows, each with the hits inside) plus totalMatches instead of content. The response includes statusCode — non-200 (e.g. 404) means the target returned an error page. XML (RSS/Atom/sitemap) and text/plain (markdown/robots.txt) are returned verbatim without HTML extraction. Uses proxy if configured. Returns the page title and extracted content as markdown.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -275,6 +275,25 @@ fn list_tools(config: &Config) -> Vec<Value> {
                 "endChar": {
                     "type": "number",
                     "description": "Read up to this character offset (exclusive). Defaults to startChar + maxLength"
+                },
+                "find": {
+                    "type": "string",
+                    "description": "Literal substring to search for in the fetched text. When set, the server returns only merged context windows around matches (no full content), saving tokens."
+                },
+                "contextChars": {
+                    "type": "number",
+                    "description": "Context characters kept before/after each match in find mode (default: 200)",
+                    "default": 200
+                },
+                "maxMatches": {
+                    "type": "number",
+                    "description": "Max context windows returned in find mode (default: 20, max: 50). totalMatches still reports the full count.",
+                    "default": 20
+                },
+                "matchCase": {
+                    "type": "boolean",
+                    "description": "Case-sensitive matching in find mode (ASCII only; default: false)",
+                    "default": false
                 }
             },
             "required": ["url"]
@@ -453,6 +472,106 @@ async fn handle_fetch(args: &Value, config: &Config) -> String {
         Ok(result) => {
             let full = result.content;
             let total = full.chars().count();
+
+            // ── find mode: literal substring search over the fetched text ──
+            // Returns only merged context windows around matches, so callers
+            // don't have to pull the full page and scan it with attention.
+            // startChar/endChar/maxLength are ignored in this mode.
+            if args.get("find").is_some() {
+                let needle = args["find"].as_str().unwrap_or("");
+                if needle.is_empty() {
+                    return serde_json::to_string_pretty(&serde_json::json!({
+                        "error": "find must not be empty"
+                    })).unwrap_or_default();
+                }
+                let context_chars = (args["contextChars"].as_f64().unwrap_or(200.0) as usize).min(2000);
+                let max_matches = (args["maxMatches"].as_f64().unwrap_or(20.0) as usize).clamp(1, 50);
+                let match_case = args["matchCase"].as_bool().unwrap_or(false);
+
+                let hay: Vec<char> = full.chars().collect();
+                let pat: Vec<char> = needle.chars().collect();
+                let mut hits: Vec<(usize, usize)> = Vec::new();
+                if pat.len() <= hay.len() {
+                    for i in 0..=hay.len() - pat.len() {
+                        let mut ok = true;
+                        for j in 0..pat.len() {
+                            let (c, p) = (hay[i + j], pat[j]);
+                            if c != p && (match_case || !c.eq_ignore_ascii_case(&p)) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            hits.push((i, i + pat.len()));
+                        }
+                    }
+                }
+                let total_matches = hits.len();
+                eprintln!("🔎 find {:?} → {} matches (case={})", needle, total_matches, match_case);
+
+                // Merge overlapping/adjacent context windows.
+                let mut windows: Vec<(usize, usize)> = Vec::new();
+                for (s, e) in &hits {
+                    let ws = s.saturating_sub(context_chars);
+                    let we = std::cmp::min(e + context_chars, total);
+                    if let Some(last) = windows.last_mut() {
+                        if ws <= last.1 {
+                            last.1 = last.1.max(we);
+                            continue;
+                        }
+                    }
+                    windows.push((ws, we));
+                }
+                let total_windows = windows.len();
+                let truncated = total_windows > max_matches;
+                windows.truncate(max_matches);
+
+                // Attribute hits to their (possibly merged) window.
+                let mut matches = Vec::new();
+                let mut hi = 0;
+                for (ws, we) in &windows {
+                    let mut win_hits = Vec::new();
+                    while hi < hits.len() && hits[hi].0 < *we {
+                        // Defensive: skip any hit ending before this window.
+                        if hits[hi].1 > *ws {
+                            win_hits.push(serde_json::json!({
+                                "startChar": hits[hi].0,
+                                "endChar": hits[hi].1,
+                            }));
+                        }
+                        hi += 1;
+                    }
+                    let context: String = hay[*ws..*we].iter().collect();
+                    matches.push(serde_json::json!({
+                        "startChar": ws,
+                        "endChar": we,
+                        "hits": win_hits,
+                        "context": context,
+                    }));
+                }
+
+                let mut response = serde_json::json!({
+                    "url": result.url,
+                    "title": result.title,
+                    "site": result.site_name,
+                    "contentType": result.content_type,
+                    "statusCode": result.status_code,
+                    "find": needle,
+                    "matchCase": match_case,
+                    "contextChars": context_chars,
+                    "totalLength": total,
+                    "totalMatches": total_matches,
+                    "totalWindows": total_windows,
+                    "truncated": truncated,
+                    "matches": matches,
+                });
+                if total_matches == 0 {
+                    response["hint"] = serde_json::json!(
+                        "No matches found. Try different keywords (find is a literal substring, case-insensitive by default) or fetch the full content without find."
+                    );
+                }
+                return serde_json::to_string_pretty(&response).unwrap_or_default();
+            }
 
             // Compute the slice window.
             let start = std::cmp::min(start_char, total);

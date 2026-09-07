@@ -306,8 +306,10 @@ fn append_node_markdown(node: &ego_tree::NodeRef<'_, Node>, buf: &mut String) {
 const MIN_CONTENT_LEN: usize = 200;
 /// Direct fetch per-request timeout.
 const DIRECT_FETCH_TIMEOUT_SECS: u64 = 8;
-/// Jina Reader per-request timeout.
-const JINA_TIMEOUT_SECS: u64 = 12;
+/// Jina Reader per-request timeout. Must exceed Jina's cold headless-render
+/// time for heavy SPA pages (measured ~15s for modelscope.cn on cold cache;
+/// warm cache is ~4s). Also matches the X-Timeout: 30 header sent to Jina.
+const JINA_TIMEOUT_SECS: u64 = 30;
 
 /// Domains known to require JS rendering — try Jina Reader directly first.
 const JINA_PREFERRED_DOMAINS: &[&str] = &[
@@ -423,6 +425,28 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
                 }
                 return Err(e);
             }
+        }
+    }
+
+    // ── YouTube watch / Shorts / youtu.be → timedtext captions as SRT ──
+    // Chain: watch page HTML (INNERTUBE_API_KEY + optional inline caption
+    // tracks) → Innertube ANDROID player API (caption track list) → timedtext
+    // JSON (fmt=json3). The WEB client now requires a POT/BotGuard token for
+    // server-side calls, the ANDROID client does not (verified 2026-09).
+    // Non-watch pages (channel, playlist, search...) fall through to generic.
+    if host.contains("youtube.com") || host == "youtu.be" {
+        if let Some(video_id) = extract_youtube_id(&parsed) {
+            return fetch_youtube_subtitle(url, &video_id, config).await;
+        }
+    }
+
+    // ── Bilibili video page → subtitle track as SRT ──
+    // The video page is a client-rendered SPA shell (nothing to extract), but
+    // Bilibili exposes the subtitle track via JSON APIs. Non-video bilibili
+    // pages (opus articles, user space...) fall through to the generic path.
+    if host.contains("bilibili.com") {
+        if let Some(video) = extract_bilibili_video(&parsed) {
+            return fetch_bilibili_subtitle(url, &video, config).await;
         }
     }
 
@@ -1227,6 +1251,616 @@ async fn fetch_zhihu(url: &str, host: &str, config: &Config) -> Result<FetchResu
     })
 }
 
+// ── YouTube video captions ──────────────────────────────────────────────────
+//
+// Chain: watch page HTML → INNERTUBE_API_KEY → Innertube player API with the
+// ANDROID client (clientName "ANDROID", clientVersion "20.10.38") →
+// captionTracks[].baseUrl → timedtext JSON (fmt=json3) → SRT. The WEB client
+// now requires a POT/BotGuard token for server-side calls, the ANDROID
+// client does not (verified 2026-09). No login needed; anonymous works.
+// youtube-nocookie.com embeds carry no video id, fall through to generic.
+
+/// Innertube ANDROID client version (also used in the UA + headers).
+const YT_ANDROID_VERSION: &str = "20.10.38";
+/// Android-app User-Agent required by the Innertube player endpoint.
+const YT_ANDROID_UA: &str =
+    "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip";
+
+/// Extract the 11-char video id from watch / Shorts / live / embed / youtu.be
+/// URLs. Returns None for non-video pages (channel, playlist, feed...).
+fn extract_youtube_id(parsed: &url::Url) -> Option<String> {
+    fn valid(id: &str) -> Option<String> {
+        if id.len() == 11
+            && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            Some(id.to_string())
+        } else {
+            None
+        }
+    }
+    let host = parsed.host_str().unwrap_or("");
+    if host == "youtu.be" {
+        let seg = parsed.path().split('/').filter(|s| !s.is_empty()).next()?;
+        return valid(seg);
+    }
+    if !host.contains("youtube.com") {
+        return None;
+    }
+    // ?v=ID on /watch (also picks live /watch-style links)
+    if let Some(v) = parsed.query_pairs().find(|(k, _)| k == "v").map(|(_, v)| v.to_string()) {
+        if let Some(id) = valid(&v) {
+            return Some(id);
+        }
+    }
+    let segs: Vec<&str> = parsed.path().split('/').filter(|s| !s.is_empty()).collect();
+    match segs.as_slice() {
+        ["shorts", id] | ["live", id] | ["embed", id] | ["v", id] => valid(id),
+        _ => None,
+    }
+}
+
+/// Scrape the watch page HTML for the Innertube API key in ytcfg.set({...}).
+fn extract_innertube_key(html: &str) -> Option<String> {
+    let marker = "\"INNERTUBE_API_KEY\":\"";
+    let i = html.find(marker)? + marker.len();
+    let rest = &html[i..];
+    let end = rest.find('"')?;
+    let key = &rest[..end];
+    if key.starts_with("AIza") && key.len() > 20 {
+        Some(key.to_string())
+    } else {
+        None
+    }
+}
+
+/// Track name: {"simpleText": "..."} or {"runs": [{"text": ...}]}.
+fn yt_track_label(t: &serde_json::Value) -> String {
+    if let Some(s) = t.pointer("/name/simpleText").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+    if let Some(runs) = t.pointer("/name/runs").and_then(|v| v.as_array()) {
+        return runs.iter().filter_map(|r| r.get("text").and_then(|v| v.as_str())).collect();
+    }
+    String::new()
+}
+
+/// Pick the best caption track: manual English > manual any > auto English >
+/// first available. `pref` is a language prefix like "en" (matches "en-US").
+fn pick_youtube_track<'a>(
+    tracks: &'a [serde_json::Value],
+    pref: &str,
+) -> Option<&'a serde_json::Value> {
+    fn score(t: &serde_json::Value, pref: &str) -> i32 {
+        let code = t.get("languageCode").and_then(|v| v.as_str()).unwrap_or("");
+        let auto = t.get("kind").and_then(|v| v.as_str()) == Some("asr");
+        let lang_match = code == pref || code.starts_with(&format!("{}-", pref));
+        match (lang_match, !auto) {
+            (true, true) => 3,
+            (false, true) => 2,
+            (true, false) => 1,
+            (false, false) => 0,
+        }
+    }
+    tracks.iter().max_by_key(|t| score(t, pref))
+}
+
+/// Convert a timedtext json3 `events` array to SRT. Events without `segs`
+/// (timing/style markers) are skipped; `aAppend` continuation segs ("\n")
+/// carry no text and are dropped — each event keeps its own time range.
+fn youtube_json3_to_srt(events: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    let mut n = 0;
+    for ev in events {
+        let start_ms = ev.get("tStartMs").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // dDurationMs is sometimes absent (append markers) — fall back to
+        // the next event's start handled implicitly by skipping such events.
+        let dur_ms = match ev.get("dDurationMs").and_then(|v| v.as_f64()) {
+            Some(d) => d,
+            None => continue,
+        };
+        let text: String = ev
+            .get("segs")
+            .and_then(|v| v.as_array())
+            .map(|segs| {
+                segs.iter()
+                    .filter_map(|s| s.get("utf8").and_then(|v| v.as_str()))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        let text = text.replace('\n', " ").split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            continue;
+        }
+        n += 1;
+        out.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            n,
+            srt_timestamp(start_ms / 1000.0),
+            srt_timestamp((start_ms + dur_ms) / 1000.0),
+            text
+        ));
+    }
+    out
+}
+
+/// Fetch a YouTube video's caption track and return it as SRT.
+async fn fetch_youtube_subtitle(
+    url: &str,
+    video_id: &str,
+    config: &Config,
+) -> Result<FetchResult, FetchError> {
+    let site_name = "YouTube".to_string();
+    eprintln!("▶️ YouTube captions: {}", video_id);
+
+    // YouTube is unreachable without egress abroad — must NOT bypass proxy.
+    // build_fetch_client routes via DIRECT_DOMAINS, so force proxy here.
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.fetch_timeout_secs))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(0)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36");
+    if config.use_proxy {
+        if let Some(ref proxy_url) = config.proxy_url {
+            let proxy = reqwest::Proxy::all(proxy_url)
+                .map_err(|e| FetchError::Config(format!("Invalid proxy URL: {}", e)))?;
+            builder = builder.proxy(proxy);
+        }
+    }
+    let page_client = builder.build().map_err(|e| FetchError::Config(e.to_string()))?;
+    let api_client = page_client.clone();
+
+    // Step 1: watch page → INNERTUBE_API_KEY (+ title fallback).
+    let watch_url = format!("https://www.youtube.com/watch?v={}", video_id);
+    let html = page_client
+        .get(&watch_url)
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                FetchError::Timeout
+            } else if e.is_connect() {
+                FetchError::Network(format!("YouTube unreachable (needs proxy egress): {}", e))
+            } else {
+                FetchError::Http(format!("YouTube watch page request failed: {}", e))
+            }
+        })?
+        .error_for_status()
+        .map_err(|e| FetchError::Http(format!("YouTube watch page HTTP: {}", e)))?
+        .text()
+        .await
+        .map_err(|e| FetchError::Http(format!("Failed to read YouTube watch page: {}", e)))?;
+    if html.contains("consent.youtube.com") || html.len() < 50_000 {
+        return Err(FetchError::Blocked(
+            "YouTube served a consent/captcha page instead of the watch page. \
+             Retry later or from an egress IP that already passed consent."
+                .into(),
+        ));
+    }
+    let api_key = extract_innertube_key(&html).ok_or_else(|| {
+        FetchError::Parse("YouTube watch page: INNERTUBE_API_KEY not found".into())
+    })?;
+    let page_title = extract_title(&html);
+
+    // Step 2: Innertube player API (ANDROID client) → caption tracks.
+    let player_url = format!(
+        "https://www.youtube.com/youtubei/v1/player?key={}&prettyPrint=false",
+        api_key
+    );
+    let body = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "ANDROID",
+                "clientVersion": YT_ANDROID_VERSION,
+                "hl": "en",
+                "gl": "US",
+            }
+        },
+        "videoId": video_id,
+    });
+    let player: serde_json::Value = api_client
+        .post(&player_url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::HeaderName::from_static("x-youtube-client-name"), "3")
+        .header(
+            reqwest::header::HeaderName::from_static("x-youtube-client-version"),
+            YT_ANDROID_VERSION,
+        )
+        .header(reqwest::header::USER_AGENT, YT_ANDROID_UA)
+        .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                FetchError::Timeout
+            } else {
+                FetchError::Http(format!("YouTube player API request failed: {}", e))
+            }
+        })?
+        .error_for_status()
+        .map_err(|e| FetchError::Http(format!("YouTube player API HTTP: {}", e)))?
+        .json()
+        .await
+        .map_err(|e| FetchError::Parse(format!("YouTube player API JSON: {}", e)))?;
+
+    // Playability gate: private / age-restricted / deleted have no captions.
+    let status = player
+        .pointer("/playabilityStatus/status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN");
+    if status != "OK" {
+        let reason = player
+            .pointer("/playabilityStatus/reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return Err(FetchError::Blocked(format!(
+            "YouTube video not playable (status {}): {}",
+            status, reason
+        )));
+    }
+    let title = player
+        .pointer("/videoDetails/title")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or(page_title);
+    let tracks = player
+        .pointer("/captions/playerCaptionsTracklistRenderer/captionTracks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if tracks.is_empty() {
+        return Err(FetchError::Blocked(format!(
+            "该视频没有可用字幕轨（YouTube 未返回任何 captionTracks）：{}",
+            title
+        )));
+    }
+    let track = pick_youtube_track(&tracks, "en")
+        .ok_or_else(|| FetchError::Parse("YouTube player API: empty track entry".into()))?;
+    let code = track.get("languageCode").and_then(|v| v.as_str()).unwrap_or("");
+    let label = yt_track_label(track);
+    let auto = track.get("kind").and_then(|v| v.as_str()) == Some("asr");
+    eprintln!(
+        "▶️ YouTube caption track: {} ({}){}",
+        code,
+        label,
+        if auto { " (auto)" } else { "" }
+    );
+
+    // Step 3: timedtext JSON (strip any existing fmt, force json3).
+    let base_raw = track
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| FetchError::Parse("YouTube player API: track missing baseUrl".into()))?;
+    let mut base = String::new();
+    for (i, part) in base_raw.split('&').enumerate() {
+        if part.starts_with("fmt=") {
+            continue;
+        }
+        if i > 0 {
+            base.push('&');
+        }
+        base.push_str(part);
+    }
+    let cap_url = format!("{}&fmt=json3", base);
+    let cap_json: serde_json::Value = api_client
+        .get(&cap_url)
+        .header(reqwest::header::USER_AGENT, YT_ANDROID_UA)
+        .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| FetchError::Http(format!("YouTube timedtext request failed: {}", e)))?
+        .error_for_status()
+        .map_err(|e| FetchError::Http(format!("YouTube timedtext HTTP: {}", e)))?
+        .json()
+        .await
+        .map_err(|e| FetchError::Parse(format!("YouTube timedtext JSON: {}", e)))?;
+    let events = cap_json
+        .get("events")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| FetchError::Parse("YouTube timedtext JSON: missing events array".into()))?;
+    let srt = youtube_json3_to_srt(events);
+    if srt.trim().is_empty() {
+        return Err(FetchError::EmptyContent);
+    }
+
+    Ok(FetchResult {
+        url: url.to_string(),
+        title,
+        content: srt,
+        content_type: "application/x-subrip".into(),
+        site_name,
+        status_code: 200,
+        via: "youtube-api".into(),
+    })
+}
+
+// ── Bilibili video subtitles ────────────────────────────────────────────────
+//
+// Chain: view API (bvid→cid + per-part list) → player API (cid→subtitle
+// tracks) → subtitle JSON on aisubtitle.hdslb.com. Bilibili only serves the
+// subtitle track list to logged-in requests — anonymous requests always get
+// an empty list (verified 2026-09 across 20 popular videos) — so SESSDATA in
+// FETCH_COOKIES is effectively required.
+//
+// The openresty WAF on api.bilibili.com fingerprints requests: bare clients
+// get HTTP 412 "request was banned". The full browser-style header set in
+// bilibili_api_get (sec-ch-ua / sec-fetch-* + Referer) passes anonymously;
+// wbi signatures are NOT required for x/player/wbi/v2 (verified 2026-09).
+
+/// A parsed bilibili video URL: /video/{BVID|avNUM}, optionally ?p=N (part).
+struct BiliVideoRef {
+    /// API query parameter name: "bvid" or "aid"
+    id_param: &'static str,
+    id_value: String,
+    /// Selected part, from ?p=N (default 1)
+    page: u32,
+}
+
+/// Match bilibili.com/video/{BV...|avN}. Returns None for non-video pages so
+/// they fall through to the generic fetch path.
+fn extract_bilibili_video(parsed: &url::Url) -> Option<BiliVideoRef> {
+    let segments: Vec<&str> = parsed.path().split('/').filter(|s| !s.is_empty()).collect();
+    let (id_param, id_value) = match segments.as_slice() {
+        ["video", bv] if bv.len() > 2
+            && bv.starts_with("BV")
+            && bv.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            ("bvid", bv.to_string())
+        }
+        ["video", av] if av.len() > 2
+            && av.starts_with("av")
+            && av[2..].chars().all(|c| c.is_ascii_digit()) =>
+        {
+            ("aid", av[2..].to_string())
+        }
+        _ => return None,
+    };
+    let page = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "p")
+        .and_then(|(_, v)| v.parse::<u32>().ok())
+        .filter(|p| *p >= 1)
+        .unwrap_or(1);
+    Some(BiliVideoRef { id_param, id_value, page })
+}
+
+/// GET a bilibili JSON API with the header set that passes the WAF.
+async fn bilibili_api_get(
+    client: &reqwest::Client,
+    url: &str,
+    cookie_header: &str,
+) -> Result<serde_json::Value, FetchError> {
+    let mut request = client.get(url)
+        .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
+        .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+        .header(reqwest::header::REFERER, "https://www.bilibili.com/")
+        .header(reqwest::header::HeaderName::from_static("sec-ch-ua"),
+            "\"Google Chrome\";v=\"136\", \"Chromium\";v=\"136\", \"Not?A_Brand\";v=\"99\"")
+        .header(reqwest::header::HeaderName::from_static("sec-ch-ua-mobile"), "?0")
+        .header(reqwest::header::HeaderName::from_static("sec-ch-ua-platform"), "\"Windows\"")
+        .header(reqwest::header::HeaderName::from_static("sec-fetch-dest"), "empty")
+        .header(reqwest::header::HeaderName::from_static("sec-fetch-mode"), "cors")
+        .header(reqwest::header::HeaderName::from_static("sec-fetch-site"), "same-site")
+        .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS));
+    if !cookie_header.is_empty() {
+        let hv = reqwest::header::HeaderValue::from_str(cookie_header)
+            .map_err(|e| FetchError::Config(format!("Invalid bilibili cookie header: {}", e)))?;
+        request = request.header(reqwest::header::COOKIE, hv);
+    }
+    let resp = request.send().await.map_err(|e| {
+        if e.is_timeout() { FetchError::Timeout }
+        else if e.is_connect() { FetchError::Network(format!("Connection failed: {}", e)) }
+        else { FetchError::Http(format!("Bilibili API request failed: {}", e)) }
+    })?;
+    let status = resp.status();
+    // The WAF answers blocked requests with HTTP 412 + an HTML block page.
+    if status == 412 {
+        return Err(FetchError::Blocked(
+            "Bilibili WAF blocked the request (HTTP 412). Retry later; if it persists, \
+             the browser-style header set in bilibili_api_get() may need updating.".into()
+        ));
+    }
+    if !status.is_success() {
+        return Err(FetchError::HttpStatus(status.as_u16(), status.as_str().to_string()));
+    }
+    let bytes = resp.bytes().await
+        .map_err(|e| FetchError::Http(format!("Failed to read Bilibili API response: {}", e)))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| FetchError::Parse(format!("Bilibili API JSON: {}", e)))
+}
+
+/// Map a bilibili API JSON error code to a FetchError.
+fn bilibili_api_error(api: &str, json: &serde_json::Value) -> FetchError {
+    let code = json.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let message = json.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    match code {
+        -412 => FetchError::Blocked(format!(
+            "Bilibili WAF banned the {} request (code -412). Retry later.", api
+        )),
+        -101 => FetchError::Blocked(
+            "Bilibili account not logged in (code -101) — SESSDATA in FETCH_COOKIES \
+             is missing or expired.".into()
+        ),
+        -400 | -404 => FetchError::InvalidUrl(format!(
+            "Bilibili {} says video not found (code {}): {}", api, code, message
+        )),
+        _ => FetchError::Http(format!(
+            "Bilibili {} API error (code {}): {}", api, code, message
+        )),
+    }
+}
+
+/// Best-effort: fetch an anonymous buvid3/buvid4 pair via finger/spi, since
+/// the WAF expects a buvid cookie even alongside SESSDATA. Failure is fine —
+/// requests just go out without it.
+async fn fetch_bilibili_buvid(client: &reqwest::Client) -> Option<String> {
+    let json = bilibili_api_get(client, "https://api.bilibili.com/x/frontend/finger/spi", "").await.ok()?;
+    let b3 = json.pointer("/data/b_3")?.as_str()?.to_string();
+    let b4 = json.pointer("/data/b_4").and_then(|v| v.as_str()).unwrap_or("");
+    if b4.is_empty() {
+        Some(format!("buvid3={}", b3))
+    } else {
+        Some(format!("buvid3={}; buvid4={}", b3, b4))
+    }
+}
+
+/// Compose the Cookie header: user cookies from FETCH_COOKIES, plus an
+/// anonymous buvid3 when the user's cookies don't include one.
+async fn build_bilibili_cookie(config: &Config, client: &reqwest::Client) -> String {
+    let mut cookie = config.fetch_cookies.clone();
+    if !cookie.contains("buvid3") {
+        if let Some(buvid) = fetch_bilibili_buvid(client).await {
+            if cookie.is_empty() { cookie = buvid; } else { cookie = format!("{}; {}", cookie, buvid); }
+        }
+    }
+    cookie
+}
+
+/// Pick the best subtitle track: manual Chinese > manual any language >
+/// AI Chinese > first available.
+fn pick_bilibili_track<'a>(subtitles: &'a [serde_json::Value]) -> Option<&'a serde_json::Value> {
+    fn score(t: &serde_json::Value) -> i32 {
+        let lan = t.get("lan").and_then(|v| v.as_str()).unwrap_or("");
+        let ai_type = t.get("ai_type").and_then(|v| v.as_i64()).unwrap_or(0);
+        if ai_type == 0 && lan.contains("zh") { 3 }
+        else if ai_type == 0 { 2 }
+        else if lan.contains("zh") { 1 }
+        else { 0 }
+    }
+    subtitles.iter().max_by_key(|t| score(t))
+}
+
+/// Format seconds as an SRT timestamp: HH:MM:SS,mmm
+fn srt_timestamp(t: f64) -> String {
+    let total_ms = (t.max(0.0) * 1000.0).round() as u64;
+    let ms = total_ms % 1000;
+    let s = (total_ms / 1000) % 60;
+    let m = (total_ms / 60_000) % 60;
+    let h = total_ms / 3_600_000;
+    format!("{:02}:{:02}:{:02},{:03}", h, m, s, ms)
+}
+
+/// Convert a subtitle JSON `body` array ([{from,to,content},...]) to SRT.
+/// SRT requires sequential cue numbers, so empty cues are skipped without
+/// consuming a number.
+fn subtitle_body_to_srt(body: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    let mut n = 0;
+    for cue in body {
+        let from = cue.get("from").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let to = cue.get("to").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let content = cue.get("content").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if content.is_empty() { continue; }
+        n += 1;
+        out.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            n, srt_timestamp(from), srt_timestamp(to), content
+        ));
+    }
+    out
+}
+
+/// Fetch a bilibili video's subtitle track and return it as SRT.
+async fn fetch_bilibili_subtitle(url: &str, video: &BiliVideoRef, config: &Config) -> Result<FetchResult, FetchError> {
+    let site_name = detect_site("bilibili.com");
+    let client = build_fetch_client(config, "api.bilibili.com")?;
+    let cookie_header = build_bilibili_cookie(config, &client).await;
+    let has_sessdata = !extract_cookie_value(&cookie_header, "SESSDATA").is_empty();
+    eprintln!("📺 Bilibili subtitle: {} p={} (SESSDATA={})", video.id_value, video.page, has_sessdata);
+
+    // Step 1: view API — title + per-part cid
+    let view_url = format!("https://api.bilibili.com/x/web-interface/view?{}={}", video.id_param, video.id_value);
+    let view = bilibili_api_get(&client, &view_url, &cookie_header).await?;
+    if view.get("code").and_then(|v| v.as_i64()) != Some(0) {
+        return Err(bilibili_api_error("view", &view));
+    }
+    let data = view.get("data")
+        .ok_or_else(|| FetchError::Parse("Bilibili view API: missing data".into()))?;
+    let title = data.get("title").and_then(|v| v.as_str()).unwrap_or("bilibili video");
+    let pages = data.get("pages").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let (cid, part_title, total_parts) = if pages.is_empty() {
+        let cid = data.get("cid").and_then(|v| v.as_u64())
+            .ok_or_else(|| FetchError::Parse("Bilibili view API: missing cid".into()))?;
+        (cid, String::new(), 1)
+    } else {
+        let total = pages.len();
+        let page = pages.iter()
+            .find(|p| p.get("page").and_then(|v| v.as_u64()) == Some(video.page as u64))
+            .ok_or_else(|| FetchError::InvalidUrl(format!(
+                "Bilibili: 分P {} 不存在，视频「{}」共 {} 个分P（URL 加 ?p=1..{} 选择）",
+                video.page, title, total, total
+            )))?;
+        let cid = page.get("cid").and_then(|v| v.as_u64())
+            .ok_or_else(|| FetchError::Parse("Bilibili view API: page missing cid".into()))?;
+        let part = page.get("part").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        (cid, part, total)
+    };
+
+    // Step 2: player API — subtitle track list
+    let player_url = format!(
+        "https://api.bilibili.com/x/player/wbi/v2?{}={}&cid={}",
+        video.id_param, video.id_value, cid
+    );
+    let player = bilibili_api_get(&client, &player_url, &cookie_header).await?;
+    if player.get("code").and_then(|v| v.as_i64()) != Some(0) {
+        return Err(bilibili_api_error("player", &player));
+    }
+    let subtitles = player.pointer("/data/subtitle/subtitles")
+        .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if subtitles.is_empty() {
+        return Err(FetchError::Blocked(if has_sessdata {
+            format!("该视频没有可用字幕轨（B 站未返回任何 CC/AI 字幕）：{}", title)
+        } else {
+            "B 站只向登录用户返回字幕列表，匿名字幕列表为空。请在 FETCH_COOKIES 环境变量中加入 \
+             SESSDATA=...（浏览器 DevTools → Application → Cookies → bilibili.com）；\
+             若已配置 SESSDATA 仍为空，则该视频可能确实没有 CC 字幕。".into()
+        }));
+    }
+    let track = pick_bilibili_track(&subtitles)
+        .ok_or_else(|| FetchError::Parse("Bilibili player API: empty track entry".into()))?;
+    let lan = track.get("lan").and_then(|v| v.as_str()).unwrap_or("");
+    let lan_doc = track.get("lan_doc").and_then(|v| v.as_str()).unwrap_or("");
+    let ai_tag = if track.get("ai_type").and_then(|v| v.as_i64()).unwrap_or(0) != 0 { " (AI)" } else { "" };
+    eprintln!("📺 Bilibili subtitle track: {} ({}){}", lan, lan_doc, ai_tag);
+
+    // Step 3: subtitle JSON from the CDN (public, no auth needed)
+    let sub_url_raw = track.get("subtitle_url").and_then(|v| v.as_str())
+        .ok_or_else(|| FetchError::Parse("Bilibili player API: track missing subtitle_url".into()))?;
+    let sub_url = if let Some(rest) = sub_url_raw.strip_prefix("//") {
+        format!("https://{}", rest)
+    } else {
+        sub_url_raw.to_string()
+    };
+    let cdn_client = build_fetch_client(config, "aisubtitle.hdslb.com")?;
+    let sub_json = bilibili_api_get(&cdn_client, &sub_url, "").await?;
+    let body = sub_json.get("body").and_then(|v| v.as_array())
+        .ok_or_else(|| FetchError::Parse("Bilibili subtitle JSON: missing body array".into()))?;
+    let srt = subtitle_body_to_srt(body);
+    if srt.trim().is_empty() {
+        return Err(FetchError::EmptyContent);
+    }
+
+    let display_title = if part_title.is_empty() || part_title == title {
+        format!("{}（P{}/{}）", title, video.page, total_parts)
+    } else {
+        format!("{} - {}（P{}/{}）", title, part_title, video.page, total_parts)
+    };
+
+    Ok(FetchResult {
+        url: url.to_string(),
+        title: display_title,
+        content: srt,
+        content_type: "application/x-subrip".into(),
+        site_name,
+        status_code: 200,
+        via: "bilibili-api".into(),
+    })
+}
+
 /// CSDN blog article fetch — server-rendered static HTML, no JS required.
 /// Direct fetch is faster than Jina and our extract_csdn_content has tuned selectors.
 async fn fetch_csdn(url: &str, host: &str, config: &Config) -> Result<FetchResult, FetchError> {
@@ -1876,6 +2510,10 @@ fn build_headers(domain: &str) -> reqwest::header::HeaderMap {
             headers.insert(reqwest::header::REFERER,
                 "https://www.bilibili.com/".parse().unwrap());
         }
+        d if d.contains("youtube") || d.contains("youtu.be") => {
+            headers.insert(reqwest::header::REFERER,
+                "https://www.youtube.com/".parse().unwrap());
+        }
         d if d.contains("mp.weixin") => {
             headers.insert(reqwest::header::REFERER,
                 "https://mp.weixin.qq.com/".parse().unwrap());
@@ -1929,6 +2567,7 @@ fn detect_site(domain: &str) -> String {
     else if domain.contains("csdn") { "CSDN".to_string() }
     else if domain.contains("juejin") { "掘金".to_string() }
     else if domain.contains("bilibili") { "B站".to_string() }
+    else if domain.contains("youtube") || domain.contains("youtu.be") { "YouTube".to_string() }
     else if domain.contains("xiaohongshu") { "小红书".to_string() }
     else if domain.contains("baijiahao") { "百家号".to_string() }
     else if domain.contains("baidu") { "百度".to_string() }

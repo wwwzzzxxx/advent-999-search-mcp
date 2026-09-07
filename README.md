@@ -185,12 +185,12 @@ Edit `opencode.json`:
 |----------|:--------:|---------|-------------|
 | `PROXY_URL` | No | — | Proxy address (e.g. `http://127.0.0.1:7890`) |
 | `USE_PROXY` | No | `true` | Enable/disable proxy |
-| `DIRECT_DOMAINS` | No | *mainland list* | Domains that bypass the proxy (direct). Default: `sogou,weixin,baidu,bilibili,zhihu,csdn,juejin,xiaohongshu`. Set `none` to proxy everything |
+| `DIRECT_DOMAINS` | No | *mainland list* | Domains that bypass the proxy (direct). Default: `sogou,weixin,baidu,bilibili,hdslb,zhihu,csdn,juejin,xiaohongshu`. Set `none` to proxy everything. NOTE: YouTube always uses the proxy regardless of this setting (it needs egress outside mainland China) |
 | `EXA_API_KEY` | No | — | Exa API key — get one [here](https://dashboard.exa.ai/api-keys) |
 | `DEEPSEEK_API_KEY` | No | — | DeepSeek web-search key — official API key or OpenCode Go subscription key (auto-detected) — enables the `deepseek` engine |
 | `DEEPSEEK_API_MODE` | No | *(auto)* | Force backend: `official` (api.deepseek.com) or `go` (opencode.ai) |
 | `DEEPSEEK_MODEL` | No | `deepseek-v4-flash` | Model used by the deepseek engine |
-| `FETCH_COOKIES` | No | — | Browser cookies for authenticated pages. Format: `key=value; key2=value2` |
+| `FETCH_COOKIES` | No | — | Browser cookies for authenticated pages. Format: `key=value; key2=value2`. `d_c0` unlocks Zhihu; `SESSDATA` unlocks Bilibili subtitles (the subtitle list requires login) |
 | `EVERYTHING_ES_PATH` | No | — | Path to ES.exe (required to enable local search) |
 | `DEFAULT_SEARCH_ENGINE` | No | `exa` | Default search engine |
 | `ALLOWED_SEARCH_ENGINES` | No | *(all)* | Comma-separated list of allowed engines |
@@ -239,7 +239,23 @@ foldersOnly   (boolean)          — Folders only
 ```
 url       (string, required)    — URL to fetch, or an arXiv paper ID
 maxLength (number, max 200000)  — Max content length
+startChar (number)              — Start reading from this character offset (0-based)
+endChar   (number)              — Read up to this offset (exclusive)
+find      (string)              — Literal substring to search in the fetched text (find mode)
+contextChars (number, default 200) — Context chars around each match in find mode
+maxMatches (number, default 20, max 50) — Max context windows in find mode
+matchCase (boolean, default false) — Case-sensitive matching (ASCII only)
 ```
+
+Find mode (server-side substring search, saves tokens): when `find` is set, the fetch happens
+normally, then the server scans the extracted text for the literal substring and returns only
+merged context windows around matches — no full content is returned, and
+`startChar`/`endChar`/`maxLength` are ignored. Each match reports absolute character offsets
+(`startChar`/`endChar` of the window and of each hit inside) so you can follow up with a
+targeted `startChar`/`endChar` read of the full text. Overlapping windows are merged to avoid
+duplicate output. `totalMatches` always reports the full hit count even when `maxMatches`
+truncates the window list. Empty needle is rejected; zero hits return a hint suggesting
+different keywords.
 
 Smart fetching strategy:
 - **Zhihu** → signed API (requires `d_c0` in `FETCH_COOKIES`)
@@ -248,6 +264,8 @@ Smart fetching strategy:
 - **WeChat articles** (`mp.weixin.qq.com`) → MicroMessenger UA direct fetch
 - **Sogou WeChat links** (`weixin.sogou.com/link?url=...`) → JS-URL resolution + fetch
 - **GitHub issues/PRs** → page body + all comments appended via the public REST API (comments are client-side rendered on the HTML page, so they are fetched from `api.github.com` and appended as markdown)
+- **Bilibili videos** (`bilibili.com/video/BVxxx`, optional `?p=N` for multi-part) → subtitle track returned as SRT (requires `SESSDATA` in `FETCH_COOKIES` — Bilibili only serves the subtitle list to logged-in users)
+- **YouTube videos** (`youtube.com/watch?v=ID`, `/shorts/ID`, `/live/ID`, `/embed/ID`, `youtu.be/ID`) → caption track returned as SRT via the Innertube ANDROID player API (anonymous, no login; needs proxy egress outside mainland China). Track priority: manual English > manual any language > auto English > first available. Non-video pages (channel, playlist, search) fall through to the generic fetch path
 - **arXiv papers** → accepts a paper ID (`2401.12345`, `arXiv:2401.12345`, or an `arxiv.org/abs/...` URL) and returns the paper's HTML content (official `arxiv.org/html/` conversion, falling back to ar5iv for older papers)
 - **JS-heavy sites** → Jina Reader fallback
 - **Normal sites** → direct HTTP with HTML-to-Markdown

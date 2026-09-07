@@ -8,6 +8,7 @@ const DEFAULT_DIRECT_DOMAINS: &[&str] = &[
     "weixin",      // 微信 (mp.weixin.qq.com 等)
     "baidu",       // 百度
     "bilibili",    // B站
+    "hdslb",       // B站静态资源 CDN (aisubtitle.hdslb.com 字幕文件等)
     "zhihu",       // 知乎
     "csdn",        // CSDN
     "juejin",      // 掘金

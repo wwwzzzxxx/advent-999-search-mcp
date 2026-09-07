@@ -183,12 +183,12 @@ EVERYTHING_ES_PATH=C:\path\to\es.exe
 |----------|:---:|---------|------|
 | `PROXY_URL` | 否 | — | 代理地址（如 `http://127.0.0.1:7890`） |
 | `USE_PROXY` | 否 | `true` | 是否启用代理 |
-| `DIRECT_DOMAINS` | 否 | *大陆列表* | 绕过代理直连的域名。默认：`sogou,weixin,baidu,bilibili,zhihu,csdn,juejin,xiaohongshu`。设为 `none` 则全部走代理 |
+| `DIRECT_DOMAINS` | 否 | *大陆列表* | 绕过代理直连的域名。默认：`sogou,weixin,baidu,bilibili,hdslb,zhihu,csdn,juejin,xiaohongshu`。设为 `none` 则全部走代理。注意：YouTube 始终走代理（需出境），不受此设置影响 |
 | `EXA_API_KEY` | 否 | — | Exa API 密钥，[点此申请](https://dashboard.exa.ai/api-keys) |
 | `DEEPSEEK_API_KEY` | 否 | — | DeepSeek 搜索密钥——官方 API key 或 OpenCode Go 订阅 key（自动检测）——启用 `deepseek` 引擎 |
 | `DEEPSEEK_API_MODE` | 否 | 自动 | 强制后端：`official`（api.deepseek.com）或 `go`（opencode.ai） |
 | `DEEPSEEK_MODEL` | 否 | `deepseek-v4-flash` | deepseek 引擎使用的模型 |
-| `FETCH_COOKIES` | 否 | — | 浏览器 Cookie。格式：`key=value; key2=value2` |
+| `FETCH_COOKIES` | 否 | — | 浏览器 Cookie。格式：`key=value; key2=value2`。`d_c0` 解锁知乎；`SESSDATA` 解锁 B 站字幕（字幕列表需登录才能获取） |
 | `EVERYTHING_ES_PATH` | 否 | — | ES.exe 路径（必须设置才能启用本地搜索） |
 | `DEFAULT_SEARCH_ENGINE` | 否 | `exa` | 默认搜索引擎 |
 | `ALLOWED_SEARCH_ENGINES` | 否 | *（全部）* | 允许的搜索引擎列表（逗号分隔） |
@@ -237,7 +237,20 @@ foldersOnly   (boolean)        — 仅文件夹
 ```
 url       (string, 必填)       — 要抓取的 URL，或 arXiv 论文号
 maxLength (number, 最大 200000) — 最大内容长度
+startChar (number)              — 从该字符偏移开始读（0-based）
+endChar   (number)              — 读到该偏移为止（不含）
+find      (string)              — 在抓取文本中搜索的字面子串（find 模式）
+contextChars (number, 默认 200) — find 模式每处匹配前后保留的上下文字符数
+maxMatches (number, 默认 20, 最大 50) — find 模式最多返回的上下文窗口数
+matchCase (boolean, 默认 false) — 是否区分大小写（仅 ASCII）
 ```
+
+find 模式（服务端子串搜索，省 token）：设置 `find` 后先正常抓取，再在提取文本中做字面子串
+匹配，只返回匹配点附近合并后的上下文窗口——不返回全文，且忽略
+`startChar`/`endChar`/`maxLength`。每处匹配都带绝对字符偏移（窗口和窗口内每个命中点的
+`startChar`/`endChar`），可据此再用 `startChar`/`endChar` 精确读取全文对应段落。重叠窗口会合并
+去重。即使 `maxMatches` 截断了窗口列表，`totalMatches` 仍报告全部命中数。空串会被拒绝；
+零命中时返回 hint 建议换关键词。
 
 智能抓取策略：
 - **知乎** → 签名 API（需在 `FETCH_COOKIES` 中提供 `d_c0`）
@@ -246,6 +259,8 @@ maxLength (number, 最大 200000) — 最大内容长度
 - **微信公众号**（`mp.weixin.qq.com`）→ 微信 UA 直抓
 - **搜狗微信跳转**（`weixin.sogou.com/link?url=...`）→ JS 拼接 URL 解析 + 抓取
 - **GitHub issue/PR** → 页面正文 + 全部评论（评论在 HTML 页面中是客户端动态渲染的，通过 `api.github.com` REST API 获取并以 Markdown 追加到正文后）
+- **B 站视频**（`bilibili.com/video/BVxxx`，多 P 视频可用 `?p=N` 选集）→ 返回字幕轨的 SRT 格式文本（需在 `FETCH_COOKIES` 中提供 `SESSDATA`——B 站只向登录用户返回字幕列表）
+- **YouTube 视频**（`youtube.com/watch?v=ID`、`shorts`/`live`/`embed`、`youtu.be/ID`）→ 经 Innertube ANDROID player API 返回字幕轨 SRT（匿名即可，无需登录；需可出境的代理）。选轨优先级：手动英文 > 手动任意语言 > 自动英文 > 首个。非视频页（频道、播放列表、搜索页）回落通用抓取
 - **arXiv 论文** → 接受论文号（`2401.12345`、`arXiv:2401.12345` 或 `arxiv.org/abs/...` 链接），返回论文 HTML 内容（优先官方 `arxiv.org/html/` 转换版，老论文自动降级到 ar5iv）
 - **JS 密集型站点** → 自动降级到 Jina Reader
 - **普通站点** → 直接 HTTP + HTML 转 Markdown
