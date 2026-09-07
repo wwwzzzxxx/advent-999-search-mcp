@@ -70,6 +70,7 @@ $GH_REPO     = "wwwzzzxxx/advent-999-search-mcp"
 $GITEE_REPO  = "pzwzx/advent-999-search-mcp"
 $ProjectDir  = Split-Path -Parent $PSScriptRoot
 $ExePath     = Join-Path $ProjectDir "target\release\advent-999-search-mcp.exe"
+$LinuxPath   = Join-Path $ProjectDir "target\release\advent-999-search-mcp-linux"
 
 function Info($m) { Write-Host "[INFO] $m" -ForegroundColor Cyan }
 function Ok($m)   { Write-Host "[OK]   $m" -ForegroundColor Green }
@@ -117,6 +118,17 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $ExePath)) { Fail "找不到 $ExePath（可用 -SkipBuild 跳过构建）" }
 Ok "二进制: $ExePath ($((Get-Item $ExePath).Length) bytes)"
+# Linux 附件：WSL 构建后复制到 target\release\advent-999-search-mcp-linux。
+# 不存在则只发 Windows 版（警告不断发布）；存在则双系统一起发布。
+$LinuxAssets = @()
+if (Test-Path $LinuxPath) {
+  $LinuxAssets = @($LinuxPath)
+  Ok "Linux 二进制: $LinuxPath ($((Get-Item $LinuxPath).Length) bytes)"
+} else {
+  Warn "找不到 $LinuxPath —— 只发布 Windows 版。如需双系统发布，先在 WSL 构建并复制过来："
+  Warn "  wsl --exec sh -c 'export CARGO_TARGET_DIR=/home/user/advent-target; ...; cargo build --release'"
+  Warn "  wsl --exec cp /home/user/advent-target/release/advent-999-search-mcp <repo>/target/release/advent-999-search-mcp-linux"
+}
 
 # ---------- 4. Tag 处理 ----------
 $tagExists = git -C $ProjectDir rev-parse -q --verify "refs/tags/$Tag" 2>$null
@@ -158,16 +170,20 @@ function Publish-GitHub {
       return
     }
     $view = gh release view $Tag --repo $GH_REPO --json tagName 2>$null
+    # 注意：gh 的 -R 必须紧跟 tag（gh release upload <tag> <files>... -R <repo>），
+    # 写成 --repo ... <file> 会被解析成两个文件参数而报错。
+    $uploadArgs = @($ExePath) + $LinuxAssets + @("--clobber", "-R", $GH_REPO)
     if ($view) {
       Info "Release $Tag 已存在，更新说明并覆盖资产"
       gh release edit $Tag --repo $GH_REPO --title $Title --notes-file $notesFile
       if ($LASTEXITCODE -ne 0) { Fail "gh release edit 失败" }
-      gh release upload $Tag --repo $GH_REPO $ExePath --clobber
+      gh release upload $Tag @uploadArgs
       if ($LASTEXITCODE -ne 0) { Fail "gh release upload 失败" }
     } else {
       $a = @("release", "create", $Tag, "--repo", $GH_REPO, "--title", $Title, "--notes-file", $notesFile)
       if ($Prerelease) { $a += "--prerelease" }
       $a += $ExePath
+      $a += $LinuxAssets
       gh @a
       if ($LASTEXITCODE -ne 0) { Fail "gh release create 失败" }
     }
@@ -243,22 +259,25 @@ function Publish-Gitee {
   $relId = $rel.id
   Ok "Gitee release: https://gitee.com/$GITEE_REPO/releases/tag/$Tag"
 
-  # 上传附件（先删同名旧附件）
-  $exeName = Split-Path $ExePath -Leaf
+  # 上传附件（先删同名旧附件；Windows exe + Linux 二进制一起传）
+  $assets = @($ExePath) + $LinuxAssets
   $files = @(Invoke-GiteeJson -Method GET -Path "/releases/$relId/attach_files" -Data @{ access_token = $Token })
-  foreach ($f in $files) {
-    if ($f.name -eq $exeName) {
-      Invoke-GiteeJson -Method DELETE -Path "/releases/$relId/attach_files/$($f.id)" -Data @{ access_token = $Token }
-      Info "已删除旧附件 $exeName"
+  foreach ($asset in $assets) {
+    $assetName = Split-Path $asset -Leaf
+    foreach ($f in $files) {
+      if ($f.name -eq $assetName) {
+        Invoke-GiteeJson -Method DELETE -Path "/releases/$relId/attach_files/$($f.id)" -Data @{ access_token = $Token }
+        Info "已删除旧附件 $assetName"
+      }
     }
+    Info "上传附件 $assetName ..."
+    $up = & curl.exe -s --max-time 180 -X POST -F "access_token=$Token" -F "file=@$asset" `
+          "https://gitee.com/api/v5/repos/$GITEE_REPO/releases/$relId/attach_files"
+    if ($LASTEXITCODE -ne 0) { Fail "上传附件失败: $up" }
+    $af = $up | ConvertFrom-Json
+    if ($af.message) { Fail "上传附件错误: $($af.message)" }
+    Ok "Gitee 附件: $($af.browser_download_url)"
   }
-  Info "上传附件 $exeName ..."
-  $up = & curl.exe -s --max-time 180 -X POST -F "access_token=$Token" -F "file=@$ExePath" `
-        "https://gitee.com/api/v5/repos/$GITEE_REPO/releases/$relId/attach_files"
-  if ($LASTEXITCODE -ne 0) { Fail "上传附件失败: $up" }
-  $af = $up | ConvertFrom-Json
-  if ($af.message) { Fail "上传附件错误: $($af.message)" }
-  Ok "Gitee 附件: $($af.browser_download_url)"
 }
 
 # ---------- 执行 ----------
