@@ -8,7 +8,7 @@
 
 A Rust-based MCP server that gives your AI assistant **web search**, **local file search**, and **web page fetching** abilities.
 
-- **`web`** — Search with 10 engines (Exa, Bing, CSDN, Juejin, Startpage, Sogou, Weixin, DBLP, CNKI + credential-gated DeepSeek)
+- **`web`** — Search with 11 engines (Exa, Bing, CSDN, Juejin, Startpage, Sogou, Weixin, DBLP, CNKI + credential-gated DeepSeek, IEEE)
 - **`local`** — Search your local files via Everything (voidtools)
 - **`get_page`** — Fetch and extract readable content from any web page
 
@@ -118,10 +118,15 @@ DEEPSEEK_API_KEY=your_key_here
 DEEPSEEK_API_MODE=official   # optional: force backend
 DEEPSEEK_MODEL=deepseek-v4-flash  # optional: override model
 
+# Optional — IEEE Xplore Metadata Search API key (enables the `ieee` engine).
+# Get one at https://developer.ieee.org (needs IEEE activation during US
+# business hours before first use). The key is read ONLY from this env var.
+IEEE_API_KEY=your_key_here
+
 # Optional — restrict which engines are available (comma-separated).
 # IMPORTANT: if you set this, include every engine you want — including
 # deepseek once its key is configured:
-ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,deepseek
+ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,deepseek,ieee
 
 # Optional — browser cookies for fetching authenticated pages (e.g. zhihu.com)
 # Same format as the HTTP Cookie header:
@@ -190,6 +195,7 @@ Edit `opencode.json`:
 | `DEEPSEEK_API_KEY` | No | — | DeepSeek web-search key — official API key or OpenCode Go subscription key (auto-detected) — enables the `deepseek` engine |
 | `DEEPSEEK_API_MODE` | No | *(auto)* | Force backend: `official` (api.deepseek.com) or `go` (opencode.ai) |
 | `DEEPSEEK_MODEL` | No | `deepseek-v4-flash` | Model used by the deepseek engine |
+| `IEEE_API_KEY` | No | — | IEEE Xplore Metadata Search API key ([developer.ieee.org](https://developer.ieee.org)) — enables the `ieee` engine |
 | `FETCH_COOKIES` | No | — | Browser cookies for authenticated pages. Format: `key=value; key2=value2`. `d_c0` unlocks Zhihu; `SESSDATA` unlocks Bilibili subtitles (the subtitle list requires login) |
 | `EVERYTHING_ES_PATH` | No | — | Path to ES.exe (required to enable local search) |
 | `DEFAULT_SEARCH_ENGINE` | No | `exa` | Default search engine |
@@ -209,12 +215,13 @@ engines    (string[])           — Which engine(s) to use
 searchMode (string)             — "request" | "auto" | "playwright"
 ```
 
-Supported engines (10 total, all tested): Exa (default), Bing, CSDN, Juejin, Startpage, Sogou, Weixin (WeChat articles), DBLP (CS bibliography), CNKI (知网), DeepSeek (LLM-backed, requires key).
+Supported engines (11 total, all tested): Exa (default), Bing, CSDN, Juejin, Startpage, Sogou, Weixin (WeChat articles), DBLP (CS bibliography), CNKI (知网), DeepSeek (LLM-backed, requires key), IEEE (Xplore metadata, requires key).
 
 Credential-gated engines (implemented, hidden until key set — appear automatically in `tools/list` when the env var is present):
 - **`deepseek`** — LLM-backed web search via the Anthropic-compatible Messages API with the server-side `web_search_20250305` tool. Two backends auto-detected from key format:
   - **official** — DeepSeek official API key (`sk-`+32 hex) → `api.deepseek.com` (direct, no proxy needed)
   - **go** — OpenCode Go subscription key (`sk-`+64 chars) → `opencode.ai` via proxy. Runs via Python (embedded runtime on Windows, system `python3` on Linux/macOS — see build note). Returns an AI summary attached to the first result (`summary` field).
+- **`ieee`** — IEEE Xplore Metadata Search API (`ieeexploreapi.ieee.org`, `IEEE_API_KEY` required). Returns title, authors, venue, year, content type, citation count, DOI and abstract snippet per record.
 
 When the key is set via the env var, the engine is automatically listed in `tools/list`; without the key it stays hidden.
 

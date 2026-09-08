@@ -8,7 +8,7 @@
 
 基于 Rust 的 MCP 服务器，为你的 AI 助手提供**网络搜索**、**本地文件搜索**和**网页抓取**能力。
 
-- **`web`** — 10 个搜索引擎（Exa、Bing、CSDN、掘金、Startpage、搜狗、微信、DBLP、知网 + 凭据门控的 DeepSeek）
+- **`web`** — 11 个搜索引擎（Exa、Bing、CSDN、掘金、Startpage、搜狗、微信、DBLP、知网 + 凭据门控的 DeepSeek、IEEE）
 - **`local`** — 通过 Everything (voidtools) 搜索本地文件
 - **`get_page`** — 抓取任意网页并提取可读内容
 
@@ -116,10 +116,15 @@ DEEPSEEK_API_KEY=你的密钥
 DEEPSEEK_API_MODE=official   # 可选：强制后端
 DEEPSEEK_MODEL=deepseek-v4-flash  # 可选：覆盖模型
 
+# （可选）IEEE Xplore 元数据搜索 API 密钥（启用 ieee 引擎）
+# 申请：https://developer.ieee.org（需 IEEE 在美东工作时间激活后方可使用）
+# key 只从该环境变量读取（绝不读任何文件）
+IEEE_API_KEY=你的密钥
+
 # （可选）限制可用引擎（逗号分隔）
 # 重要：如果设置了这个变量，务必把想用的引擎都写进去——
 # 包括配置了 key 后的 deepseek：
-ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,deepseek
+ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,deepseek,ieee
 
 # （可选）浏览器 Cookie，用于抓取需登录的页面（如知乎）
 # 格式与 HTTP 的 Cookie 请求头相同：
@@ -188,6 +193,7 @@ EVERYTHING_ES_PATH=C:\path\to\es.exe
 | `DEEPSEEK_API_KEY` | 否 | — | DeepSeek 搜索密钥——官方 API key 或 OpenCode Go 订阅 key（自动检测）——启用 `deepseek` 引擎 |
 | `DEEPSEEK_API_MODE` | 否 | 自动 | 强制后端：`official`（api.deepseek.com）或 `go`（opencode.ai） |
 | `DEEPSEEK_MODEL` | 否 | `deepseek-v4-flash` | deepseek 引擎使用的模型 |
+| `IEEE_API_KEY` | 否 | — | IEEE Xplore 元数据搜索 API 密钥（[developer.ieee.org](https://developer.ieee.org)）——启用 `ieee` 引擎 |
 | `FETCH_COOKIES` | 否 | — | 浏览器 Cookie。格式：`key=value; key2=value2`。`d_c0` 解锁知乎；`SESSDATA` 解锁 B 站字幕（字幕列表需登录才能获取） |
 | `EVERYTHING_ES_PATH` | 否 | — | ES.exe 路径（必须设置才能启用本地搜索） |
 | `DEFAULT_SEARCH_ENGINE` | 否 | `exa` | 默认搜索引擎 |
@@ -207,12 +213,13 @@ engines    (string[])           — 使用的搜索引擎
 searchMode (string)             — "request" | "auto" | "playwright"
 ```
 
-支持的搜索引擎（10 个，均已实测）：Exa（默认）、Bing、CSDN、掘金、Startpage、搜狗、微信（公众号文章）、DBLP（计算机文献）、知网、DeepSeek（LLM 搜索，需密钥）。
+支持的搜索引擎（11 个，均已实测）：Exa（默认）、Bing、CSDN、掘金、Startpage、搜狗、微信（公众号文章）、DBLP（计算机文献）、知网、DeepSeek（LLM 搜索，需密钥）、IEEE（Xplore 元数据，需密钥）。
 
 凭据门控引擎（已实现，设置密钥前隐藏——配置环境变量后自动出现在 `tools/list`）：
 - **`deepseek`** — 基于 LLM 的搜索，通过 Anthropic 兼容 Messages API 调用服务端 `web_search_20250305` 工具。按 key 格式自动检测后端：
   - **official** — DeepSeek 官方 API key（`sk-`+32 位十六进制）→ `api.deepseek.com`（国内直连，无需代理）
   - **go** — OpenCode Go 订阅 key（`sk-`+64 字符）→ `opencode.ai`（走代理）。通过 Python 调用（Windows 用内置运行时，Linux/macOS 用系统 `python3`，见编译说明）。返回的 AI 总结会附加到第一条结果的 `summary` 字段。
+- **`ieee`** — IEEE Xplore 元数据搜索 API（`ieeexploreapi.ieee.org`，需 `IEEE_API_KEY`）。每条记录返回标题、作者、出版物、年份、内容类型、被引数、DOI 和摘要片段。
 
 通过环境变量设置密钥后，引擎会自动出现在 `tools/list` 中；未设置密钥时保持隐藏。
 

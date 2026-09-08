@@ -35,6 +35,11 @@ pub struct Config {
     /// Optional override for DeepSeek key format detection:
     /// "official" (api.deepseek.com) or "go" (opencode.ai/zen/go).
     pub deepseek_api_mode: Option<String>,
+    /// IEEE Xplore Metadata Search API key — enables the `ieee` engine.
+    /// Get one at https://developer.ieee.org (key needs IEEE activation
+    /// during US business hours before first use). Read ONLY from this
+    /// env var (never from any file).
+    pub ieee_api_key: Option<String>,
 }
 
 impl Config {
@@ -92,6 +97,14 @@ impl Config {
             eprintln!("🔑 DEEPSEEK_API_KEY set, deepseek engine enabled ({})", mode);
         }
 
+        // IEEE Xplore key — enables the `ieee` engine when set.
+        let ieee_api_key = env::var("IEEE_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty());
+        if ieee_api_key.is_some() {
+            eprintln!("🔑 IEEE_API_KEY set, ieee engine enabled");
+        }
+
         Self {
             default_search_engine: default_engine,
             allowed_search_engines: allowed,
@@ -102,11 +115,15 @@ impl Config {
             fetch_timeout_secs: fetch_timeout,
             deepseek_api_key,
             deepseek_api_mode,
+            ieee_api_key,
         }
     }
 
     /// Whether the DeepSeek engine is available (DEEPSEEK_API_KEY env var set).
     pub fn has_deepseek_key(&self) -> bool { self.deepseek_api_key.is_some() }
+
+    /// Whether the IEEE engine is available (IEEE_API_KEY env var set).
+    pub fn has_ieee_key(&self) -> bool { self.ieee_api_key.is_some() }
 
     /// Whether requests to this host must bypass the proxy entirely.
     ///

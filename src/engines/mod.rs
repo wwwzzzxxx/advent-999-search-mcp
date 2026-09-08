@@ -18,6 +18,7 @@ pub mod weixin;
 pub mod dblp;
 pub mod cnki;
 pub mod deepseek;
+pub mod ieee;
 
 /// Engines that require an API key / cookie from the environment.
 /// They are only added to the engine map when the credential is present;
@@ -26,6 +27,9 @@ fn credential_gated_engines(config: &Config) -> Vec<Box<dyn SearchEngine>> {
     let mut engines: Vec<Box<dyn SearchEngine>> = Vec::new();
     if config.has_deepseek_key() {
         engines.push(Box::new(deepseek::DeepseekEngine));
+    }
+    if config.has_ieee_key() {
+        engines.push(Box::new(ieee::IeeeEngine));
     }
     engines
 }
