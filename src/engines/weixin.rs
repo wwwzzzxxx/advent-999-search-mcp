@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 use crate::config::Config;
+use crate::cookie_cache;
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 
@@ -15,6 +16,13 @@ use super::SearchEngine;
 pub struct WeixinEngine;
 
 const WEIXIN_SEARCH_URL: &str = "https://weixin.sogou.com/weixin";
+
+/// Sogou's "captcha already solved" cookies (see `sogou.rs`). weixin.sogou.com
+/// shares the same trust mechanism, so replaying the browser's SNUID/SUV also
+/// keeps WeChat article search working.
+const WEIXIN_COOKIE_NAMES: &[&str] = &[
+    "SNUID", "SUV", "SUID", "ABTEST", "IPLOC", "cuid", "PHPSESSID",
+];
 
 #[async_trait]
 impl SearchEngine for WeixinEngine {
@@ -36,12 +44,31 @@ impl SearchEngine for WeixinEngine {
                     builder = builder.proxy(proxy);
                 }
             }
+        } else {
+            // Disable reqwest's automatic system proxy (Windows registry /
+            // *_PROXY env vars) — otherwise "direct" still goes via the proxy
+            // and hits the captcha wall.
+            builder = builder.no_proxy();
         }
 
         let client = builder.build()
             .map_err(|e| SearchError::Http(e.to_string()))?;
 
-        let headers = build_browser_headers();
+        let mut headers = build_browser_headers();
+
+        // Replay the captcha-solved session cookies from the local cookie cache
+        // (shared with sogou — weixin.sogou.com trusts the same SNUID).
+        let cookie = cookie_cache::get("sogou", config.cookie_cache_ttl_secs)
+            .and_then(|raw| cookie_cache::filter_cookie_header(&raw, WEIXIN_COOKIE_NAMES));
+
+        if let Some(c) = cookie {
+            match reqwest::header::HeaderValue::from_str(&c) {
+                Ok(v) => {
+                    headers.insert(reqwest::header::COOKIE, v);
+                }
+                Err(_) => eprintln!("⚠️ weixin: cached cookies are not a valid header value"),
+            }
+        }
 
         let mut all_results = Vec::new();
         let mut seen_urls = std::collections::HashSet::new();
@@ -115,9 +142,14 @@ fn check_antispider(final_url: &str, html: &str) -> Result<(), SearchError> {
         || lower.contains("请依次点击")
         || lower.contains("验证码")
     {
-        return Err(SearchError::Blocked(
-            "Weixin (Sogou) returned a verification page; slow down requests or retry later".to_string(),
-        ));
+        return Err(SearchError::Blocked(format!(
+            "Weixin (via Sogou) returned a verification page (IP rate-limited; SNUID may have \
+             expired). Fix: open https://www.sogou.com/web?query=test in a browser, solve the \
+             「请依次点击」captcha, then store `document.cookie` with the `set_cookies` tool or \
+             `python tests/manual/seed_cookies.py sogou --stdin` — no restart needed. \
+             Cookie cache: {}",
+            crate::cookie_cache::cache_path().display()
+        )));
     }
     Ok(())
 }

@@ -14,6 +14,8 @@ const DEFAULT_DIRECT_DOMAINS: &[&str] = &[
     "juejin",      // 掘金
     "xiaohongshu", // 小红书
     "deepseek",    // DeepSeek 官方 API (国内直连)
+    "cnki",        // 知网 (scholar/kns/www.cnki.net 在腾讯 EdgeOne 后，代理/数据中心 IP 一律 418，必须直连)
+    "dblp",        // DBLP (dblp.org / dblp.uni-trier.de 对代理 IP 返回 Anubis 反爬挑战，国内直连可用)
 ];
 
 #[derive(Debug, Clone)]
@@ -40,6 +42,13 @@ pub struct Config {
     /// during US business hours before first use). Read ONLY from this
     /// env var (never from any file).
     pub ieee_api_key: Option<String>,
+    /// How long a cookie-cache entry is considered fresh, in seconds.
+    ///
+    /// Advisory only: stale entries are still used (the remote server is the
+    /// real authority) but a warning is logged. Defaults to 1200s (~20 min),
+    /// matching the observed lifetime of Sogou's `SNUID`.
+    /// Override with `COOKIE_CACHE_TTL` (0 disables the warning).
+    pub cookie_cache_ttl_secs: u64,
 }
 
 impl Config {
@@ -105,6 +114,20 @@ impl Config {
             eprintln!("🔑 IEEE_API_KEY set, ieee engine enabled");
         }
 
+        // Cookie-cache freshness window (advisory warning threshold).
+        let cookie_cache_ttl_secs = env::var("COOKIE_CACHE_TTL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1200);
+
+        // Anti-bot session cookies (sogou/weixin SNUID & friends) live in a
+        // small local file rather than an env var, so refreshing them takes
+        // effect on the next search instead of requiring a restart.
+        eprintln!(
+            "🍪 cookie cache: {}",
+            crate::cookie_cache::cache_path().display()
+        );
+
         Self {
             default_search_engine: default_engine,
             allowed_search_engines: allowed,
@@ -116,6 +139,7 @@ impl Config {
             deepseek_api_key,
             deepseek_api_mode,
             ieee_api_key,
+            cookie_cache_ttl_secs,
         }
     }
 
@@ -151,7 +175,20 @@ impl Config {
     ///
     /// Sogou / WeChat domains block datacenter and proxy IPs with captchas,
     /// so those requests must always go direct (use_proxy = false).
+    ///
+    /// NOTE: reqwest enables an automatic "system" proxy by default
+    /// (`auto_sys_proxy`), which reads the Windows registry
+    /// (`HKCU\...\Internet Settings`) and the HTTP_PROXY/HTTPS_PROXY env vars.
+    /// That matcher would silently route "direct" requests back through the
+    /// proxy whenever the user turns on a global/system proxy. Calling
+    /// `.no_proxy()` in the bypass branch disables it, so DIRECT_DOMAINS
+    /// actually means "direct".
     pub fn build_reqwest_client_with_proxy(&self, use_proxy: bool) -> reqwest::Result<reqwest::Client> {
+        self.client_builder(use_proxy)?.build()
+    }
+
+    /// Shared builder so every client gets identical timeout / UA / proxy rules.
+    fn client_builder(&self, use_proxy: bool) -> reqwest::Result<reqwest::ClientBuilder> {
         let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -165,9 +202,23 @@ impl Config {
                 })?;
                 builder = builder.proxy(proxy);
             }
+        } else {
+            // Disable reqwest's automatic system/env proxy — otherwise the
+            // "bypass" is a no-op when a system proxy (registry) is active.
+            builder = builder.no_proxy();
         }
 
-        builder.build()
+        Ok(builder)
+    }
+
+    /// Like [`build_reqwest_client_for`], but with a cookie jar enabled.
+    ///
+    /// Required for sites that hand out a session cookie we must replay:
+    /// Anubis challenge tokens (`src/anubis.rs`) and Sogou's SNUID/SUV.
+    pub fn build_reqwest_client_for_with_cookies(&self, domain: &str) -> reqwest::Result<reqwest::Client> {
+        self.client_builder(!self.should_bypass_proxy(domain))?
+            .cookie_store(true)
+            .build()
     }
 
     pub fn is_engine_allowed(&self, engine: &str) -> bool {

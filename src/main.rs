@@ -4,6 +4,8 @@ mod engines;
 mod local_search;
 mod fetch;
 mod python_embed;
+mod anubis;
+mod cookie_cache;
 
 use config::Config;
 use models::{SearchResponse, PartialFailure, normalize_engine};
@@ -76,7 +78,7 @@ async fn main() {
                         },
                         "serverInfo": {
                             "name": "advent-999-search-mcp",
-                            "version": "0.6.0"
+                            "version": "0.7.0"
                         }
                     }
                 });
@@ -300,11 +302,98 @@ fn list_tools(config: &Config) -> Vec<Value> {
         }
     });
 
-    let mut tools = vec![search_tool, fetch_tool];
+    // Session-cookie seeding for captcha-walled engines (sogou / weixin).
+    //
+    // Sogou rate-limits by egress IP and answers with a "请依次点击" click
+    // captcha. A human solves it in a browser; the resulting SNUID cookie is
+    // then replayed. Storing it via a tool (rather than an env var) means a
+    // refresh takes effect on the next search, with no server restart.
+    let set_cookies_tool = serde_json::json!({
+        "name": "set_cookies",
+        "description": "Store fresh browser session cookies for captcha-walled engines (sogou, weixin). Use when search reports a Sogou verification page: solve the captcha in a browser, read document.cookie, and pass it here. Values are filtered down to the cookies the engines need, then cached locally (outside the repo) and picked up on the next search — no restart. The tool reports only a non-reversible fingerprint, never the values.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cookies": {
+                    "type": "string",
+                    "description": "Cookie header value, e.g. \"SNUID=...; SUV=...; SUID=...; ABTEST=...; IPLOC=...\" (the whole document.cookie dump is fine; unrelated cookies are dropped)"
+                },
+                "site": {
+                    "type": "string",
+                    "description": "Which engine the cookies belong to (default: sogou, shared with weixin)",
+                    "default": "sogou"
+                }
+            },
+            "required": ["cookies"]
+        }
+    });
+
+    let mut tools = vec![search_tool, fetch_tool, set_cookies_tool];
     if find_es_exe().is_some() {
         tools.insert(1, local_tool);
     }
     tools
+}
+
+/// Handle `set_cookies`: filter, validate, and persist to the cookie cache.
+fn handle_set_cookies(args: &Value) -> String {
+    use crate::cookie_cache;
+
+    let raw = args.get("cookies").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let site = args.get("site").and_then(|v| v.as_str()).unwrap_or("sogou").trim();
+
+    if raw.is_empty() {
+        return json_error("set_cookies requires a non-empty `cookies` argument");
+    }
+    if site.is_empty() {
+        return json_error("set_cookies requires a non-empty `site` argument");
+    }
+
+    // Sending unrelated cookies (bilibili SESSDATA, zhihu d_c0, ...) to every
+    // host is itself a bot signal, so narrow to what Sogou's trust check needs.
+    const NAMES: &[&str] = &["SNUID", "SUV", "SUID", "ABTEST", "IPLOC", "cuid", "PHPSESSID"];
+    let filtered = match cookie_cache::filter_cookie_header(raw, NAMES) {
+        Some(f) => f,
+        None => {
+            return json_error(
+                "None of the expected cookies were found. Sogou needs at least `SNUID` \
+                 (issued only after solving the captcha in a browser) plus `SUV`/`SUID`. \
+                 Copy `document.cookie` from a page you just passed the captcha on.",
+            )
+        }
+    };
+
+    if !filtered.to_uppercase().contains("SNUID=") {
+        return json_error(
+            "No `SNUID` in the supplied cookies. SNUID is issued only after the \
+             captcha is solved — make sure you copied document.cookie from the \
+             browser session that passed it.",
+        );
+    }
+
+    if let Err(e) = cookie_cache::put(site, &filtered) {
+        return json_error(&format!("Failed to write the cookie cache: {}", e));
+    }
+
+    let names: Vec<&str> = filtered
+        .split(';')
+        .filter_map(|p| p.split('=').next())
+        .map(|s| s.trim())
+        .collect();
+
+    let out = serde_json::json!({
+        "status": "ok",
+        "site": site,
+        "stored": names,
+        "cache_file": cookie_cache::cache_path().display().to_string(),
+        "note": "Takes effect on the next search — no restart needed. \
+                 Sogou's SNUID typically lasts ~20 minutes.",
+    });
+    serde_json::to_string_pretty(&out).unwrap_or_default()
+}
+
+fn json_error(message: &str) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({"error": message})).unwrap_or_default()
 }
 
 async fn handle_tool_call(
@@ -317,6 +406,7 @@ async fn handle_tool_call(
         "web" => handle_web_search(args, config, engine_map).await,
         "local" => handle_local_search(args),
         "get_page" => handle_fetch(args, config).await,
+        "set_cookies" => handle_set_cookies(args),
         _ => {
             let err = serde_json::json!({
                 "error": format!("Unknown tool: {}", name)

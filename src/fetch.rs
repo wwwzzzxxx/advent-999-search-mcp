@@ -2451,6 +2451,10 @@ fn build_fetch_client(config: &Config, domain: &str) -> Result<reqwest::Client, 
             })?;
             builder = builder.proxy(proxy);
         }
+    } else {
+        // reqwest's automatic system proxy (Windows registry / *_PROXY env vars)
+        // would route this "direct" request back through the proxy. Disable it.
+        builder = builder.no_proxy();
     }
 
     builder.build().map_err(|e| FetchError::Config(e.to_string()))

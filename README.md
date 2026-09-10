@@ -11,6 +11,7 @@ A Rust-based MCP server that gives your AI assistant **web search**, **local fil
 - **`web`** — Search with 11 engines (Exa, Bing, CSDN, Juejin, Startpage, Sogou, Weixin, DBLP, CNKI + credential-gated DeepSeek, IEEE)
 - **`local`** — Search your local files via Everything (voidtools)
 - **`get_page`** — Fetch and extract readable content from any web page
+- **`set_cookies`** — Store fresh session cookies for captcha-walled engines (Sogou), no restart needed
 
 ### Why advent?
 
@@ -190,13 +191,13 @@ Edit `opencode.json`:
 |----------|:--------:|---------|-------------|
 | `PROXY_URL` | No | — | Proxy address (e.g. `http://127.0.0.1:7890`) |
 | `USE_PROXY` | No | `true` | Enable/disable proxy |
-| `DIRECT_DOMAINS` | No | *mainland list* | Domains that bypass the proxy (direct). Default: `sogou,weixin,baidu,bilibili,hdslb,zhihu,csdn,juejin,xiaohongshu`. Set `none` to proxy everything. NOTE: YouTube always uses the proxy regardless of this setting (it needs egress outside mainland China) |
+| `DIRECT_DOMAINS` | No | *mainland list* | Domains that bypass the proxy (direct). Default: `sogou,weixin,baidu,bilibili,hdslb,zhihu,csdn,juejin,xiaohongshu,cnki,dblp`. Set `none` to proxy everything. NOTE: YouTube always uses the proxy regardless of this setting (it needs egress outside mainland China) |
 | `EXA_API_KEY` | No | — | Exa API key — get one [here](https://dashboard.exa.ai/api-keys) |
 | `DEEPSEEK_API_KEY` | No | — | DeepSeek web-search key — official API key or OpenCode Go subscription key (auto-detected) — enables the `deepseek` engine |
 | `DEEPSEEK_API_MODE` | No | *(auto)* | Force backend: `official` (api.deepseek.com) or `go` (opencode.ai) |
 | `DEEPSEEK_MODEL` | No | `deepseek-v4-flash` | Model used by the deepseek engine |
 | `IEEE_API_KEY` | No | — | IEEE Xplore Metadata Search API key ([developer.ieee.org](https://developer.ieee.org)) — enables the `ieee` engine |
-| `FETCH_COOKIES` | No | — | Browser cookies for authenticated pages. Format: `key=value; key2=value2`. `d_c0` unlocks Zhihu; `SESSDATA` unlocks Bilibili subtitles (the subtitle list requires login) |
+| `FETCH_COOKIES` | No | — | Long-lived **login** cookies. Format: `key=value; key2=value2`. `d_c0` unlocks Zhihu; `SESSDATA` unlocks Bilibili subtitles (the subtitle list requires login). For short-lived **anti-bot** cookies (Sogou `SNUID`) use the cookie cache / `set_cookies` tool instead — see the Sogou note below. **Never commit real cookies** — set them as env vars |
 | `EVERYTHING_ES_PATH` | No | — | Path to ES.exe (required to enable local search) |
 | `DEFAULT_SEARCH_ENGINE` | No | `exa` | Default search engine |
 | `ALLOWED_SEARCH_ENGINES` | No | *(all)* | Comma-separated list of allowed engines |
@@ -225,7 +226,45 @@ Credential-gated engines (implemented, hidden until key set — appear automatic
 
 When the key is set via the env var, the engine is automatically listed in `tools/list`; without the key it stays hidden.
 
-Note: `cnki` needs no cookie or key — it uses the public scholar.cnki.net REST API.
+Note: `cnki` needs no cookie or key — it uses the public scholar.cnki.net REST API. CNKI hosts sit behind Tencent EdgeOne, which answers HTTP 418 to proxy/datacenter IPs, so `cnki` must bypass the proxy (present in the default `DIRECT_DOMAINS`).
+
+Note: `dblp` queries `dblp.org` and falls back to `dblp.uni-trier.de`. Both are protected by [Anubis](https://anubis.techaro.lol) proof-of-work anti-bot; the engine solves the challenge automatically (see below).
+
+Note: `startpage` proxies Google results. Sogou-style blocks aside, Startpage answers automated clients with an Anubis challenge on `/sp/search`; the engine solves it automatically.
+
+### Anubis proof-of-work (dblp, startpage)
+
+Both sites sit behind [Anubis](https://anubis.techaro.lol), which replies to non-browser clients with a JavaScript challenge page instead of content. The server solves it the same way a browser would (`src/anubis.rs`):
+
+1. read `randomData`, `id` and `difficulty` from `<script id="anubis_challenge">`
+2. brute-force a `nonce` so that `sha256hex(randomData + nonce)` starts with `difficulty` zero **hex digits**
+3. `GET /.within.website/x/cmd/anubis/api/pass-challenge` — this sets the auth cookie
+4. replay the original request; the cookie is cached in the client's jar
+
+The hash search runs multi-threaded; `difficulty` counts hex digits (not bits), so difficulty 4 takes ~15 ms and difficulty 6 ~1 s. The auth cookie lasts about a week, so the cost is paid once per process rather than per search.
+
+Note: `sogou` (and `weixin`, which rides on weixin.sogou.com) rate-limits by egress IP. Once Sogou decides your IP is suspicious it serves a "请依次点击" click-captcha instead of results. **To recover**, solve it once in a browser and store the resulting cookies locally:
+
+1. open `https://www.sogou.com/web?query=test`, solve the captcha
+2. copy the cookies: in DevTools → Console run `copy(document.cookie)`
+3. seed the cache — either paste into the `set_cookies` MCP tool, or run
+   `python tests/manual/seed_cookies.py sogou --stdin`
+4. search again — **no restart needed**
+
+`SNUID` is the credential that proves the captcha was solved; it is *not* HttpOnly, so `document.cookie` is enough. It lasts roughly 20 minutes, after which Sogou challenges again. The cache warns when an entry looks stale.
+
+### Two kinds of cookies
+
+| | `FETCH_COOKIES` (env var) | Cookie cache (file) |
+|---|---|---|
+| For | long-lived **login** credentials — Zhihu `d_c0`, Bilibili `SESSDATA` | short-lived **anti-bot** credentials — Sogou `SNUID`/`SUV` |
+| Loaded | once at startup | re-read whenever the file changes |
+| Refresh | edit config **and restart** | just re-seed — effective on the next search |
+| Location | your MCP config | `%LOCALAPPDATA%\advent-mcp\cookie-cache.json` (Windows), `~/.cache/advent-mcp/cookie-cache.json` (Linux/macOS) |
+
+Both live **outside this repository** and must never be committed. Logs only ever print a non-reversible fingerprint (`SNUID(D04E…1AF4, len 32)`), never a usable value.
+
+Note: `cnki`, `dblp` and `sogou` all detect proxy/datacenter IPs, so they belong in `DIRECT_DOMAINS` (they are there by default). Sogou's block is IP-level, and note that in a rules-based VPN the proxy may still route CN domains direct — so "proxying" Sogou does not actually change your egress IP.
 
 ### `local` — Local File Search
 

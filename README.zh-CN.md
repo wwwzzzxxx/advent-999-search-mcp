@@ -11,6 +11,7 @@
 - **`web`** — 11 个搜索引擎（Exa、Bing、CSDN、掘金、Startpage、搜狗、微信、DBLP、知网 + 凭据门控的 DeepSeek、IEEE）
 - **`local`** — 通过 Everything (voidtools) 搜索本地文件
 - **`get_page`** — 抓取任意网页并提取可读内容
+- **`set_cookies`** — 为有验证码墙的引擎（搜狗）写入新会话 Cookie，无需重启
 
 ### 为什么选 advent？
 
@@ -188,13 +189,13 @@ EVERYTHING_ES_PATH=C:\path\to\es.exe
 |----------|:---:|---------|------|
 | `PROXY_URL` | 否 | — | 代理地址（如 `http://127.0.0.1:7890`） |
 | `USE_PROXY` | 否 | `true` | 是否启用代理 |
-| `DIRECT_DOMAINS` | 否 | *大陆列表* | 绕过代理直连的域名。默认：`sogou,weixin,baidu,bilibili,hdslb,zhihu,csdn,juejin,xiaohongshu`。设为 `none` 则全部走代理。注意：YouTube 始终走代理（需出境），不受此设置影响 |
+| `DIRECT_DOMAINS` | 否 | *大陆列表* | 绕过代理直连的域名。默认：`sogou,weixin,baidu,bilibili,hdslb,zhihu,csdn,juejin,xiaohongshu,cnki,dblp`。设为 `none` 则全部走代理。注意：YouTube 始终走代理（需出境），不受此设置影响 |
 | `EXA_API_KEY` | 否 | — | Exa API 密钥，[点此申请](https://dashboard.exa.ai/api-keys) |
 | `DEEPSEEK_API_KEY` | 否 | — | DeepSeek 搜索密钥——官方 API key 或 OpenCode Go 订阅 key（自动检测）——启用 `deepseek` 引擎 |
 | `DEEPSEEK_API_MODE` | 否 | 自动 | 强制后端：`official`（api.deepseek.com）或 `go`（opencode.ai） |
 | `DEEPSEEK_MODEL` | 否 | `deepseek-v4-flash` | deepseek 引擎使用的模型 |
 | `IEEE_API_KEY` | 否 | — | IEEE Xplore 元数据搜索 API 密钥（[developer.ieee.org](https://developer.ieee.org)）——启用 `ieee` 引擎 |
-| `FETCH_COOKIES` | 否 | — | 浏览器 Cookie。格式：`key=value; key2=value2`。`d_c0` 解锁知乎；`SESSDATA` 解锁 B 站字幕（字幕列表需登录才能获取） |
+| `FETCH_COOKIES` | 否 | — | 长期**登录** Cookie。格式：`key=value; key2=value2`。`d_c0` 解锁知乎；`SESSDATA` 解锁 B 站字幕（字幕列表需登录才能获取）。短时**反爬** Cookie（搜狗 `SNUID`）请用 cookie 缓存 / `set_cookies` 工具——见下文搜狗说明。**切勿提交真实 Cookie**——请用环境变量配置 |
 | `EVERYTHING_ES_PATH` | 否 | — | ES.exe 路径（必须设置才能启用本地搜索） |
 | `DEFAULT_SEARCH_ENGINE` | 否 | `exa` | 默认搜索引擎 |
 | `ALLOWED_SEARCH_ENGINES` | 否 | *（全部）* | 允许的搜索引擎列表（逗号分隔） |
@@ -223,7 +224,45 @@ searchMode (string)             — "request" | "auto" | "playwright"
 
 通过环境变量设置密钥后，引擎会自动出现在 `tools/list` 中；未设置密钥时保持隐藏。
 
-说明：`cnki`（知网）无需 Cookie 或密钥，直接使用公开的 scholar.cnki.net REST API。
+说明：`cnki`（知网）无需 Cookie 或密钥，直接使用公开的 scholar.cnki.net REST API。知网各域名在腾讯 EdgeOne 后，对代理/数据中心 IP 一律返回 HTTP 418，因此 `cnki` 必须绕过代理直连（已在默认 `DIRECT_DOMAINS` 中）。
+
+说明：`dblp` 先请求 `dblp.org`，失败时回退到 `dblp.uni-trier.de`。两者均已启用 [Anubis](https://anubis.techaro.lol) 工作量证明反爬，引擎会自动求解（见下文）。
+
+说明：`startpage` 是 Google 结果的匿名代理。除了常规反爬，它会对自动化客户端的 `/sp/search` 返回 Anubis 挑战页，引擎会自动求解。
+
+### Anubis 工作量证明（dblp、startpage）
+
+这两个站点都在 [Anubis](https://anubis.techaro.lol) 之后，它对非浏览器客户端返回 JavaScript 挑战页而不是内容。服务端按与浏览器相同的方式求解（`src/anubis.rs`）：
+
+1. 从 `<script id="anubis_challenge">` 读取 `randomData`、`id`、`difficulty`
+2. 暴力搜索 `nonce`，使 `sha256hex(randomData + nonce)` 以 `difficulty` 个**前导零十六进制位**开头
+3. `GET /.within.website/x/cmd/anubis/api/pass-challenge` —— 该响应会设置认证 Cookie
+4. 重放原请求；Cookie 缓存在客户端的 cookie jar 中
+
+哈希搜索是多线程的；`difficulty` 的单位是**十六进制位数**而非比特，所以 difficulty 4 约 15 毫秒、difficulty 6 约 1 秒。认证 Cookie 有效期约一周，因此每个进程只需付出一次求解成本，而不是每次搜索都算。
+
+说明：`sogou`（以及依赖 weixin.sogou.com 的 `weixin`）按出口 IP 限流。一旦搜狗判定你的 IP 可疑，就会返回「请依次点击」点选验证码而不是结果。**恢复方法**——在浏览器里通过一次验证，然后把 Cookie 存到本地：
+
+1. 打开 `https://www.sogou.com/web?query=test`，完成验证码
+2. 复制 Cookie：DevTools → Console 执行 `copy(document.cookie)`
+3. 写入缓存 —— 粘贴给 `set_cookies` MCP 工具，或运行
+   `python tests/manual/seed_cookies.py sogou --stdin`
+4. 重新搜索 —— **无需重启**
+
+`SNUID` 是证明「验证码已通过」的凭证，**不是 HttpOnly**，所以 `document.cookie` 就能取到。有效期约 20 分钟，之后搜狗会再次要求验证。缓存过期时会在日志里给出提醒。
+
+### 两种 Cookie 的分工
+
+| | `FETCH_COOKIES`（环境变量） | Cookie 缓存（文件） |
+|---|---|---|
+| 用途 | 长期**登录**凭证 —— 知乎 `d_c0`、B 站 `SESSDATA` | 短时**反爬**凭证 —— 搜狗 `SNUID`/`SUV` |
+| 加载时机 | 启动时读取一次 | 文件变更后立即重读 |
+| 刷新方式 | 改配置**并重启** | 重新写入即可，下次搜索生效 |
+| 位置 | 你的 MCP 配置 | `%LOCALAPPDATA%\advent-mcp\cookie-cache.json`（Windows）、`~/.cache/advent-mcp/cookie-cache.json`（Linux/macOS） |
+
+两者都在**本仓库之外**，切勿提交。日志只打印不可逆的指纹（如 `SNUID(D04E…1AF4, len 32)`），永远不会输出可用的真实值。
+
+说明：`cnki`、`dblp`、`sogou` 都会识别代理/数据中心 IP，因此它们属于应当直连的域名（默认已包含在 `DIRECT_DOMAINS` 中）。搜狗的封锁是 IP 级的；另外注意在规则模式下 VPN 可能仍把国内域名走直连，所以「用代理」并不会真的改变搜狗的出口 IP。
 
 ### `local` — 本地文件搜索
 

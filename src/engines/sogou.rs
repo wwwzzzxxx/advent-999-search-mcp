@@ -3,6 +3,7 @@ use scraper::{Html, Selector};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use crate::config::Config;
+use crate::cookie_cache;
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 
@@ -24,6 +25,17 @@ static SOGOU_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// consecutive tool calls are spaced out.
 static LAST_REQUEST: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// Cookies Sogou uses to decide whether a client already passed the captcha.
+///
+/// `SNUID` is the credential issued *after* a human solves the
+/// "请依次点击【…】" captcha; `SUV`/`SUID`/`ABTEST`/`IPLOC`/`cuid`/`PHPSESSID`
+/// accompany it. They are NOT HttpOnly, so they can be lifted from a real
+/// browser session and replayed. They expire (~20 min reported, less under
+/// load), after which Sogou shows the captcha again.
+const SOGOU_COOKIE_NAMES: &[&str] = &[
+    "SNUID", "SUV", "SUID", "ABTEST", "IPLOC", "cuid", "PHPSESSID",
+];
+
 fn get_sogou_client(config: &Config) -> Result<&'static reqwest::Client, SearchError> {
     Ok(SOGOU_CLIENT.get_or_init(|| {
         // Sogou blocks proxy/datacenter IPs with captchas — bypass proxy by
@@ -40,6 +52,11 @@ fn get_sogou_client(config: &Config) -> Result<&'static reqwest::Client, SearchE
                     builder = builder.proxy(proxy);
                 }
             }
+        } else {
+            // Disable reqwest's automatic system proxy (Windows registry /
+            // *_PROXY env vars) — otherwise "direct" still goes via the proxy
+            // and hits the captcha wall.
+            builder = builder.no_proxy();
         }
 
         builder.build().expect("failed to build sogou client")
@@ -86,17 +103,39 @@ impl SearchEngine for SogouEngine {
     async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
         let client = get_sogou_client(config)?;
 
+        // SNUID is the "captcha already solved" credential — replaying it is
+        // what makes programmatic requests look like the user's own browser.
+        //
+        // It comes from the local cookie cache (a file, so refreshing it takes
+        // effect on the next search — no env var, no MCP restart).
+        let cookie_header = cookie_cache::get("sogou", config.cookie_cache_ttl_secs)
+            .and_then(|raw| cookie_cache::filter_cookie_header(&raw, SOGOU_COOKIE_NAMES));
+
+        if cookie_header.is_none() {
+            eprintln!(
+                "🍪 sogou: no cached SNUID/SUV — expect a captcha page.\n   \
+                 Fix: solve the captcha in a browser, then run\n   \
+                 \x20 python tests/manual/seed_cookies.py sogou \"<document.cookie>\"\n   \
+                 \x20 cache file: {}",
+                cookie_cache::cache_path().display()
+            );
+        }
+
+        let mut headers = build_sogou_headers();
+        if let Some(ref c) = cookie_header {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(c) {
+                headers.insert(reqwest::header::COOKIE, v);
+            }
+        }
+
         // First use: warm up the homepage so sogou.com issues session
         // cookies (SUV/SNUID) before we hit the search endpoint.
         if LAST_REQUEST.lock().unwrap().is_none() {
             let _ = client.get("https://www.sogou.com/")
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .headers(headers.clone())
                 .send()
                 .await;
         }
-
-        let headers = build_sogou_headers();
 
         let mut all_results = Vec::new();
         let mut seen_urls = std::collections::HashSet::new();
@@ -176,9 +215,14 @@ fn check_sogou_challenge(final_url: &str, html: &str) -> Result<(), SearchError>
         || lower.contains("请依次点击")
         || lower.contains("验证码")
     {
-        return Err(SearchError::Blocked(
-            "Sogou returned a verification page; slow down requests or retry later".to_string(),
-        ));
+        return Err(SearchError::Blocked(format!(
+            "Sogou returned a verification page (IP rate-limited; SNUID may have expired). \
+             Fix: (1) open https://www.sogou.com/web?query=test in a browser and solve the \
+             「请依次点击」captcha, (2) run `document.cookie` in DevTools, (3) store it with the \
+             `set_cookies` tool or `python tests/manual/seed_cookies.py sogou --stdin` — \
+             no restart needed. Cookie cache: {}",
+            crate::cookie_cache::cache_path().display()
+        )));
     }
     Ok(())
 }
