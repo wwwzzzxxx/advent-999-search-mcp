@@ -291,6 +291,7 @@ find      (string)              — Literal substring to search in the fetched t
 contextChars (number, default 200) — Context chars around each match in find mode
 maxMatches (number, default 20, max 50) — Max context windows in find mode
 matchCase (boolean, default false) — Case-sensitive matching (ASCII only)
+includeLinks (boolean, default false) — Keep markdown hyperlinks [text](url); by default links are stripped to their visible text to save tokens
 ```
 
 Find mode (server-side substring search, saves tokens): when `find` is set, the fetch happens

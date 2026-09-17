@@ -289,6 +289,7 @@ find      (string)              — 在抓取文本中搜索的字面子串（fi
 contextChars (number, 默认 200) — find 模式每处匹配前后保留的上下文字符数
 maxMatches (number, 默认 20, 最大 50) — find 模式最多返回的上下文窗口数
 matchCase (boolean, 默认 false) — 是否区分大小写（仅 ASCII）
+includeLinks (boolean, 默认 false) — 保留 Markdown 超链接 [text](url)；默认剥离为可见文本以省 token
 ```
 
 find 模式（服务端子串搜索，省 token）：设置 `find` 后先正常抓取，再在提取文本中做字面子串

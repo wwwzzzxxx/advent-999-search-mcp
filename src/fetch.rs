@@ -3248,32 +3248,211 @@ fn post_process_content(text: &str, domain: &str) -> String {
     cleaned
 }
 
-/// Strip ALL markdown links, preserving only the link text. `[text](url)` → `text`.
-fn strip_markdown_links(text: &str) -> String {
+/// Strip markdown hyperlinks, preserving only the visible text.
+///
+/// `[text](url)` → `text`, `![alt](src)` → `alt`, `[text][ref]` → `text`,
+/// `<https://example.com>` → `https://example.com`.
+/// Fenced code blocks (```...```) and inline code (`...`) are kept verbatim
+/// so code samples showing markdown syntax are not corrupted.
+/// Relative links (`](/path)`, `](./x)`) are stripped just like http(s) ones.
+pub fn strip_markdown_links(text: &str) -> String {
+    // Split out fenced code blocks first: even parts are normal text,
+    // odd parts are inside ``` fences (kept verbatim).
+    let fence_parts: Vec<&str> = text.split("```").collect();
+    if fence_parts.len() == 1 {
+        return strip_links_outside_fences(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, part) in fence_parts.iter().enumerate() {
+        if i % 2 == 1 {
+            out.push_str(part);
+        } else {
+            out.push_str(&strip_links_outside_fences(part));
+        }
+        if i + 1 < fence_parts.len() {
+            out.push_str("```");
+        }
+    }
+    out
+}
+
+/// Strip links in text that contains no fenced code blocks.
+/// Inline `code` spans are preserved verbatim.
+fn strip_links_outside_fences(text: &str) -> String {
+    // Split on backticks to protect inline code. Even segments are normal
+    // text, odd segments are inside `...` (kept verbatim). This is an
+    // approximation for ``double`` spans but safe: worst case we protect
+    // slightly more/less than perfect, never corrupting prose.
+    if !text.contains('`') {
+        return strip_inline_links_twice(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    for seg in text.split_inclusive('`') {
+        if seg.ends_with('`') {
+            // Segment ends with a backtick: the part before it belongs to
+            // the current state, the backtick itself is a delimiter.
+            let body = &seg[..seg.len() - 1];
+            if in_code {
+                out.push_str(body);
+            } else {
+                out.push_str(&strip_inline_links_twice(body));
+            }
+            out.push('`');
+            in_code = !in_code;
+        } else if in_code {
+            out.push_str(seg);
+        } else {
+            out.push_str(&strip_inline_links_twice(seg));
+        }
+    }
+    out
+}
+
+/// Run the inline-link stripper twice so nested constructs like
+/// `[![alt](img)](url)` fully collapse to `alt`.
+fn strip_inline_links_twice(text: &str) -> String {
+    let once = strip_inline_links(text);
+    if once.contains("](") || once.contains("](http") {
+        strip_inline_links(&once)
+    } else {
+        once
+    }
+}
+
+/// Strip one level of inline / reference / autolink markup outside code.
+fn strip_inline_links(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut remaining = text;
-    while let Some(bracket) = remaining.find('[') {
-        // Push everything before the `[`
-        result.push_str(&remaining[..bracket]);
-        let after_bracket = &remaining[bracket + 1..];
-        // Try to find `](http` after the `[`
-        if let Some(link_start) = after_bracket.find("](http") {
-            // link_text is between [ and ]
-            let link_text = &after_bracket[..link_start];
-            // Find closing `)` of the URL
-            let after_url = &after_bracket[link_start + 2..]; // skip `](`
-            if let Some(close_paren) = after_url.find(')') {
-                result.push_str(link_text);
-                remaining = &after_url[close_paren + 1..];
-                continue;
+    while let Some(open) = remaining.find('[') {
+        let prefix = &remaining[..open];
+        let is_image = prefix.ends_with('!');
+        let after_bracket = &remaining[open + 1..];
+        // ── inline link: [text](url) / [text](url "title") ──
+        if let Some(close_idx) = after_bracket.find("](") {
+            let link_text = &after_bracket[..close_idx];
+            if is_valid_link_text(link_text) {
+                let after_paren = &after_bracket[close_idx + 2..];
+                if let Some(end) = find_inline_link_end(after_paren) {
+                    if is_image {
+                        result.push_str(&prefix[..prefix.len() - 1]);
+                    } else {
+                        result.push_str(prefix);
+                    }
+                    result.push_str(link_text);
+                    remaining = &after_paren[end + 1..];
+                    continue;
+                }
             }
         }
-        // Not a valid markdown link, keep the `[`
+        // ── reference link: [text][ref] / [text][] ──
+        if let Some(cb) = after_bracket.find(']') {
+            let link_text = &after_bracket[..cb];
+            let after = &after_bracket[cb + 1..];
+            if is_valid_link_text(link_text) && after.starts_with('[') {
+                if let Some(end2) = after.find(']') {
+                    // [text][ref] or [text][] — drop the reference part.
+                    if is_image {
+                        result.push_str(&prefix[..prefix.len() - 1]);
+                    } else {
+                        result.push_str(prefix);
+                    }
+                    result.push_str(link_text);
+                    remaining = &after[end2 + 1..];
+                    continue;
+                }
+            }
+        }
+        // Not a link — emit through the `[` and keep scanning.
+        result.push_str(prefix);
         result.push('[');
         remaining = after_bracket;
     }
-    result.push_str(remaining);
-    result
+    result.push_str(&strip_autolinks(remaining));
+    // Autolinks may also appear before the first `[`, so run on the whole
+    // accumulated output's tail? Simpler: run on the final string once.
+    // (Only `<http...>` shaped spans are affected, so this is safe.)
+    strip_autolinks(&result)
+}
+
+/// Link text is valid when it is a single-line span without nesting.
+fn is_valid_link_text(t: &str) -> bool {
+    !t.is_empty() && !t.contains('[') && !t.contains('\n') && !t.starts_with('^')
+}
+
+/// Find the byte index of the `)` closing an inline link destination.
+///
+/// `s` starts just after `](`. Handles nested parens (e.g. Wikipedia URLs
+/// like `.../Test_(assessment)`) and backslash-escaped `\)`.
+fn find_inline_link_end(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `<https://example.com>` → `https://example.com`. Only unwraps angle
+/// brackets whose inner text looks like a URL/mail (no spaces, contains
+/// `://` or `@`); HTML tags are left untouched.
+fn strip_autolinks(text: &str) -> String {
+    if !text.contains("<http") && !text.contains("<mailto:") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        if let Some(close) = rest[open..].find('>') {
+            let inner = &rest[open + 1..open + close];
+            if !inner.contains(char::is_whitespace)
+                && (inner.contains("://") || inner.starts_with("mailto:"))
+            {
+                out.push_str(&rest[..open]);
+                out.push_str(inner);
+                rest = &rest[open + close + 1..];
+                continue;
+            }
+        }
+        out.push_str(&rest[..=open]);
+        rest = &rest[open + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Apply the `includeLinks=false` default policy for `get_page` output.
+///
+/// When `keep_links` is true the content is returned untouched. Otherwise
+/// markdown hyperlinks are stripped to their visible text — except for
+/// verbatim payloads (XML/RSS, text/plain, subtitles) which are returned
+/// as-is to honor the "verbatim" guarantee.
+pub fn apply_link_policy(content: String, content_type: &str, keep_links: bool) -> String {
+    if keep_links {
+        return content;
+    }
+    if is_xml_content_type(content_type)
+        || is_plain_text_type(content_type)
+        || content_type.contains("subrip")
+        || content_type.contains("srt")
+    {
+        return content;
+    }
+    strip_markdown_links(&content)
 }
 
 /// Clean up markdown content by removing navigation/boilerplate lines.
@@ -3355,4 +3534,83 @@ fn clean_markdown_content(text: &str) -> String {
     }
 
     result.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_inline_image_and_relative_links() {
+        assert_eq!(
+            strip_markdown_links("见[文档](https://example.com/a)一节"),
+            "见文档一节"
+        );
+        assert_eq!(
+            strip_markdown_links("![架构图](https://example.com/i.png)如下"),
+            "架构图如下"
+        );
+        assert_eq!(
+            strip_markdown_links("点[这里](/docs/x)继续"),
+            "点这里继续"
+        );
+    }
+
+    #[test]
+    fn keeps_code_spans_verbatim() {
+        assert_eq!(
+            strip_markdown_links("写法 `[a](b)` 不动，正文 [c](d) 剥离"),
+            "写法 `[a](b)` 不动，正文 c 剥离"
+        );
+        assert_eq!(
+            strip_markdown_links("```\n[a](b)\n```\n正文 [c](d)"),
+            "```\n[a](b)\n```\n正文 c"
+        );
+    }
+
+    #[test]
+    fn collapses_nested_and_reference_links() {
+        assert_eq!(
+            strip_markdown_links("[![alt](https://i.png)](https://e.com)"),
+            "alt"
+        );
+        assert_eq!(strip_markdown_links("[文字][ref]"), "文字");
+        assert_eq!(
+            strip_markdown_links("<https://example.com/x>"),
+            "https://example.com/x"
+        );
+        // Wikipedia-style URL with nested parens.
+        assert_eq!(
+            strip_markdown_links("[a](https://en.wikipedia.org/wiki/T_(x))!"),
+            "a!"
+        );
+    }
+
+    #[test]
+    fn leaves_non_links_alone() {
+        assert_eq!(strip_markdown_links("[1, 2, 3]"), "[1, 2, 3]");
+        assert_eq!(strip_markdown_links("[^1]"), "[^1]");
+        assert_eq!(strip_markdown_links("[a]\n[b]"), "[a]\n[b]");
+        assert_eq!(
+            strip_markdown_links("a <div> b"),
+            "a <div> b"
+        );
+    }
+
+    #[test]
+    fn link_policy_keeps_verbatim_types() {
+        let srt = "1\n00:00:00 --> 00:00:01\n[a](b)".to_string();
+        assert_eq!(
+            apply_link_policy(srt.clone(), "application/x-subrip", false),
+            srt
+        );
+        assert_eq!(
+            apply_link_policy("[a](https://e.com)".into(), "text/html", true),
+            "[a](https://e.com)"
+        );
+        assert_eq!(
+            apply_link_policy("[a](https://e.com)".into(), "text/html", false),
+            "a"
+        );
+    }
 }

@@ -78,7 +78,7 @@ async fn main() {
                         },
                         "serverInfo": {
                             "name": "advent-999-search-mcp",
-                            "version": "0.7.0"
+                            "version": "0.8.0"
                         }
                     }
                 });
@@ -256,7 +256,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
 
     let fetch_tool = serde_json::json!({
         "name": "get_page",
-        "description": "Fetch the content of a web page and extract its readable text. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). Bilibili video URLs (bilibili.com/video/BVxxx, optional ?p=N for multi-part videos) return the subtitle track as SRT — requires SESSDATA in FETCH_COOKIES, since Bilibili only serves the subtitle list to logged-in users. YouTube video URLs (youtube.com/watch?v=ID, /shorts/ID, /live/ID, /embed/ID, youtu.be/ID) return the caption track as SRT — anonymous, no login needed (needs proxy egress outside mainland). For academic papers: search first with web (engines: dblp, cnki, ieee, exa), then use this tool to read the full text. To read long content in chunks, pass startChar/endChar (0-based character offsets; the response includes totalLength so you can continue with startChar=endChar of the previous call). To avoid reading the full text, pass find (a literal substring): the server searches the fetched text and returns only the matching contexts — much cheaper than pulling the whole page and scanning it yourself. In find mode startChar/endChar/maxLength are ignored; the response carries matches (merged context windows, each with the hits inside) plus totalMatches instead of content. The response includes statusCode — non-200 (e.g. 404) means the target returned an error page. XML (RSS/Atom/sitemap) and text/plain (markdown/robots.txt) are returned verbatim without HTML extraction. Uses proxy if configured. Returns the page title and extracted content as markdown.",
+        "description": "Fetch the content of a web page and extract its readable text. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). Bilibili video URLs (bilibili.com/video/BVxxx, optional ?p=N for multi-part videos) return the subtitle track as SRT — requires SESSDATA in FETCH_COOKIES, since Bilibili only serves the subtitle list to logged-in users. YouTube video URLs (youtube.com/watch?v=ID, /shorts/ID, /live/ID, /embed/ID, youtu.be/ID) return the caption track as SRT — anonymous, no login needed (needs proxy egress outside mainland). For academic papers: search first with web (engines: dblp, cnki, ieee, exa), then use this tool to read the full text. To read long content in chunks, pass startChar/endChar (0-based character offsets; the response includes totalLength so you can continue with startChar=endChar of the previous call). To avoid reading the full text, pass find (a literal substring): the server searches the fetched text and returns only the matching contexts — much cheaper than pulling the whole page and scanning it yourself. In find mode startChar/endChar/maxLength are ignored; the response carries matches (merged context windows, each with the hits inside) plus totalMatches instead of content. The response includes statusCode — non-200 (e.g. 404) means the target returned an error page. XML (RSS/Atom/sitemap) and text/plain (markdown/robots.txt) are returned verbatim without HTML extraction. Uses proxy if configured. Returns the page title and extracted content as markdown. Hyperlinks are stripped to their visible text by default; pass includeLinks:true to keep [text](url).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -295,6 +295,11 @@ fn list_tools(config: &Config) -> Vec<Value> {
                 "matchCase": {
                     "type": "boolean",
                     "description": "Case-sensitive matching in find mode (ASCII only; default: false)",
+                    "default": false
+                },
+                "includeLinks": {
+                    "type": "boolean",
+                    "description": "Keep markdown hyperlinks [text](url) in the returned content. Default false: links are stripped to their visible text to save tokens.",
                     "default": false
                 }
             },
@@ -547,6 +552,9 @@ async fn handle_fetch(args: &Value, config: &Config) -> String {
     // Optional character-range reading (0-based, half-open [start, end)).
     let start_char = args["startChar"].as_f64().unwrap_or(0.0) as usize;
     let end_char = args["endChar"].as_f64().map(|v| v as usize);
+    // Hyperlinks are stripped by default to save tokens; pass
+    // `includeLinks: true` to keep `[text](url)` in the output.
+    let keep_links = args["includeLinks"].as_bool().unwrap_or(false);
 
     eprintln!("🌐 Fetching URL: {}", url);
 
@@ -560,7 +568,7 @@ async fn handle_fetch(args: &Value, config: &Config) -> String {
 
     match fetch_result {
         Ok(result) => {
-            let full = result.content;
+            let full = fetch::apply_link_policy(result.content, &result.content_type, keep_links);
             let total = full.chars().count();
 
             // ── find mode: literal substring search over the fetched text ──
