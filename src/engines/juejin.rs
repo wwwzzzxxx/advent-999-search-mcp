@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use crate::config::Config;
+use crate::filters::{FreshnessTier, SearchOptions};
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 
@@ -9,9 +10,16 @@ pub struct JuejinEngine;
 impl SearchEngine for JuejinEngine {
     fn name(&self) -> &'static str { "juejin" }
 
-    async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+    /// Juejin has no true time-range filter; `sort_type=1` sorts newest-first
+    /// instead, so this is a hint rather than a guarantee.
+    fn freshness_tier(&self) -> FreshnessTier { FreshnessTier::BestEffort }
+
+    async fn search(&self, query: &str, limit: usize, opts: &SearchOptions, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
         let client = config.build_reqwest_client()
             .map_err(|e| SearchError::Http(e.to_string()))?;
+
+        // 0 = relevance, 1 = newest, 2 = hottest.
+        let sort_type = if opts.freshness.is_some() { "1" } else { "0" };
 
         let mut all_results = Vec::new();
         let mut cursor = "0".to_string();
@@ -26,7 +34,7 @@ impl SearchEngine for JuejinEngine {
                     ("cursor", &cursor),
                     ("limit", &format!("{}", std::cmp::min(20, limit - all_results.len()))),
                     ("search_type", "0"),
-                    ("sort_type", "0"),
+                    ("sort_type", sort_type),
                 ])
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
                 .header("Accept", "*/*")
@@ -82,6 +90,7 @@ impl SearchEngine for JuejinEngine {
                     source: user_name.to_string(),
                     engine: "juejin".to_string(),
                     summary: None,
+                    engines: Vec::new(),
                 });
 
                 if all_results.len() >= limit { break; }

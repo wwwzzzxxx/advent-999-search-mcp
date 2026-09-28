@@ -1,24 +1,42 @@
 use async_trait::async_trait;
 use crate::config::Config;
+use crate::filters::{Freshness, FreshnessTier, SearchOptions};
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 
 pub struct CsdnEngine;
 
+impl CsdnEngine {
+    /// CSDN's `tm` time-range code. Verified to change the result set.
+    fn tm_for(f: Option<&Freshness>) -> &'static str {
+        match f {
+            None => "0",
+            Some(Freshness::Day) => "1",
+            Some(Freshness::Week) => "2",
+            Some(Freshness::Month) => "3",
+            // tm=5 is "past year"; tm=4 is "past 3 months".
+            Some(Freshness::Year) | Some(Freshness::Range { .. }) => "5",
+        }
+    }
+}
+
 #[async_trait]
 impl SearchEngine for CsdnEngine {
     fn name(&self) -> &'static str { "csdn" }
 
-    async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+    fn freshness_tier(&self) -> FreshnessTier { FreshnessTier::Applied }
+
+    async fn search(&self, query: &str, limit: usize, opts: &SearchOptions, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
         let client = config.build_reqwest_client()
             .map_err(|e| SearchError::Http(e.to_string()))?;
 
+        let tm = Self::tm_for(opts.freshness.as_ref());
         let mut all_results = Vec::new();
         let mut page = 1u32;
 
         while all_results.len() < limit {
             let resp = client.get("https://so.csdn.net/api/v3/search")
-                .query(&[("q", query), ("p", &page.to_string())])
+                .query(&[("q", query), ("p", &page.to_string()), ("t", "0"), ("s", "0"), ("tm", tm)])
                 .header("Pragma", "no-cache")
                 .header("User-Agent", "Apifox/1.0.0 (https://apifox.com)")
                 .header("Accept", "*/*")
@@ -52,6 +70,7 @@ impl SearchEngine for CsdnEngine {
                     source,
                     engine: "csdn".to_string(),
                     summary: None,
+                    engines: Vec::new(),
                 });
 
                 if all_results.len() >= limit { break; }

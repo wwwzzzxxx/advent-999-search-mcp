@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use crate::config::Config;
+use crate::filters::{today_days, FreshnessTier, SearchOptions, Topic};
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 
@@ -9,7 +10,11 @@ pub struct ExaEngine;
 impl SearchEngine for ExaEngine {
     fn name(&self) -> &'static str { "exa" }
 
-    async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+    fn freshness_tier(&self) -> FreshnessTier { FreshnessTier::Applied }
+
+    fn supports_topic(&self) -> bool { true }
+
+    async fn search(&self, query: &str, limit: usize, opts: &SearchOptions, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
         let client = config.build_reqwest_client()
             .map_err(|e| SearchError::Http(e.to_string()))?;
 
@@ -22,14 +27,34 @@ impl SearchEngine for ExaEngine {
 
         let session_id = init.1;
 
+        // Exa honours domain filters, category and published-date windows
+        // natively, so pass them through rather than post-filtering (that keeps
+        // recall: Exa can go find matching pages instead of us discarding most
+        // of what it returned).
+        let mut arguments = serde_json::json!({
+            "query": query,
+            "numResults": limit as u64,
+            "type": "auto"
+        });
+        if !opts.include_domains.is_empty() {
+            arguments["includeDomains"] = serde_json::json!(opts.include_domains);
+        }
+        if !opts.exclude_domains.is_empty() {
+            arguments["excludeDomains"] = serde_json::json!(opts.exclude_domains);
+        }
+        if opts.topic == Some(Topic::News) {
+            arguments["category"] = serde_json::json!("news");
+        }
+        if let Some(f) = &opts.freshness {
+            let (start, end) = f.iso_range(today_days());
+            arguments["startPublishedDate"] = serde_json::json!(format!("{}T00:00:00.000Z", start));
+            arguments["endPublishedDate"] = serde_json::json!(format!("{}T23:59:59.000Z", end));
+        }
+
         // Call web_search_exa
         let (call_resp, _) = mcp_call(&client, "tools/call", serde_json::json!({
             "name": "web_search_exa",
-            "arguments": {
-                "query": query,
-                "numResults": limit as u64,
-                "type": "auto"
-            }
+            "arguments": arguments
         }), session_id).await?;
 
         // Extract text content from response
@@ -83,6 +108,7 @@ impl SearchEngine for ExaEngine {
                 source,
                 engine: "exa".to_string(),
                 summary: None,
+                engines: Vec::new(),
             });
 
             if results.len() >= limit { break; }

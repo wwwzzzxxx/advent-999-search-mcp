@@ -13,6 +13,15 @@ pub struct SearchResult {
     /// engines like deepseek; omitted from JSON when absent).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Every engine that returned this (de-duplicated) URL, in first-seen
+    /// order. Only serialized when more than one engine agreed, so the common
+    /// single-engine case keeps its original shape.
+    #[serde(skip_serializing_if = "has_one_or_no_engine")]
+    pub engines: Vec<String>,
+}
+
+fn has_one_or_no_engine(v: &[String]) -> bool {
+    v.len() <= 1
 }
 
 /// Partial failure for an engine
@@ -33,6 +42,21 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     #[serde(rename = "partialFailures")]
     pub partial_failures: Vec<PartialFailure>,
+    /// How many duplicate URLs were folded together (omitted when zero).
+    #[serde(
+        rename = "duplicatesRemoved",
+        skip_serializing_if = "is_zero_usize"
+    )]
+    pub duplicates_removed: usize,
+    /// Echo of the filters that were applied, including per-engine honesty
+    /// about which engines could actually honour them (omitted when no filter
+    /// was requested).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<serde_json::Value>,
+}
+
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
 }
 
 /// Search error type

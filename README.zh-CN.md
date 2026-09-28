@@ -8,9 +8,9 @@
 
 基于 Rust 的 MCP 服务器，为你的 AI 助手提供**网络搜索**、**本地文件搜索**和**网页抓取**能力。
 
-- **`web`** — 11 个搜索引擎（Exa、Bing、CSDN、掘金、Startpage、搜狗、微信、DBLP、知网 + 凭据门控的 DeepSeek、IEEE）
+- **`web`** — 11 个搜索引擎（Exa、Bing、CSDN、掘金、Startpage、搜狗、微信、DBLP、知网 + 凭据门控的 DeepSeek、IEEE），支持**按请求过滤**（`freshness`、`topic`、`includeDomains`、`excludeDomains`）与**跨引擎去重**
 - **`local`** — 通过 Everything (voidtools) 搜索本地文件
-- **`get_page`** — 抓取任意网页并提取可读内容
+- **`get_page`** — 抓取任意网页并提取可读内容，支持 `find`（字面子串）与 `highlights`（按查询相关性）两种模式
 - **`set_cookies`** — 为有验证码墙的引擎（搜狗）写入新会话 Cookie，无需重启
 
 ### 为什么选 advent？
@@ -18,6 +18,7 @@
 - 🪶 **极低内存占用** — 使用 Rust 编写，单文件二进制：Windows 约 18 MB（内置 Python 运行时），Linux/macOS 约 7 MB（使用系统 Python 3），运行时内存占用极小
 - ⚙️ **轻量化配置** — 开箱即用，无需繁琐依赖
 - 🌐 **智能 `get_page`** — 能抓取并渲染几乎所有网站：支持 JS 渲染页面、需登录页面（知乎、Discourse）、复杂 HTML，自动降级策略保证成功率
+- 🔎 **对做不到的事说实话** — 各引擎对时间过滤的支持差异很大，响应会逐个引擎说明是否真的过滤了（`filters.freshnessByEngine`），而不是假装过滤成功
 
 ---
 
@@ -208,11 +209,61 @@ EVERYTHING_ES_PATH=C:\path\to\es.exe
 ### `web` — 网络搜索
 
 ```
-query      (string, 必填)      — 搜索关键词
-limit      (number, 默认 10)   — 每引擎结果数（1-50）
-engines    (string[])           — 使用的搜索引擎
-searchMode (string)             — "request" | "auto" | "playwright"
+query          (string, 必填)      — 搜索关键词
+limit          (number, 默认 10)   — 结果总数上限（1-50）
+engines        (string[])           — 使用的搜索引擎
+searchMode     (string)             — "request" | "auto" | "playwright"
+freshness      (string)             — day | week | month | year | YYYY-MM-DD..YYYY-MM-DD
+topic          (string)             — "news" | "general"
+includeDomains (string[])           — 只返回这些域名（含子域名）
+excludeDomains (string[])           — 排除这些域名（含子域名）
+dedupe         (boolean, 默认 true) — 跨引擎合并重复 URL
 ```
+
+各引擎**并发执行**，结果合并为一张列表：重复 URL 会被合并（保留结果的
+`engines` 字段列出所有命中它的引擎），被更多引擎一致命中的结果排更前；在
+命中数相同时保持各引擎自身的相关性顺序。
+
+#### `freshness` —— 各引擎的真实能力
+
+这一项各引擎差异极大，且部分引擎会**静默忽略**参数。因此响应不会假装过滤
+成功，而是在 `filters.freshnessByEngine` 里逐个引擎如实汇报：
+
+| 引擎 | 档位 | 机制 |
+|---|---|---|
+| `exa` | `applied` | `startPublishedDate` / `endPublishedDate` |
+| `sogou` | `applied` | `tsn`（1/2/3/4 = 一天/一周/一月/一年） |
+| `csdn` | `applied` | `tm`（1/2/3/5 = 一天/一周/一月/一年） |
+| `ieee` | `applied` | `start_date` / `end_date`（`YYYYMMDD`） |
+| `juejin` | `best_effort` | 按最新排序（`sort_type=1`），并非真区间过滤 |
+| `cnki` | `best_effort` | 本身已按出版时间倒序 |
+| `dblp` | `best_effort` | 查询里加 `year:YYYY`（仅到年粒度） |
+| `bing` | `best_effort` | 会发送 `filters=ex1:"ezN"`，但**大陆出口实测无效果** |
+| `startpage` | `unsupported` | 无 |
+| `weixin` | `unsupported` | `tsn` 参数会返回拒绝页 |
+
+`applied` = 已实测确认会改变结果集；`best_effort` = 发了参数或用最新排序，
+但不保证真的收窄了结果；`unsupported` = 该引擎根本没有时间过滤。
+
+> 时间窗口按 **UTC** 计算；显式区间（`2026-01-01..2026-02-01`）原样传递。
+
+`topic` 目前仅 `exa` 支持（`category: news`），实际生效的引擎列在
+`filters.topicAppliedBy`。
+
+`includeDomains` / `excludeDomains` 会原生传给 `exa`（召回更好），并对其他
+所有引擎的结果做后置过滤。
+
+#### 去重
+
+`dedupe`（默认开启）合并**URL 完全重复**的条目——同一页面被多个引擎返回，
+或同一引擎翻页重复。顺带会清掉追踪参数，例如 CSDN 的 URL 会丢掉约 300 字符
+的 `ops_request_misc`/`request_id`/`utm_*` 噪声。
+
+只移除**已知的追踪参数**。有语义的参数（如 B 站多 P 视频的 `?p=2`）会保留，
+因此不会把不同的页面误合并。被合并的条数以 `duplicatesRemoved` 返回。
+
+**不做**的去重：同一篇文章转载到不同域名。这需要抓取每个页面正文，会把快速
+搜索路径变成慢速路径，而且基于标题的启发式会误合并真正不同的页面。
 
 支持的搜索引擎（11 个，均已实测）：Exa（默认）、Bing、CSDN、掘金、Startpage、搜狗、微信（公众号文章）、DBLP（计算机文献）、知网、DeepSeek（LLM 搜索，需密钥）、IEEE（Xplore 元数据，需密钥）。
 
@@ -286,11 +337,34 @@ maxLength (number, 最大 200000) — 最大内容长度
 startChar (number)              — 从该字符偏移开始读（0-based）
 endChar   (number)              — 读到该偏移为止（不含）
 find      (string)              — 在抓取文本中搜索的字面子串（find 模式）
-contextChars (number, 默认 200) — find 模式每处匹配前后保留的上下文字符数
+contextChars (number, 默认 200) — find/highlights 模式每处上下文保留的字符数
 maxMatches (number, 默认 20, 最大 50) — find 模式最多返回的上下文窗口数
 matchCase (boolean, 默认 false) — 是否区分大小写（仅 ASCII）
+highlights (string)             — 用于排序段落的查询（highlights 模式）
+maxHighlights (number, 默认 5, 最大 20) — highlights 模式最多返回的片段数
 includeLinks (boolean, 默认 false) — 保留 Markdown 超链接 [text](url)；默认剥离为可见文本以省 token
 ```
+
+**highlights 模式**（`highlights`）是读取长页面最省 token 的方式：不返回全文，
+而是按查询对段落排序，只返回最相关的若干段。纯本地、确定性（不调用 LLM），
+排序**以命中的不同查询词数量优先**——一段覆盖多个不同查询词，胜过反复出现同
+一个词。ASCII 按词匹配、中文按 bigram 匹配，因此中文无需分词器。
+
+```jsonc
+// get_page { "url": "...", "highlights": "训练 推理", "maxHighlights": 3 }
+{
+  "highlights": "训练 推理",
+  "totalLength": 47010,
+  "totalSnippets": 3,
+  "snippets": [
+    { "startChar": 5441, "endChar": 7977, "score": 2044,
+      "terms": ["推理", "训练"], "context": "..." }
+  ]
+}
+```
+
+偏移是字符级、半开区间，可直接用 `startChar`/`endChar` 精确复读该片段。
+highlights 模式下 `startChar`/`endChar`/`maxLength`/`find` 均被忽略。
 
 find 模式（服务端子串搜索，省 token）：设置 `find` 后先正常抓取，再在提取文本中做字面子串
 匹配，只返回匹配点附近合并后的上下文窗口——不返回全文，且忽略

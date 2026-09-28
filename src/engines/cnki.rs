@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use aes::Aes256;
 use cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use crate::config::Config;
+use crate::filters::{FreshnessTier, SearchOptions};
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 
@@ -24,7 +25,12 @@ const CNKI_ALL_DATABASE_CLASS_ID: &str = "WD0FTY92";
 impl SearchEngine for CnkiEngine {
     fn name(&self) -> &'static str { "cnki" }
 
-    async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+    /// CNKI's API already sorts by publication time (newest first), so a
+    /// freshness request is approximated by that ordering — there is no true
+    /// range filter in the public endpoint.
+    fn freshness_tier(&self) -> FreshnessTier { FreshnessTier::BestEffort }
+
+    async fn search(&self, query: &str, limit: usize, _opts: &SearchOptions, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
         let client = config.build_reqwest_client_for("cnki.net")
             .map_err(|e| SearchError::Http(e.to_string()))?;
 
@@ -164,6 +170,7 @@ impl SearchEngine for CnkiEngine {
                 source: source.chars().take(200).collect(),
                 engine: "cnki".to_string(),
                 summary: None,
+                engines: Vec::new(),
             });
 
             if results.len() >= limit { break; }

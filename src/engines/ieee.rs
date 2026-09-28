@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use crate::config::Config;
+use crate::filters::{today_days, FreshnessTier, SearchOptions};
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 
@@ -20,7 +21,11 @@ const IEEE_API_URL: &str = "https://ieeexploreapi.ieee.org/api/v1/search/article
 impl SearchEngine for IeeeEngine {
     fn name(&self) -> &'static str { "ieee" }
 
-    async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+    /// IEEE's Metadata API has real `start_date`/`end_date` filters (insert
+    /// date, `YYYYMMDD`), so a freshness window maps onto it directly.
+    fn freshness_tier(&self) -> FreshnessTier { FreshnessTier::Applied }
+
+    async fn search(&self, query: &str, limit: usize, opts: &SearchOptions, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
         let api_key = config.ieee_api_key.clone()
             .filter(|k| !k.trim().is_empty())
             .ok_or_else(|| SearchError::Engine(
@@ -32,14 +37,21 @@ impl SearchEngine for IeeeEngine {
 
         let max_records = std::cmp::min(limit, 200).max(1);
 
+        let mut params: Vec<(&str, String)> = vec![
+            ("apikey", api_key.clone()),
+            ("format", "json".to_string()),
+            ("querytext", query.to_string()),
+            ("max_records", max_records.to_string()),
+            ("start_record", "1".to_string()),
+        ];
+        if let Some(f) = &opts.freshness {
+            let (start, end) = f.compact_range(today_days());
+            params.push(("start_date", start));
+            params.push(("end_date", end));
+        }
+
         let resp = client.get(IEEE_API_URL)
-            .query(&[
-                ("apikey", api_key.as_str()),
-                ("format", "json"),
-                ("querytext", query),
-                ("max_records", &max_records.to_string()),
-                ("start_record", "1"),
-            ])
+            .query(&params)
             .header("Accept", "application/json")
             .send()
             .await
@@ -141,6 +153,7 @@ impl SearchEngine for IeeeEngine {
                 source: source.chars().take(120).collect(),
                 engine: "ieee".to_string(),
                 summary: None,
+                engines: Vec::new(),
             });
 
             if results.len() >= limit { break; }

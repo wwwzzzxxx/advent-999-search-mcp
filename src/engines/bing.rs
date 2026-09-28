@@ -1,12 +1,44 @@
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 use crate::config::Config;
+use crate::filters::{days_from_civil, Freshness, FreshnessTier, SearchOptions, today_days};
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 
 pub struct BingEngine;
 
 const BING_URL: &str = "https://cn.bing.com/search";
+
+/// Bing's day-sequence epoch: 2024-01-01 is sequence 19723.
+const BING_EPOCH_DAYS: i64 = 19723;
+
+/// Build Bing's `filters=ex1:"..."` value.
+///
+/// NOTE: this engine is reported as `best_effort`, not `applied`, because the
+/// parameter could not be observed to change the result set from a mainland
+/// egress (requests land on cn.bing.com). The format itself is the documented
+/// one, so it is sent anyway — it is free and may work on other markets.
+fn bing_filters(f: &Freshness, today: i64) -> Option<String> {
+    fn seq(iso: &str) -> Option<i64> {
+        let p: Vec<&str> = iso.split('-').collect();
+        if p.len() != 3 {
+            return None;
+        }
+        let y: i32 = p[0].parse().ok()?;
+        let m: u32 = p[1].parse().ok()?;
+        let d: u32 = p[2].parse().ok()?;
+        Some(days_from_civil(y, m, d) - days_from_civil(2024, 1, 1) + BING_EPOCH_DAYS)
+    }
+    match f {
+        Freshness::Day => Some("ex1%3a%22ez1%22".to_string()),
+        Freshness::Week => Some("ex1%3a%22ez2%22".to_string()),
+        Freshness::Month => Some("ex1%3a%22ez3%22".to_string()),
+        Freshness::Year | Freshness::Range { .. } => {
+            let (s, e) = f.iso_range(today);
+            Some(format!("ex1%3a%22ez5_{}_{}%22", seq(&s)?, seq(&e)?))
+        }
+    }
+}
 
 const BLOCK_KEYWORDS: &[&str] = &[
     "captcha", "verification", "verify you are human",
@@ -18,16 +50,25 @@ const BLOCK_KEYWORDS: &[&str] = &[
 impl SearchEngine for BingEngine {
     fn name(&self) -> &'static str { "bing" }
 
-    async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+    fn freshness_tier(&self) -> FreshnessTier { FreshnessTier::BestEffort }
+
+    async fn search(&self, query: &str, limit: usize, opts: &SearchOptions, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
         let client = config.build_reqwest_client()
             .map_err(|e| SearchError::Http(e.to_string()))?;
+
+        let filter_param = opts
+            .freshness
+            .as_ref()
+            .and_then(|f| bing_filters(f, today_days()))
+            .map(|f| format!("&filters={}", f))
+            .unwrap_or_default();
 
         let mut all_results = Vec::new();
         let mut page = 0;
 
         while all_results.len() < limit {
-            let url = format!("{}?q={}&setlang=zh-CN&ensearch=0&first={}",
-                BING_URL, url_encode(query), 1 + page * 10);
+            let url = format!("{}?q={}&setlang=zh-CN&ensearch=0&first={}{}",
+                BING_URL, url_encode(query), 1 + page * 10, filter_param);
 
             let resp = client.get(&url)
                 .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
@@ -124,6 +165,7 @@ fn parse_bing_results(html: &str, limit: usize) -> Vec<SearchResult> {
                 source: source.chars().take(200).collect(),
                 engine: "bing".to_string(),
                 summary: None,
+                engines: Vec::new(),
             });
         }
     }

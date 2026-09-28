@@ -8,9 +8,9 @@
 
 A Rust-based MCP server that gives your AI assistant **web search**, **local file search**, and **web page fetching** abilities.
 
-- **`web`** — Search with 11 engines (Exa, Bing, CSDN, Juejin, Startpage, Sogou, Weixin, DBLP, CNKI + credential-gated DeepSeek, IEEE)
+- **`web`** — Search with 11 engines (Exa, Bing, CSDN, Juejin, Startpage, Sogou, Weixin, DBLP, CNKI + credential-gated DeepSeek, IEEE), with **per-request filters** (`freshness`, `topic`, `includeDomains`, `excludeDomains`) and **cross-engine de-duplication**
 - **`local`** — Search your local files via Everything (voidtools)
-- **`get_page`** — Fetch and extract readable content from any web page
+- **`get_page`** — Fetch and extract readable content from any web page, with `find` (literal) and `highlights` (query-relevance) modes
 - **`set_cookies`** — Store fresh session cookies for captcha-walled engines (Sogou), no restart needed
 
 ### Why advent?
@@ -18,6 +18,7 @@ A Rust-based MCP server that gives your AI assistant **web search**, **local fil
 - 🪶 **Extremely low memory** — Written in Rust. Single binary: ~18 MB on Windows (includes embedded Python runtime), ~7 MB on Linux/macOS (uses system Python 3). Minimal runtime footprint
 - ⚙️ **Minimal configuration** — Works out of the box with sensible defaults, no heavy dependencies
 - 🌐 **Smart `get_page`** — Fetches and renders content from almost any site: handles JS-rendered pages, authenticated pages (Zhihu, Discourse), and complex HTML, all with automatic fallback strategies
+- 🔎 **Honest about what it can't do** — Engines differ in whether they support a time filter, so the response reports exactly which engine applied it (`filters.freshnessByEngine`) instead of silently pretending the filter worked
 
 ---
 
@@ -210,11 +211,69 @@ Edit `opencode.json`:
 ### `web` — Web Search
 
 ```
-query      (string, required)  — Search query
-limit      (number, default 10) — Results per engine (1-50)
-engines    (string[])           — Which engine(s) to use
-searchMode (string)             — "request" | "auto" | "playwright"
+query          (string, required)  — Search query
+limit          (number, default 10) — Max results total (1-50)
+engines        (string[])           — Which engine(s) to use
+searchMode     (string)             — "request" | "auto" | "playwright"
+freshness      (string)             — day | week | month | year | YYYY-MM-DD..YYYY-MM-DD
+topic          (string)             — "news" | "general"
+includeDomains (string[])           — only these domains (and subdomains)
+excludeDomains (string[])           — drop these domains (and subdomains)
+dedupe         (boolean, default true) — fold duplicate URLs across engines
 ```
+
+Engines run **concurrently**, and their results are merged into one list:
+duplicate URLs are folded together (the survivor lists every engine that
+returned it, in `engines`), and results agreed on by more engines rank first.
+Per-engine relevance order is preserved within equal agreement.
+
+#### `freshness` — and what each engine can actually do
+
+Engines differ a lot here, and some silently ignore a filter. Rather than
+pretend, the response reports the truth per engine in
+`filters.freshnessByEngine`:
+
+| Engine | Tier | Mechanism |
+|---|---|---|
+| `exa` | `applied` | `startPublishedDate` / `endPublishedDate` |
+| `sogou` | `applied` | `tsn` (1/2/3/4 = day/week/month/year) |
+| `csdn` | `applied` | `tm` (1/2/3/5 = day/week/month/year) |
+| `ieee` | `applied` | `start_date` / `end_date` (`YYYYMMDD`) |
+| `juejin` | `best_effort` | newest-first sort (`sort_type=1`), not a true range |
+| `cnki` | `best_effort` | already sorted by publication time |
+| `dblp` | `best_effort` | `year:YYYY` query term (year granularity only) |
+| `bing` | `best_effort` | `filters=ex1:"ezN"` sent, but **no effect observed** from a mainland egress |
+| `startpage` | `unsupported` | — |
+| `weixin` | `unsupported` | the `tsn` parameter returns a rejection page |
+
+`applied` means verified to change the result set. `best_effort` means a
+parameter was sent or a newest-first sort was used, but it is not guaranteed to
+restrict results. `unsupported` means the engine has no time filter at all.
+
+> The window is computed in **UTC**. An explicit range
+> (`2026-01-01..2026-02-01`) is passed through verbatim.
+
+`topic` is currently honoured only by `exa` (`category: news`); the response
+lists which engines applied it in `filters.topicAppliedBy`.
+
+`includeDomains` / `excludeDomains` are passed to `exa` natively (better recall)
+and applied as a post-filter to every other engine's results.
+
+#### De-duplication
+
+`dedupe` (default on) folds **exact duplicate URLs** together — the same page
+returned by several engines, or repeated across an engine's pages. As a side
+effect it strips tracking parameters, so a CSDN URL loses its ~300 characters
+of `ops_request_misc`/`request_id`/`utm_*` cruft.
+
+Only parameters known to be tracking are removed. A meaningful parameter such
+as bilibili's `?p=2` (multi-part video) is preserved, so genuinely different
+pages are never merged. The count of folded duplicates is reported as
+`duplicatesRemoved`.
+
+**Not** de-duplicated: the same article reposted on a different domain. That
+requires fetching each page's body, which would turn the fast search path into
+a slow one, and title-based heuristics merge genuinely different pages.
 
 Supported engines (11 total, all tested): Exa (default), Bing, CSDN, Juejin, Startpage, Sogou, Weixin (WeChat articles), DBLP (CS bibliography), CNKI (知网), DeepSeek (LLM-backed, requires key), IEEE (Xplore metadata, requires key).
 
@@ -288,11 +347,37 @@ maxLength (number, max 200000)  — Max content length
 startChar (number)              — Start reading from this character offset (0-based)
 endChar   (number)              — Read up to this offset (exclusive)
 find      (string)              — Literal substring to search in the fetched text (find mode)
-contextChars (number, default 200) — Context chars around each match in find mode
+contextChars (number, default 200) — Context chars around each match / highlight
 maxMatches (number, default 20, max 50) — Max context windows in find mode
 matchCase (boolean, default false) — Case-sensitive matching (ASCII only)
+highlights (string)             — Query to rank passages against (highlights mode)
+maxHighlights (number, default 5, max 20) — Max snippets in highlights mode
 includeLinks (boolean, default false) — Keep markdown hyperlinks [text](url); by default links are stripped to their visible text to save tokens
 ```
+
+**Highlights mode** (`highlights`) is the token-cheap way to read a long page:
+instead of returning the whole document, the server ranks passages against your
+query and returns only the best ones. It is local and deterministic (no LLM
+call) and ranks by **distinct-term coverage first** — a passage containing
+several different query terms beats one repeating a single term. ASCII words
+and CJK bigrams are matched, so Chinese works without a segmenter.
+
+```jsonc
+// get_page { "url": "...", "highlights": "create task", "maxHighlights": 3 }
+{
+  "highlights": "create task",
+  "totalLength": 47010,
+  "totalSnippets": 3,
+  "snippets": [
+    { "startChar": 5441, "endChar": 7977, "score": 2044,
+      "terms": ["create", "task"], "context": "..." }
+  ]
+}
+```
+
+Offsets are character-based and half-open, so a snippet can be re-read exactly
+with `startChar`/`endChar`. `startChar`/`endChar`/`maxLength`/`find` are ignored
+in highlights mode.
 
 Find mode (server-side substring search, saves tokens): when `find` is set, the fetch happens
 normally, then the server scans the extracted text for the literal substring and returns only

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use scraper::{Html, Selector};
 use crate::config::Config;
 use crate::cookie_cache;
+use crate::filters::SearchOptions;
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 
@@ -28,7 +29,7 @@ const WEIXIN_COOKIE_NAMES: &[&str] = &[
 impl SearchEngine for WeixinEngine {
     fn name(&self) -> &'static str { "weixin" }
 
-    async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+    async fn search(&self, query: &str, limit: usize, _opts: &SearchOptions, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
         // Sogou blocks proxy/datacenter IPs with captchas — bypass proxy by default
         // (controlled via DIRECT_DOMAINS). Cookie store keeps SUID/SNUID across
         // pages to look like one browser session.
@@ -217,6 +218,7 @@ fn parse_weixin_results(html: &str) -> Vec<SearchResult> {
             source: source.chars().take(200).collect(),
             engine: "weixin".to_string(),
             summary: None,
+            engines: Vec::new(),
         });
     }
 

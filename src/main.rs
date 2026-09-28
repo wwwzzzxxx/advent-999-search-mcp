@@ -1,5 +1,8 @@
 mod config;
 mod models;
+mod filters;
+mod dedupe;
+mod snippets;
 mod engines;
 mod local_search;
 mod fetch;
@@ -8,12 +11,14 @@ mod anubis;
 mod cookie_cache;
 
 use config::Config;
+use filters::{Freshness, FreshnessTier, SearchOptions, Topic};
 use models::{SearchResponse, PartialFailure, normalize_engine};
 use local_search::{find_es_exe, search_local, LocalSearchOptions};
 use engines::SearchEngine;
 use engines::create_engine_map;
 
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 use serde_json::Value;
 
 #[tokio::main]
@@ -78,7 +83,7 @@ async fn main() {
                         },
                         "serverInfo": {
                             "name": "advent-999-search-mcp",
-                            "version": "0.8.0"
+                            "version": "0.9.0"
                         }
                     }
                 });
@@ -213,6 +218,30 @@ fn list_tools(config: &Config) -> Vec<Value> {
                     "type": "string",
                     "enum": ["request", "auto", "playwright"],
                     "description": "Search mode override (optional)"
+                },
+                "freshness": {
+                    "type": "string",
+                    "description": "Restrict results by publish/insert time: day | week | month | year, or an explicit range YYYY-MM-DD..YYYY-MM-DD. Honoured natively by exa/sogou/csdn/ieee; approximated by a newest-first sort on juejin/cnki; sent but unverified on bing; not supported by weixin/startpage. The response's `filters.freshnessByEngine` reports which engines actually applied it."
+                },
+                "topic": {
+                    "type": "string",
+                    "enum": ["news", "general"],
+                    "description": "Content category hint. Only exa honours it natively today; `filters.topicAppliedBy` lists the engines that did."
+                },
+                "includeDomains": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Only return results from these domains (and their subdomains). Empty = no restriction. Passed to exa natively and applied to every other engine as a post-filter."
+                },
+                "excludeDomains": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Drop results from these domains (and their subdomains)."
+                },
+                "dedupe": {
+                    "type": "boolean",
+                    "description": "Fold duplicate URLs across engines into one result (default true). Tracking parameters are stripped; URLs that differ in a meaningful parameter (e.g. a bilibili ?p=2) are kept separate.",
+                    "default": true
                 }
             },
             "required": ["query"]
@@ -296,6 +325,15 @@ fn list_tools(config: &Config) -> Vec<Value> {
                     "type": "boolean",
                     "description": "Case-sensitive matching in find mode (ASCII only; default: false)",
                     "default": false
+                },
+                "highlights": {
+                    "type": "string",
+                    "description": "A query to rank passages against. When set, the server returns only the most relevant snippets (no full content) — use this to pull the useful parts of a long page without reading all of it. Ranks by how many distinct query terms a passage covers. ASCII words and CJK bigrams are matched. In this mode startChar/endChar/maxLength/find are ignored."
+                },
+                "maxHighlights": {
+                    "type": "number",
+                    "description": "Max snippets returned in highlights mode (default 5, max 20)",
+                    "default": 5
                 },
                 "includeLinks": {
                     "type": "boolean",
@@ -405,7 +443,7 @@ async fn handle_tool_call(
     name: &str,
     args: &Value,
     config: &Config,
-    engine_map: &[Box<dyn SearchEngine>],
+    engine_map: &[Arc<dyn SearchEngine>],
 ) -> String {
     match name {
         "web" => handle_web_search(args, config, engine_map).await,
@@ -421,20 +459,30 @@ async fn handle_tool_call(
     }
 }
 
+/// Read a JSON array of strings, trimming blanks.
+fn string_list(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn handle_web_search(
     args: &Value,
     config: &Config,
-    engine_map: &[Box<dyn SearchEngine>],
+    engine_map: &[Arc<dyn SearchEngine>],
 ) -> String {
     let query = args["query"].as_str().unwrap_or("").to_string();
     if query.trim().is_empty() {
-        return serde_json::to_string_pretty(&serde_json::json!({
-            "error": "Query must not be empty"
-        })).unwrap_or_default();
+        return json_error("Query must not be empty");
     }
 
-    let limit = args["limit"].as_f64().unwrap_or(10.0) as usize;
-    let limit = std::cmp::min(limit, 50);
+    let limit = std::cmp::min(args["limit"].as_f64().unwrap_or(10.0) as usize, 50);
 
     let requested_engines: Vec<String> = args["engines"]
         .as_array()
@@ -448,48 +496,142 @@ async fn handle_web_search(
 
     let resolved_engines = config.resolve_engines(&requested_engines);
 
-    eprintln!("Searching for \"{}\" using engines: {}", query, resolved_engines.join(", "));
+    // ── filters ────────────────────────────────────────────────────────────
+    let freshness = match args.get("freshness").and_then(|v| v.as_str()) {
+        Some(raw) => match Freshness::parse(raw) {
+            Some(f) => Some(f),
+            None => {
+                return json_error(
+                    "freshness must be one of day|week|month|year, or a range like 2026-01-01..2026-02-01",
+                )
+            }
+        },
+        None => None,
+    };
+    let topic = match args.get("topic").and_then(|v| v.as_str()) {
+        Some(raw) => match Topic::parse(raw) {
+            Some(t) => Some(t),
+            None => return json_error("topic must be news or general"),
+        },
+        None => None,
+    };
+    let include_domains = string_list(&args["includeDomains"]);
+    let exclude_domains = string_list(&args["excludeDomains"]);
+    let do_dedupe = args["dedupe"].as_bool().unwrap_or(true);
 
-    let mut all_results = Vec::new();
-    let mut partial_failures = Vec::new();
+    let opts = SearchOptions {
+        freshness: freshness.clone(),
+        topic,
+        include_domains: include_domains.clone(),
+        exclude_domains: exclude_domains.clone(),
+    };
+
+    eprintln!(
+        "Searching for \"{}\" using engines: {}{}",
+        query,
+        resolved_engines.join(", "),
+        match &freshness {
+            Some(f) => format!(" (freshness={})", f.label()),
+            None => String::new(),
+        }
+    );
+
+    // ── dispatch engine searches concurrently ──────────────────────────────
     let engine_count = resolved_engines.len();
     let per_engine = if engine_count > 0 { limit / engine_count } else { limit };
     let remainder = if engine_count > 0 { limit % engine_count } else { 0 };
 
+    let mut partial_failures: Vec<PartialFailure> = Vec::new();
+    // engine name -> its results (or error). Collected by name so the final
+    // ordering stays deterministic regardless of completion order.
+    let mut collected: std::collections::HashMap<String, Result<Vec<models::SearchResult>, String>> =
+        std::collections::HashMap::new();
+
+    let mut set = tokio::task::JoinSet::new();
     for (i, engine_name) in resolved_engines.iter().enumerate() {
         let engine_limit = per_engine + if i < remainder { 1 } else { 0 };
-        if engine_limit == 0 { continue; }
-
-        let engine = engine_map.iter().find(|e| e.name() == engine_name);
-        match engine {
-            Some(e) => {
-                match e.search(&query, engine_limit, config).await {
-                    Ok(results) => {
-                        eprintln!("✅ {} returned {} results", engine_name, results.len());
-                        all_results.extend(results);
-                    }
-                    Err(err) => {
-                        eprintln!("⚠️ {} search failed: {}", engine_name, err);
-                        partial_failures.push(PartialFailure {
-                            engine: engine_name.clone(),
-                            code: "engine_error".to_string(),
-                            message: err.to_string(),
-                        });
-                    }
-                }
+        if engine_limit == 0 {
+            continue;
+        }
+        match engine_map.iter().find(|e| e.name() == engine_name) {
+            Some(engine) => {
+                let engine = engine.clone();
+                let q = query.clone();
+                let o = opts.clone();
+                let c = config.clone();
+                let n = engine_name.clone();
+                set.spawn(async move {
+                    let res = engine.search(&q, engine_limit, &o, &c).await;
+                    (n, res)
+                });
             }
-            None => {
+            None => partial_failures.push(PartialFailure {
+                engine: engine_name.clone(),
+                code: "unsupported_engine".to_string(),
+                message: format!("Unsupported search engine: {}", engine_name),
+            }),
+        }
+    }
+
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((name, Ok(results))) => {
+                eprintln!("✅ {} returned {} results", name, results.len());
+                collected.insert(name, Ok(results));
+            }
+            Ok((name, Err(err))) => {
+                eprintln!("⚠️ {} search failed: {}", name, err);
+                collected.insert(name, Err(err.to_string()));
+            }
+            Err(join_err) => {
+                eprintln!("⚠️ engine task panicked: {}", join_err);
                 partial_failures.push(PartialFailure {
-                    engine: engine_name.clone(),
-                    code: "unsupported_engine".to_string(),
-                    message: format!("Unsupported search engine: {}", engine_name),
+                    engine: "unknown".to_string(),
+                    code: "task_panic".to_string(),
+                    message: join_err.to_string(),
                 });
             }
         }
     }
 
-    // Sort results by relevance? Keep original order.
+    // Reassemble in requested-engine order to keep ordering deterministic.
+    let mut all_results = Vec::new();
+    for name in &resolved_engines {
+        match collected.remove(name) {
+            Some(Ok(results)) => all_results.extend(results),
+            Some(Err(message)) => partial_failures.push(PartialFailure {
+                engine: name.clone(),
+                code: "engine_error".to_string(),
+                message,
+            }),
+            None => {}
+        }
+    }
+
+    // ── de-duplicate, then apply domain filters ────────────────────────────
+    let duplicates_removed = if do_dedupe {
+        let outcome = dedupe::dedupe(all_results);
+        all_results = outcome.results;
+        outcome.removed
+    } else {
+        0
+    };
+
+    if !include_domains.is_empty() || !exclude_domains.is_empty() {
+        all_results.retain(|r| filters::domain_allowed(&r.url, &include_domains, &exclude_domains));
+    }
+
     all_results.truncate(limit);
+
+    // ── filter metadata (honest per-engine reporting) ──────────────────────
+    let filters_meta = build_filters_meta(
+        engine_map,
+        &resolved_engines,
+        &freshness,
+        topic,
+        &include_domains,
+        &exclude_domains,
+    );
 
     let response = SearchResponse {
         query: query.clone(),
@@ -497,9 +639,75 @@ async fn handle_web_search(
         total_results: all_results.len(),
         results: all_results,
         partial_failures,
+        duplicates_removed,
+        filters: filters_meta,
     };
 
     serde_json::to_string_pretty(&response).unwrap_or_default()
+}
+
+/// Describe the filters that were requested, including exactly how well each
+/// engine could honour them. Never claims a filter was applied if it wasn't.
+fn build_filters_meta(
+    engine_map: &[Arc<dyn SearchEngine>],
+    engines: &[String],
+    freshness: &Option<Freshness>,
+    topic: Option<Topic>,
+    include_domains: &[String],
+    exclude_domains: &[String],
+) -> Option<Value> {
+    if freshness.is_none()
+        && topic.is_none()
+        && include_domains.is_empty()
+        && exclude_domains.is_empty()
+    {
+        return None;
+    }
+
+    let find = |n: &str| engine_map.iter().find(|e| e.name() == n);
+    let mut meta = serde_json::Map::new();
+
+    if let Some(f) = freshness {
+        let (start, end) = f.iso_range(filters::today_days());
+        meta.insert("freshness".to_string(), serde_json::json!(f.label()));
+        meta.insert(
+            "freshnessWindow".to_string(),
+            serde_json::json!(format!("{}..{}", start, end)),
+        );
+        let mut tiers = serde_json::Map::new();
+        for name in engines {
+            let tier = find(name)
+                .map(|e| e.freshness_tier())
+                .unwrap_or(FreshnessTier::Unsupported);
+            tiers.insert(name.clone(), serde_json::json!(tier.as_str()));
+        }
+        meta.insert("freshnessByEngine".to_string(), Value::Object(tiers));
+    }
+
+    if let Some(t) = topic {
+        meta.insert("topic".to_string(), serde_json::json!(t.as_str()));
+        let applied: Vec<String> = engines
+            .iter()
+            .filter(|n| find(n).map(|e| e.supports_topic()).unwrap_or(false))
+            .cloned()
+            .collect();
+        meta.insert("topicAppliedBy".to_string(), serde_json::json!(applied));
+    }
+
+    if !include_domains.is_empty() {
+        meta.insert(
+            "includeDomains".to_string(),
+            serde_json::json!(include_domains),
+        );
+    }
+    if !exclude_domains.is_empty() {
+        meta.insert(
+            "excludeDomains".to_string(),
+            serde_json::json!(exclude_domains),
+        );
+    }
+
+    Some(Value::Object(meta))
 }
 
 fn handle_local_search(args: &Value) -> String {
@@ -671,7 +879,53 @@ async fn handle_fetch(args: &Value, config: &Config) -> String {
                 return serde_json::to_string_pretty(&response).unwrap_or_default();
             }
 
-            // Compute the slice window.
+            // ── highlights mode: rank passages against a query ──────────────
+            // Like find, but instead of an exact literal it takes a query and
+            // returns the passages that cover the most distinct query terms.
+            // Purely local; startChar/endChar/maxLength/find are ignored.
+            if args.get("highlights").is_some() {
+                let hq = args["highlights"].as_str().unwrap_or("");
+                if hq.trim().is_empty() {
+                    return json_error("highlights must not be empty");
+                }
+                let context_chars = (args["contextChars"].as_f64().unwrap_or(200.0) as usize).min(2000);
+                let max_highlights = (args["maxHighlights"].as_f64().unwrap_or(5.0) as usize).clamp(1, 20);
+
+                let snips = snippets::highlight(&full, hq, context_chars, max_highlights);
+                eprintln!("✨ highlights {:?} → {} snippets", hq, snips.len());
+
+                let snippets_json: Vec<Value> = snips
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "startChar": s.start_char,
+                            "endChar": s.end_char,
+                            "score": s.score,
+                            "terms": s.terms,
+                            "context": s.context,
+                        })
+                    })
+                    .collect();
+
+                let mut response = serde_json::json!({
+                    "url": result.url,
+                    "title": result.title,
+                    "site": result.site_name,
+                    "contentType": result.content_type,
+                    "statusCode": result.status_code,
+                    "highlights": hq,
+                    "contextChars": context_chars,
+                    "totalLength": total,
+                    "totalSnippets": snips.len(),
+                    "snippets": snippets_json,
+                });
+                if snips.is_empty() {
+                    response["hint"] = serde_json::json!(
+                        "No query terms matched this page. Try different keywords, or fetch the full content without highlights."
+                    );
+                }
+                return serde_json::to_string_pretty(&response).unwrap_or_default();
+            }
             let start = std::cmp::min(start_char, total);
             let end = match end_char {
                 Some(e) => std::cmp::min(e, total),

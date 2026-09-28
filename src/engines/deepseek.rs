@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use crate::config::Config;
+use crate::filters::SearchOptions;
 use crate::models::{SearchError, SearchResult};
 use crate::python_embed;
 use super::SearchEngine;
@@ -122,7 +123,7 @@ fn build_body(query: &str, model: &str) -> serde_json::Value {
 impl SearchEngine for DeepseekEngine {
     fn name(&self) -> &'static str { "deepseek" }
 
-    async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+    async fn search(&self, query: &str, limit: usize, _opts: &SearchOptions, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
         let key = config.deepseek_api_key.as_deref()
             .ok_or_else(|| SearchError::Engine(
                 "DEEPSEEK_API_KEY not set; set it (DeepSeek official or OpenCode Go key) to enable the deepseek engine".to_string()
@@ -262,6 +263,7 @@ fn parse_response(data: &serde_json::Value, limit: usize) -> Result<Vec<SearchRe
                 source: extract_hostname(&url),
                 engine: "deepseek".to_string(),
                 summary: None,
+                engines: Vec::new(),
             });
             if results.len() >= limit { break; }
         }
@@ -302,6 +304,7 @@ fn parse_response(data: &serde_json::Value, limit: usize) -> Result<Vec<SearchRe
                             source: extract_hostname(&url),
                             engine: "deepseek".to_string(),
                             summary: None,
+                            engines: Vec::new(),
                         });
                         if results.len() >= limit { break; }
                     }

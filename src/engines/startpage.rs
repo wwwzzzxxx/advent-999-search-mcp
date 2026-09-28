@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use scraper::{Html, Selector};
 use crate::anubis;
 use crate::config::Config;
+use crate::filters::SearchOptions;
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 use std::sync::{Mutex, OnceLock};
@@ -33,7 +34,7 @@ fn get_client(config: &Config) -> Result<&'static reqwest::Client, SearchError> 
 impl SearchEngine for StartpageEngine {
     fn name(&self) -> &'static str { "startpage" }
 
-    async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+    async fn search(&self, query: &str, limit: usize, _opts: &SearchOptions, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
         let client = get_client(config)?;
 
         let mut all_results = Vec::new();
@@ -250,6 +251,7 @@ fn parse_results(html: &str) -> Vec<SearchResult> {
                 source: String::new(),
                 engine: "startpage".to_string(),
                 summary: None,
+                engines: Vec::new(),
             });
         }
     }
@@ -286,6 +288,7 @@ fn parse_results(html: &str) -> Vec<SearchResult> {
                     source: extract_hostname(&url).unwrap_or_default(),
                     engine: "startpage".to_string(),
                     summary: None,
+                    engines: Vec::new(),
                 });
             }
         }

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use crate::anubis;
 use crate::config::Config;
+use crate::filters::{today_days, FreshnessTier, SearchOptions};
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 
@@ -75,8 +76,25 @@ async fn fetch_with_anubis(
 impl SearchEngine for DblpEngine {
     fn name(&self) -> &'static str { "dblp" }
 
-    async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+    /// dblp has no date-range parameter; a `year:YYYY` term in the query is the
+    /// documented way to narrow by year, and it cannot express sub-year
+    /// windows. Hence best-effort, not applied.
+    fn freshness_tier(&self) -> FreshnessTier { FreshnessTier::BestEffort }
+
+    async fn search(&self, query: &str, limit: usize, opts: &SearchOptions, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
         let hits = std::cmp::min(limit, 100).max(1);
+
+        // dblp's query syntax accepts `year:`, which is the only time filter it
+        // offers. Only meaningful when a start year is known.
+        let effective_query: String = match opts
+            .freshness
+            .as_ref()
+            .and_then(|f| f.start_year(today_days()))
+        {
+            Some(y) => format!("{} year:{}", query, y),
+            None => query.to_string(),
+        };
+        let query = effective_query.as_str();
 
         let mut body_text: Option<String> = None;
         let mut last_err: Option<SearchError> = None;
@@ -185,6 +203,7 @@ impl SearchEngine for DblpEngine {
                 source: venue.to_string(),
                 engine: "dblp".to_string(),
                 summary: None,
+                engines: Vec::new(),
             });
 
             if results.len() >= limit { break; }

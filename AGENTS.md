@@ -3,9 +3,9 @@
 ## 项目概览
 
 Rust 编写的 MCP 服务器，提供三类工具：
-- **`web`** — 网络搜索（11 个引擎：exa, bing, csdn, juejin, startpage, sogou, weixin, dblp, cnki + 凭据门控的 deepseek, ieee）
+- **`web`** — 网络搜索（11 个引擎：exa, bing, csdn, juejin, startpage, sogou, weixin, dblp, cnki + 凭据门控的 deepseek, ieee）。v0.9.0 起：引擎**并发执行**（`tokio::task::JoinSet`，引擎以 `Arc<dyn SearchEngine>` 持有）、跨引擎 URL 去重、按请求过滤（freshness/topic/includeDomains/excludeDomains）。过滤能力按 `FreshnessTier` 三档如实上报：applied=exa/sogou/csdn/ieee（已实测生效）、best_effort=juejin/cnki/dblp/bing（bing 实测大陆出口无效果，仍照发参数）、unsupported=startpage/weixin
 - **`local`** — 本地文件搜索（Everything / es.exe，未配置时工具不出现）
-- **`get_page`** — 抓取网页正文（自动回退策略，支持需要登录 cookie 的站点；支持 find 服务端子串搜索模式，只返回匹配上下文窗口以省 token）
+- **`get_page`** — 抓取网页正文（自动回退策略，支持需要登录 cookie 的站点；支持 find 服务端子串搜索模式，只返回匹配上下文窗口以省 token；支持 highlights 模式，按查询相关性返回最相关的 N 个片段）
 - get_page 的 find 模式在 `src/main.rs::handle_fetch` 实现：先正常抓取再做字面子串匹配（默认 ASCII 大小写不敏感）→ 合并重叠窗口 → 只返回 matches 上下文（带绝对字符偏移），忽略 startChar/endChar/maxLength，totalMatches 始终为全量命中数
 - get_page 的 YouTube 字幕在 `src/fetch.rs::fetch_youtube_subtitle` 实现：watch 页取 INNERTUBE_API_KEY → Innertube player API（ANDROID 20.10.38，WEB 会被 POT/BotGuard 拦）→ captionTracks 选轨（手动英文 > 手动任意 > 自动英文 > 首个）→ timedtext json3 转 SRT；强制走代理（不可进 DIRECT_DOMAINS），匿名即可；非视频页（channel/playlist）回落通用抓取
 
@@ -32,7 +32,10 @@ cargo build --release                # 产物 target/release/advent-999-search-m
 | `src/config.rs` | 全部配置均来自环境变量；`DEFAULT_DIRECT_DOMAINS` 默认国内直连域名表。完整环境变量清单见 [README.md 第 3 节](README.md)。门控要点：`EXA_API_KEY` 开 exa、`DEEPSEEK_API_KEY` 开 deepseek、`EVERYTHING_ES_PATH` 开 local 工具（未设置则 local 工具不注册）、`DEEPSEEK_MODEL` 覆盖模型名 |
 | `src/anubis.rs` | **Anubis 工作量证明反爬求解器**（dblp / startpage 都用）。`detect()` 从 `<script id="anubis_challenge">` 取 `randomData`/`id`/`difficulty`；`solve()` 多线程暴力找 nonce 使 `sha256hex(randomData + nonce)` 有 `difficulty` 个**前导零十六进制位**；`pass()` GET `/.within.website/x/cmd/anubis/api/pass-challenge` 拿 auth cookie（**client 必须 `cookie_store(true)`**）。cookie 名随站点前缀变化（dblp=`dblp_org-auth-*`、startpage=`spchal-auth`），靠 jar 自动处理，勿写死名字 |
 | `src/cookie_cache.rs` | **短时反爬 Cookie 的本地缓存**（搜狗 SNUID 等）。文件在 `%LOCALAPPDATA%\advent-mcp\cookie-cache.json`（**仓库外**），按 mtime 判断变更 → **重新播种后下次搜索即生效，无需重启**。`filter_cookie_header()` 只保留引擎需要的 cookie；`fingerprint()` 输出不可逆指纹（`SNUID(D04E…1AF4, len 32)`）供日志使用，**永不打印真实值**。配套 CLI：`tests/manual/seed_cookies.py`（`--show` / `--path` / `--clear` / `--stdin` / `--file`） |
-| `src/models.rs` | `SearchResult`（含 `summary: Option<String>`，序列化时跳过 None）、`SearchError` 等 |
+| `src/models.rs` | `SearchResult`（含 `summary: Option<String>`、`engines: Vec<String>`，均按需跳过序列化）、`SearchError`、`SearchResponse`（含 `duplicatesRemoved` 与 `filters` 元数据）等。**注意**：给 `SearchResult` 加字段必须同步所有构造点（各 engine 内共 12 处，均带 `engines: Vec::new()`） |
+| `src/filters.rs` | 按请求过滤：`Freshness`（day/week/month/year 或 `YYYY-MM-DD..YYYY-MM-DD`）、`Topic`、`SearchOptions`、`FreshnessTier`（applied/best_effort/unsupported），以及不依赖 chrono 的 civil date 换算（`days_from_civil`/`civil_from_days`）。时间窗口按 **UTC** 计算 |
+| `src/dedupe.rs` | URL 规范化 + 精确去重。`canonical_url()` 先拆 Bing `/ck/` 跳转壳，再统一 scheme/host/尾斜杠/去 fragment，**只删已知追踪参数**（列表见 `TRACKING_PARAMS`），**绝不砍整个 query string**（否则 B 站 `?p=2` 会被误合并——这是照抄 Tavily `split('?')[0]` 的坑）。不做内容级去重 |
+| `src/snippets.rs` | `get_page` 的 highlights 片段排序（`highlight()`）。纯本地无 LLM：ASCII 按词、CJK 按 bigram 匹配，窗口按**不同查询词覆盖数优先**打分，偏移为字符级半开区间 |
 | `src/engines/mod.rs` | `SearchEngine` trait、`create_engine_map()`、`credential_gated_engines()` |
 | `src/engines/*.rs` | 各引擎实现 |
 | `src/fetch.rs` | HTTP 抓取与正文提取：代理/直连分流、cookie、超时。**~2300 行大文件**，含 ElementRef→markdown 转换管线、zhihu 签名抓取（zhihu_sign）、反爬回退策略。改动前务必通读相关段落，勿盲目重写。定位入口：`fetch_url` 按域名分流——zhihu → `fetch_zhihu`（需 `FETCH_COOKIES` + `d_c0` 签名）、weixin → `fetch_weixin_article`、sogou 微信跳转 → `fetch_sogou_weixin_link`、YouTube 视频（watch/shorts/live/embed/youtu.be）→ `fetch_youtube_subtitle`（Innertube ANDROID client，自建强制走代理的 reqwest client，**不可**用 `build_fetch_client` 因为 youtube 绝不能进 DIRECT_DOMAINS；youtube-nocookie.com 无视频 id，直接回落通用抓取）、bilibili 视频 → `fetch_bilibili_subtitle`（`bilibili_api_get` 浏览器头过 WAF，`finger/spi` 补 buvid3；SESSDATA 缺失时字幕列表为空属正常）、GitHub issue/PR（`github.com/{owner}/{repo}/issues|pull/{n}`）→ 页面抓取后追加 `fetch_github_comments`（公开 REST API 免鉴权 60 req/h，评论是客户端渲染的，best-effort 失败不影响正文）、其他 → `fetch_direct` 失败/低质量再 `fetch_via_jina` |

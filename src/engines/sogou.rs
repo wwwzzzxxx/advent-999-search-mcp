@@ -4,6 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::cookie_cache;
+use crate::filters::{FreshnessTier, SearchOptions};
 use crate::models::{SearchError, SearchResult};
 use super::SearchEngine;
 
@@ -100,7 +101,10 @@ async fn page_delay() {
 impl SearchEngine for SogouEngine {
     fn name(&self) -> &'static str { "sogou" }
 
-    async fn search(&self, query: &str, limit: usize, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+    fn freshness_tier(&self) -> FreshnessTier { FreshnessTier::Applied }
+
+    async fn search(&self, query: &str, limit: usize, opts: &SearchOptions, config: &Config) -> Result<Vec<SearchResult>, SearchError> {
+        use crate::filters::Freshness;
         let client = get_sogou_client(config)?;
 
         // SNUID is the "captcha already solved" credential — replaying it is
@@ -147,7 +151,17 @@ impl SearchEngine for SogouEngine {
             // Space out requests (across searches AND pages).
             polite_wait().await;
 
-            let url = format!("{}?query={}&page={}&ie=utf8", SOGOU_URL, url_encode(query), page);
+            // Sogou's `tsn` is a real server-side time filter (verified):
+            // 1 = past day, 2 = past week, 3 = past month, 4 = past year.
+            let tsn = match opts.freshness.as_ref() {
+                Some(Freshness::Day) => "&tsn=1",
+                Some(Freshness::Week) => "&tsn=2",
+                Some(Freshness::Month) => "&tsn=3",
+                Some(Freshness::Year) | Some(Freshness::Range { .. }) => "&tsn=4",
+                None => "",
+            };
+
+            let url = format!("{}?query={}&page={}&ie=utf8{}", SOGOU_URL, url_encode(query), page, tsn);
 
             let resp = client.get(&url)
                 .headers(headers.clone())
@@ -262,6 +276,7 @@ fn parse_sogou_results(html: &str) -> Vec<SearchResult> {
                 source: source.chars().take(200).collect(),
                 engine: "sogou".to_string(),
                 summary: None,
+                engines: Vec::new(),
             });
         }
     }
