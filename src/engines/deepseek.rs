@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::sync::OnceLock;
 use crate::config::Config;
 use crate::filters::SearchOptions;
 use crate::models::{SearchError, SearchResult};
@@ -75,6 +76,16 @@ for b in j.get("content", []):
         summary += b.get("text", "")
 print(json.dumps({"status": r.status_code, "results": results, "summary": summary}))
 "#;
+
+/// At most 2 concurrent python children: each is a full process with a
+/// ~90s API timeout, so unbounded batch fan-out must not spawn dozens.
+static GO_PY_SEM: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+fn go_py_sem() -> std::sync::Arc<tokio::sync::Semaphore> {
+    GO_PY_SEM
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+        .clone()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DeepseekMode {
@@ -182,6 +193,12 @@ impl DeepseekEngine {
 
     /// Go backend: spawn embedded Python (requests passes Cloudflare).
     async fn search_go(&self, query: &str) -> Result<serde_json::Value, SearchError> {
+        // Bound concurrent python children (batch fan-out can otherwise
+        // spawn one process per query, each with a ~90s timeout).
+        let _py_permit = go_py_sem()
+            .acquire_owned()
+            .await
+            .map_err(|e| SearchError::Engine(format!("python semaphore closed: {}", e)))?;
         let py = python_embed::python_exe()
             .map_err(|e| SearchError::Engine(format!("embedded python unavailable: {}", e)))?;
 

@@ -9,6 +9,7 @@ mod fetch;
 mod python_embed;
 mod anubis;
 mod cookie_cache;
+mod throttle;
 
 use config::Config;
 use filters::{Freshness, FreshnessTier, SearchOptions, Topic};
@@ -26,8 +27,9 @@ async fn main() {
     // Log to stderr
     eprintln!("🔍 advent-999-search-mcp Rust MCP server starting...");
 
-    let config = Config::from_env();
-    let engine_map = create_engine_map(&config);
+    let config = std::sync::Arc::new(Config::from_env());
+    let engine_map: std::sync::Arc<Vec<std::sync::Arc<dyn SearchEngine>>> =
+        std::sync::Arc::new(create_engine_map(&config));
 
     if config.allowed_search_engines.is_empty() {
         eprintln!("🔍 No engine restrictions, all {} engines available", engine_map.len());
@@ -45,6 +47,15 @@ async fn main() {
             eprintln!("🔓 Direct (no proxy) for: {}", config.direct_domains.join(", "));
         }
     }
+
+    // Serialized stdout: concurrent request tasks share one JSON-RPC line
+    // stream, so each response write holds this lock. Responses may arrive
+    // out of order; clients match them by `id`, which JSON-RPC allows.
+    let stdout_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    // Top-level request tasks: stdin is read sequentially, requests run
+    // concurrently (this is what lets N parallel `web` calls from a model
+    // actually overlap; per-engine-family throttling still applies inside).
+    let mut pending = tokio::task::JoinSet::new();
 
     let stdin = io::stdin();
     let reader = stdin.lock();
@@ -83,11 +94,11 @@ async fn main() {
                         },
                         "serverInfo": {
                             "name": "advent-999-search-mcp",
-                            "version": "0.9.0"
+                            "version": "0.10.0"
                         }
                     }
                 });
-                write_response(&resp);
+                write_response_locked(&resp, &stdout_lock).await;
             }
             "notifications/initialized" => {
                 // No response needed for notifications
@@ -102,23 +113,28 @@ async fn main() {
                     "id": id,
                     "result": { "tools": tools }
                 });
-                write_response(&resp);
+                write_response_locked(&resp, &stdout_lock).await;
             }
             "tools/call" => {
-                let name = msg["params"]["name"].as_str().unwrap_or("");
-                let args = &msg["params"]["arguments"];
-                let result = handle_tool_call(name, args, &config, &engine_map).await;
-                let resp = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "content": [{
-                            "type": "text",
-                            "text": result
-                        }]
-                    }
+                let name = msg["params"]["name"].as_str().unwrap_or("").to_string();
+                let args = msg["params"]["arguments"].clone();
+                let cfg = config.clone();
+                let engines = engine_map.clone();
+                let lock = stdout_lock.clone();
+                pending.spawn(async move {
+                    let result = handle_tool_call(&name, &args, &cfg, &engines).await;
+                    let resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": result
+                            }]
+                        }
+                    });
+                    write_response_locked(&resp, &lock).await;
                 });
-                write_response(&resp);
             }
             _ => {
                 // Unknown method - respond with error if it has an id
@@ -131,18 +147,28 @@ async fn main() {
                             "message": format!("Method not found: {}", method)
                         }
                     });
-                    write_response(&resp);
+                    write_response_locked(&resp, &stdout_lock).await;
                 }
             }
         }
     }
+
+    // stdin closed: drain in-flight requests before exiting.
+    while pending.join_next().await.is_some() {}
 }
 
 fn write_response(resp: &Value) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let json = serde_json::to_string(resp).unwrap_or_default();
     let mut stdout = io::stdout().lock();
     let _ = writeln!(stdout, "{}", json);
     let _ = stdout.flush();
+}
+
+async fn write_response_locked(resp: &Value, lock: &std::sync::Arc<tokio::sync::Mutex<()>>) {
+    let _guard = lock.lock().await;
+    write_response(resp);
 }
 
 fn list_tools(config: &Config) -> Vec<Value> {
@@ -193,7 +219,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
     let search_tool = serde_json::json!({
         "name": "web",
         "description": format!(
-            "Search the web using these engines: {}. Academic search tips: use dblp for CS papers, cnki for Chinese papers, ieee for IEEE Xplore; then pass any arXiv ID / URL or paper links from results to get_page to read the full text. WeChat article results (weixin.sogou.com/link?url=...) can also be passed directly to get_page. searchMode meanings: omit or set auto to use the server configured SEARCH_MODE; request forces request-based search; playwright forces browser-based search.",
+            "Search the web using these engines: {}. Academic search tips: use dblp for CS papers, cnki for Chinese papers, ieee for IEEE Xplore; then pass any arXiv ID / URL or paper links from results to get_page to read the full text. WeChat article results (weixin.sogou.com/link?url=...) can also be passed directly to get_page. searchMode meanings: omit or set auto to use the server configured SEARCH_MODE; request forces request-based search; playwright forces browser-based search. For multiple topics, prefer ONE web_batch call over parallel web calls: engines run concurrently across queries, while sogou/weixin (shared trust bucket) serialize and dblp/startpage are capped, so batching is faster and less likely to trigger captchas.",
             engines_desc
         ),
         "inputSchema": {
@@ -210,7 +236,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
                 },
                 "engines": {
                     "type": "array",
-                    "items": engine_schema,
+                    "items": engine_schema.clone(),
                     "description": "Search engines to use",
                     "default": [config.default_search_engine]
                 },
@@ -371,7 +397,66 @@ fn list_tools(config: &Config) -> Vec<Value> {
         }
     });
 
-    let mut tools = vec![search_tool, fetch_tool, set_cookies_tool];
+    // Batched parallel search: one call, N topics. The server fans out
+    // (query × engine) concurrently with per-family throttling
+    // (sogou/weixin serialize, dblp/startpage capped, the rest unbounded
+    // up to a global cap), so this is faster and safer than N parallel
+    // `web` calls. Each item mirrors `web` arguments.
+    let batch_tool = serde_json::json!({
+        "name": "web_batch",
+        "description": format!(
+            "Search multiple topics in one call (parallel backend). Same engines as web ({}). Use this instead of parallel web calls when you have several queries: cross-engine work runs concurrently while rate-limited engines (sogou/weixin share one permit; dblp/startpage capped) stay safe. Returns one result object per query in input order.",
+            engines_desc
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "description": "Topics to search (1-10). Each item takes the same arguments as web.",
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "description": "Search query" },
+                            "limit": { "type": "number", "description": "Max results (1-50)", "default": 10 },
+                            "engines": {
+                                "type": "array",
+                                "items": engine_schema.clone(),
+                                "description": "Search engines to use"
+                            },
+                            "freshness": {
+                                "type": "string",
+                                "description": "day | week | month | year, or YYYY-MM-DD..YYYY-MM-DD"
+                            },
+                            "topic": {
+                                "type": "string",
+                                "enum": ["news", "general"]
+                            },
+                            "includeDomains": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "excludeDomains": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "dedupe": {
+                                "type": "boolean",
+                                "description": "Fold duplicate URLs (default true)",
+                                "default": true
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            "required": ["queries"]
+        }
+    });
+
+    let mut tools = vec![search_tool, batch_tool, fetch_tool, set_cookies_tool];
     if find_es_exe().is_some() {
         tools.insert(1, local_tool);
     }
@@ -447,6 +532,7 @@ async fn handle_tool_call(
 ) -> String {
     match name {
         "web" => handle_web_search(args, config, engine_map).await,
+        "web_batch" => handle_web_batch(args, config, engine_map).await,
         "local" => handle_local_search(args),
         "get_page" => handle_fetch(args, config).await,
         "set_cookies" => handle_set_cookies(args),
@@ -561,6 +647,9 @@ async fn handle_web_search(
                 let c = config.clone();
                 let n = engine_name.clone();
                 set.spawn(async move {
+                    // Per-family throttling: held for the whole engine call
+                    // (sogou/weixin serialize, dblp/startpage capped).
+                    let _permits = crate::throttle::acquire(&n).await;
                     let res = engine.search(&q, engine_limit, &o, &c).await;
                     (n, res)
                 });
@@ -644,6 +733,231 @@ async fn handle_web_search(
     };
 
     serde_json::to_string_pretty(&response).unwrap_or_default()
+}
+
+/// Batched parallel search: N topics in one call.
+///
+/// Fans out (query × engine) into one `JoinSet`; every task goes through
+/// `throttle::acquire`, so sogou/weixin serialize on their shared permit
+/// while stateless engines overlap freely. Per-query assembly (ordering,
+/// dedupe, domain filters, `filters` meta) mirrors `handle_web_search`.
+async fn handle_web_batch(
+    args: &Value,
+    config: &Config,
+    engine_map: &[Arc<dyn SearchEngine>],
+) -> String {
+    let items = match args.get("queries").and_then(|v| v.as_array()) {
+        Some(a) => a.clone(),
+        None => return json_error("web_batch requires a `queries` array (1-10 items)"),
+    };
+    if items.is_empty() {
+        return json_error("queries must not be empty");
+    }
+    if items.len() > 10 {
+        return json_error("queries supports at most 10 topics per call; split into two web_batch calls");
+    }
+
+    struct SubQuery {
+        query: String,
+        limit: usize,
+        engines: Vec<String>,
+        opts: SearchOptions,
+        include_domains: Vec<String>,
+        exclude_domains: Vec<String>,
+        do_dedupe: bool,
+    }
+
+    let mut subs: Vec<SubQuery> = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let query = item["query"].as_str().unwrap_or("").to_string();
+        if query.trim().is_empty() {
+            return json_error(&format!("queries[{}].query must not be empty", i));
+        }
+        let limit = std::cmp::min(item["limit"].as_f64().unwrap_or(10.0) as usize, 50).max(1);
+        let requested: Vec<String> = item["engines"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| normalize_engine(s))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![config.default_search_engine.clone()]);
+        let resolved = config.resolve_engines(&requested);
+        let freshness = match item.get("freshness").and_then(|v| v.as_str()) {
+            Some(raw) => match Freshness::parse(raw) {
+                Some(f) => Some(f),
+                None => {
+                    return json_error(&format!(
+                        "queries[{}].freshness must be one of day|week|month|year, or a range like 2026-01-01..2026-02-01", i
+                    ))
+                }
+            },
+            None => None,
+        };
+        let topic = match item.get("topic").and_then(|v| v.as_str()) {
+            Some(raw) => match Topic::parse(raw) {
+                Some(t) => Some(t),
+                None => return json_error(&format!("queries[{}].topic must be news or general", i)),
+            },
+            None => None,
+        };
+        subs.push(SubQuery {
+            query,
+            limit,
+            engines: resolved,
+            opts: SearchOptions {
+                freshness,
+                topic,
+                include_domains: string_list(&item["includeDomains"]),
+                exclude_domains: string_list(&item["excludeDomains"]),
+            },
+            include_domains: string_list(&item["includeDomains"]),
+            exclude_domains: string_list(&item["excludeDomains"]),
+            do_dedupe: item["dedupe"].as_bool().unwrap_or(true),
+        });
+    }
+
+    eprintln!(
+        "Batch searching {} topics: {}",
+        subs.len(),
+        subs.iter()
+            .map(|s| format!("{:?}({})", s.query, s.engines.join("+")))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+
+    // ── fan out (query × engine) ─────────────────────────────────────────
+    let mut set = tokio::task::JoinSet::new();
+    for (qi, sub) in subs.iter().enumerate() {
+        let n_engines = sub.engines.len();
+        let per_engine = if n_engines > 0 { sub.limit / n_engines } else { sub.limit };
+        let remainder = if n_engines > 0 { sub.limit % n_engines } else { 0 };
+        for (i, engine_name) in sub.engines.iter().enumerate() {
+            let engine_limit = per_engine + if i < remainder { 1 } else { 0 };
+            if engine_limit == 0 {
+                continue;
+            }
+            match engine_map.iter().find(|e| e.name() == engine_name) {
+                Some(engine) => {
+                    let engine = engine.clone();
+                    let q = sub.query.clone();
+                    let o = sub.opts.clone();
+                    let c = config.clone();
+                    let n = engine_name.clone();
+                    set.spawn(async move {
+                        let _permits = crate::throttle::acquire(&n).await;
+                        let res = engine.search(&q, engine_limit, &o, &c).await;
+                        (qi, n, res)
+                    });
+                }
+                None => {
+                    // Unsupported engines are reported per-query below via a
+                    // placeholder task result: push a synthetic failure now by
+                    // spawning an immediately-ready task to keep the collect
+                    // path uniform.
+                    let qi_c = qi;
+                    let n_c = engine_name.clone();
+                    set.spawn(async move {
+                        (
+                            qi_c,
+                            n_c,
+                            Err(models::SearchError::Engine("unsupported_engine".to_string())),
+                        )
+                    });
+                }
+            }
+        }
+    }
+
+    // qi -> engine -> results (or error string)
+    let mut collected: Vec<std::collections::HashMap<String, Result<Vec<models::SearchResult>, String>>> =
+        (0..subs.len()).map(|_| std::collections::HashMap::new()).collect();
+    // qi -> unsupported-engine failures that never ran
+    let mut unsupported: Vec<Vec<PartialFailure>> = (0..subs.len()).map(|_| Vec::new()).collect();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((qi, name, Ok(results))) => {
+                eprintln!("✅ [{}] {} returned {} results", subs[qi].query, name, results.len());
+                collected[qi].insert(name, Ok(results));
+            }
+            Ok((qi, name, Err(err))) => {
+                let msg = err.to_string();
+                if msg.contains("unsupported_engine") {
+                    unsupported[qi].push(PartialFailure {
+                        engine: name.clone(),
+                        code: "unsupported_engine".to_string(),
+                        message: format!("Unsupported search engine: {}", name),
+                    });
+                } else {
+                    eprintln!("⚠️ [{}] {} search failed: {}", subs[qi].query, name, msg);
+                    collected[qi].insert(name, Err(msg));
+                }
+            }
+            Err(join_err) => {
+                eprintln!("⚠️ batch engine task panicked: {}", join_err);
+            }
+        }
+    }
+
+    // ── reassemble per query, in input order ─────────────────────────────
+    let mut out_queries = Vec::with_capacity(subs.len());
+    for (qi, sub) in subs.iter().enumerate() {
+        let mut all_results = Vec::new();
+        let mut partial_failures = unsupported[qi].clone();
+        for name in &sub.engines {
+            match collected[qi].remove(name) {
+                Some(Ok(results)) => all_results.extend(results),
+                Some(Err(message)) => partial_failures.push(PartialFailure {
+                    engine: name.clone(),
+                    code: "engine_error".to_string(),
+                    message,
+                }),
+                None => {}
+            }
+        }
+        let duplicates_removed = if sub.do_dedupe {
+            let outcome = dedupe::dedupe(all_results);
+            all_results = outcome.results;
+            outcome.removed
+        } else {
+            0
+        };
+        if !sub.include_domains.is_empty() || !sub.exclude_domains.is_empty() {
+            all_results.retain(|r| {
+                filters::domain_allowed(&r.url, &sub.include_domains, &sub.exclude_domains)
+            });
+        }
+        all_results.truncate(sub.limit);
+        let filters_meta = build_filters_meta(
+            engine_map,
+            &sub.engines,
+            &sub.opts.freshness,
+            sub.opts.topic,
+            &sub.include_domains,
+            &sub.exclude_domains,
+        );
+        let mut obj = serde_json::json!({
+            "query": sub.query,
+            "engines": sub.engines,
+            "totalResults": all_results.len(),
+            "results": all_results,
+            "partialFailures": partial_failures,
+        });
+        if sub.do_dedupe && duplicates_removed > 0 {
+            obj["duplicatesRemoved"] = serde_json::json!(duplicates_removed);
+        }
+        if let Some(f) = filters_meta {
+            obj["filters"] = f;
+        }
+        out_queries.push(obj);
+    }
+
+    serde_json::to_string_pretty(&serde_json::json!({
+        "count": out_queries.len(),
+        "results": out_queries,
+    }))
+    .unwrap_or_default()
 }
 
 /// Describe the filters that were requested, including exactly how well each

@@ -325,6 +325,18 @@ Both live **outside this repository** and must never be committed. Logs only eve
 
 Note: `cnki`, `dblp` and `sogou` all detect proxy/datacenter IPs, so they belong in `DIRECT_DOMAINS` (they are there by default). Sogou's block is IP-level, and note that in a rules-based VPN the proxy may still route CN domains direct — so "proxying" Sogou does not actually change your egress IP.
 
+### `web_batch` — Batched Parallel Search
+
+```
+queries (array, 1-10, required) — each item takes the same arguments as web
+```
+
+One call, N topics: the server fans out (query × engine) concurrently with
+per-family throttling (sogou/weixin share one permit and serialize;
+dblp/startpage are capped; stateless engines run free up to a global cap).
+Prefer this over parallel `web` calls for multiple topics — one round trip,
+less captcha risk. Returns one result object per query in input order.
+
 ### `local` — Local File Search
 
 ```
