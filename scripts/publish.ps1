@@ -205,15 +205,26 @@ function Invoke-GiteeJson {
   param([string]$Method, [string]$Path, [hashtable]$Data)
   $url = "https://gitee.com/api/v5/repos/$GITEE_REPO$Path"
   $args = @("-s", "--max-time", "120", "-X", $Method)
+  $tmpFiles = @()
   if ($Method -eq "GET") {
     $qs = ($Data.Keys | ForEach-Object { "$_=$([uri]::EscapeDataString($Data[$_]))" }) -join "&"
     if ($qs) { $url += "?$qs" }
   } else {
+    # Values (release notes, Chinese titles) MUST go through a file: passing
+    # them as argv makes Windows convert UTF-16 to the ANSI codepage (GBK),
+    # which silently corrupts every non-ASCII character Gitee stores.
     foreach ($k in $Data.Keys) {
-      $args += "--data-urlencode"; $args += "$k=$($Data[$k])"
+      $tmp = Join-Path $env:TEMP ("gitee-" + [guid]::NewGuid().ToString("N") + ".txt")
+      [System.IO.File]::WriteAllText($tmp, [string]$Data[$k], (New-Object System.Text.UTF8Encoding($false)))
+      $tmpFiles += $tmp
+      $args += "--data-urlencode"; $args += "$k@$tmp"
     }
   }
-  $out = & curl.exe @args $url
+  try {
+    $out = & curl.exe @args $url
+  } finally {
+    foreach ($f in $tmpFiles) { Remove-Item $f -ErrorAction SilentlyContinue }
+  }
   if ($LASTEXITCODE -ne 0) { Fail "Gitee API 请求失败: $out" }
   if (-not $out -or $out -eq "null") { return $null }
   $obj = $out | ConvertFrom-Json
@@ -266,8 +277,15 @@ function Publish-Gitee {
     $assetName = Split-Path $asset -Leaf
     foreach ($f in $files) {
       if ($f.name -eq $assetName) {
-        Invoke-GiteeJson -Method DELETE -Path "/releases/$relId/attach_files/$($f.id)" -Data @{ access_token = $Token }
-        Info "已删除旧附件 $assetName"
+        # Gitee answers 405 on this endpoint for some releases; deletion is
+        # best-effort so a re-publish still reaches the upload step.
+        $delUrl = "https://gitee.com/api/v5/repos/$GITEE_REPO/releases/$relId/attach_files/$($f.id)?access_token=$Token"
+        $del = & curl.exe -s --max-time 60 -X DELETE $delUrl
+        if ($del -match '"message"') {
+          Warn "删除旧附件 $assetName 失败（继续上传）: $del"
+        } else {
+          Info "已删除旧附件 $assetName"
+        }
       }
     }
     Info "上传附件 $assetName ..."
