@@ -91,10 +91,12 @@ def show() -> int:
     except Exception as e:  # noqa: BLE001
         print(f"  ERROR: cannot parse: {e}")
         return 1
-    if not data:
+    # v2 layout: {"version": 2, "entries": {...}}; v1 was a bare map.
+    entries = data.get("entries", data) if isinstance(data, dict) else {}
+    if not entries:
         print("  (empty)")
         return 1
-    for site, entry in data.items():
+    for site, entry in entries.items():
         cookies = entry.get("cookies", "")
         saved = entry.get("saved_at", 0)
         age = max(0, int(time.time()) - saved) if saved else -1
@@ -161,9 +163,20 @@ def main() -> int:
             data = json.loads(p.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             data = {}
-    data[site] = {"cookies": filtered, "saved_at": int(time.time())}
+    if not isinstance(data, dict):
+        data = {}
+    # Migrate v1 (bare map) to v2 before writing, so the server does not drop it.
+    if "entries" in data and isinstance(data["entries"], dict):
+        entries = data["entries"]
+    else:
+        entries = {k: v for k, v in data.items() if isinstance(v, dict)}
+    # Short site names map to the domain that owns the cookies.
+    aliases = {"sogou": "sogou.com", "weixin": "sogou.com", "bilibili": "bilibili.com",
+               "zhihu": "zhihu.com", "csdn": "csdn.net"}
+    domain = aliases.get(site.lower(), site.lower())
+    entries[domain] = {"cookies": filtered, "saved_at": int(time.time()), "source": "paste"}
 
-    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    p.write_text(json.dumps({"version": 2, "entries": entries}, indent=2), encoding="utf-8")
     try:
         p.chmod(0o600)  # best-effort; Windows may ignore this
     except Exception:  # noqa: BLE001

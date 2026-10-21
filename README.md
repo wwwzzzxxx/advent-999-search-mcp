@@ -8,10 +8,11 @@
 
 A Rust-based MCP server that gives your AI assistant **web search**, **local file search**, and **web page fetching** abilities.
 
-- **`web`** — Search with 11 engines (Exa, Bing, CSDN, Juejin, Startpage, Sogou, Weixin, DBLP, CNKI + credential-gated DeepSeek, IEEE), with **per-request filters** (`freshness`, `topic`, `includeDomains`, `excludeDomains`) and **cross-engine de-duplication**
+- **`web`** — Search with 11 engines (Exa, Bing, CSDN, Juejin, Startpage, Sogou, Weixin, DBLP, CNKI + credential-gated DeepSeek, IEEE), with **per-request filters** (`freshness`, `topic`, `includeDomains`, `excludeDomains`), **cross-engine de-duplication**, and **several topics per call** (`queries`)
 - **`local`** — Search your local files via Everything (voidtools)
-- **`get_page`** — Fetch and extract readable content from any web page, with `find` (literal) and `highlights` (query-relevance) modes
-- **`set_cookies`** — Store fresh session cookies for captcha-walled engines (Sogou), no restart needed
+- **`get_page`** — Fetch and extract readable content from any web page, with `find` (literal) and `highlights` (query-relevance) modes, and up to 10 URLs per call
+- **`set_cookies`** — A local, **domain-scoped** cookie store: set / list / clear login and anti-bot cookies at runtime, no restart needed
+- **`import_cookies`** — Opt-in (`ADVENT_ALLOW_COOKIE_IMPORT=1`): read cookies from a dedicated Edge profile over the DevTools protocol
 
 ### Why advent?
 
@@ -198,7 +199,11 @@ Edit `opencode.json`:
 | `DEEPSEEK_API_MODE` | No | *(auto)* | Force backend: `official` (api.deepseek.com) or `go` (opencode.ai) |
 | `DEEPSEEK_MODEL` | No | `deepseek-v4-flash` | Model used by the deepseek engine |
 | `IEEE_API_KEY` | No | — | IEEE Xplore Metadata Search API key ([developer.ieee.org](https://developer.ieee.org)) — enables the `ieee` engine |
-| `FETCH_COOKIES` | No | — | Long-lived **login** cookies. Format: `key=value; key2=value2`. `d_c0` unlocks Zhihu; `SESSDATA` unlocks Bilibili subtitles (the subtitle list requires login). For short-lived **anti-bot** cookies (Sogou `SNUID`) use the cookie cache / `set_cookies` tool instead — see the Sogou note below. **Never commit real cookies** — set them as env vars |
+| `FETCH_COOKIES` | No | — | Legacy way to supply long-lived **login** cookies as a flat `key=value; key2=value2` blob. It is now split by cookie owner: `d_c0`/`z_c0` → `zhihu.com`, `SESSDATA`/`buvid3`/`bili_jct`/… → `bilibili.com`, `SNUID`/`SUV` → `sogou.com`; **unrecognized names are dropped** (they would otherwise be sent to every fetched host). Prefer `set_cookies` / `import_cookies`, which store cookies per domain. **Never commit real cookies** |
+| `COOKIE_CACHE_TTL` | No | `1200` | Age (seconds) after which a cached cookie is logged as stale. Advisory only — stale cookies are still used, the remote server is the real authority. `0` disables the warning |
+| `ADVENT_ALLOW_COOKIE_IMPORT` | No | `0` | Set to `1` to register the `import_cookies` tool. Off by default: it is a credential-access capability and should be approved separately |
+| `ADVENT_FETCH_LOG` | No | `0` | Set to `1` to append one JSON line per `get_page` fetch (URL, host, outcome, status, chars, duration, strategy, attached cookie names). Values are never logged |
+| `ADVENT_FETCH_LOG_PATH` | No | `<cookie dir>/fetch-log.jsonl` | Where the fetch log is written (rotated once at 8 MB) |
 | `EVERYTHING_ES_PATH` | No | — | Path to ES.exe (required to enable local search) |
 | `DEFAULT_SEARCH_ENGINE` | No | `exa` | Default search engine |
 | `ALLOWED_SEARCH_ENGINES` | No | *(all)* | Comma-separated list of allowed engines |
@@ -211,8 +216,9 @@ Edit `opencode.json`:
 ### `web` — Web Search
 
 ```
-query          (string, required)  — Search query
-limit          (number, default 10) — Max results total (1-50)
+query          (string)             — Search query (single topic)
+queries        (string[], 1-10)     — Several topics in one call (same options apply to all)
+limit          (number, default 10) — Max results per query (1-50)
 engines        (string[])           — Which engine(s) to use
 searchMode     (string)             — "request" | "auto" | "playwright"
 freshness      (string)             — day | week | month | year | YYYY-MM-DD..YYYY-MM-DD
@@ -312,30 +318,84 @@ Note: `sogou` (and `weixin`, which rides on weixin.sogou.com) rate-limits by egr
 
 `SNUID` is the credential that proves the captcha was solved; it is *not* HttpOnly, so `document.cookie` is enough. It lasts roughly 20 minutes, after which Sogou challenges again. The cache warns when an entry looks stale.
 
-### Two kinds of cookies
+### How cookies are stored
 
-| | `FETCH_COOKIES` (env var) | Cookie cache (file) |
+Everything lives in one file, keyed by **domain**:
+
+```jsonc
+// %LOCALAPPDATA%\advent-mcp\cookie-cache.json
+{ "version": 2, "entries": {
+    "sogou.com":    { "cookies": "SNUID=...; SUV=...", "saved_at": 1789000000, "source": "paste" },
+    "bilibili.com": { "cookies": "SESSDATA=...",        "saved_at": 1789000000, "source": "browser" } } }
+```
+
+A request only ever receives the cookies of **its own host** (suffix match), so
+a Bilibili session can never leak to an unrelated site. The file lives
+**outside this repository** and must never be committed. Logs and
+`set_cookies action=list` only show names/counts, never values.
+
+Three ways in:
+
+| Method | For | Refresh |
 |---|---|---|
-| For | long-lived **login** credentials — Zhihu `d_c0`, Bilibili `SESSDATA` | short-lived **anti-bot** credentials — Sogou `SNUID`/`SUV` |
-| Loaded | once at startup | re-read whenever the file changes |
-| Refresh | edit config **and restart** | just re-seed — effective on the next search |
-| Location | your MCP config | `%LOCALAPPDATA%\advent-mcp\cookie-cache.json` (Windows), `~/.cache/advent-mcp/cookie-cache.json` (Linux/macOS) |
+| `set_cookies` (tool) | pasting a `document.cookie` dump or a specific cookie | next request, no restart |
+| `import_cookies` (tool, opt-in) | pulling cookies from a dedicated Edge profile automatically | next request, no restart |
+| `FETCH_COOKIES` (env var) | legacy; flat blob split by cookie owner | edit config **and restart** |
 
-Both live **outside this repository** and must never be committed. Logs only ever print a non-reversible fingerprint (`SNUID(D04E…1AF4, len 32)`), never a usable value.
+`import_cookies` does **not** touch your everyday Edge profile. It launches
+`msedge.exe` with its own `--user-data-dir` (`%LOCALAPPDATA%\advent-mcp\edge-profile`)
+and asks the browser for the requested domains over the DevTools protocol —
+the only supported route on current Windows builds, where cookie values are
+protected by App-Bound Encryption (v20) and the live cookie DB is not readable
+by other processes. Log in once in the window it opens; the profile keeps the
+session for next time. Enable it with `ADVENT_ALLOW_COOKIE_IMPORT=1`.
 
 Note: `cnki`, `dblp` and `sogou` all detect proxy/datacenter IPs, so they belong in `DIRECT_DOMAINS` (they are there by default). Sogou's block is IP-level, and note that in a rules-based VPN the proxy may still route CN domains direct — so "proxying" Sogou does not actually change your egress IP.
 
-### `web_batch` — Batched Parallel Search
+### Batching (`queries`)
+
+`web` takes either `query` (one topic) or `queries` (1-10 topics). With
+`queries` the server fans out (query × engine) concurrently with per-family
+throttling (sogou/weixin share one permit and serialize; dblp/startpage are
+capped; stateless engines run free up to a global cap) and returns one object
+per query, in input order. An invalid item (bad `freshness`, empty query) is
+reported as `{query, error}` and does not lose the other topics.
+
+> The throttle is process-wide, so parallel `web` calls in one process are
+> equally safe — batching mainly saves round-trips (and is faster on clients
+> that execute tool calls one at a time).
+
+Each item may also be an object (`{"query": ..., "limit": ...}`) to override
+the top-level options for that topic.
+
+### `set_cookies` — Domain-scoped cookie store
 
 ```
-queries (array, 1-10, required) — each item takes the same arguments as web
+action (string) — "set" (default) | "list" | "clear"
+domain (string) — owning domain, e.g. bilibili.com / zhihu.com / sogou.com
+                  (short aliases sogou, weixin, bilibili, zhihu work too)
+cookies (string) — Cookie header value, e.g. "SESSDATA=...; buvid3=..."
 ```
 
-One call, N topics: the server fans out (query × engine) concurrently with
-per-family throttling (sogou/weixin share one permit and serialize;
-dblp/startpage are capped; stateless engines run free up to a global cap).
-Prefer this over parallel `web` calls for multiple topics — one round trip,
-less captcha risk. Returns one result object per query in input order.
+Cookies are filtered for `sogou.com` (only the names its trust check needs),
+stored for any other domain as pasted (capped at 50 names / 8 KB), and sent
+only to that domain and its subdomains. `action=list` shows domains, cookie
+names and ages; `action=clear` with `domain:"*"` forgets everything.
+
+### `import_cookies` — Opt-in browser import
+
+```
+domains     (string[], 1-5, required) — e.g. ["bilibili.com"]
+loginUrl    (string)   — page to open (default https://<domain>/)
+waitSeconds (number, default 90, max 300) — how long to wait for the login
+keepOpen    (boolean, default false) — leave the window open afterwards
+```
+
+Registered only when the server starts with `ADVENT_ALLOW_COOKIE_IMPORT=1`.
+Probes the private profile headlessly (no window); opens Edge only when a login
+is actually missing, then stores the cookies per domain. Each domain reports
+`usable` / `missingKey`, so a zhihu import that only got `d_c0` says it still
+needs `z_c0`. Never reads your everyday browser profile.
 
 ### `local` — Local File Search
 
@@ -354,8 +414,10 @@ foldersOnly   (boolean)          — Folders only
 ### `get_page` — Fetch Web Page
 
 ```
-url       (string, required)    — URL to fetch, or an arXiv paper ID
-maxLength (number, max 200000)  — Max content length
+url       (string)              — URL to fetch, or an arXiv paper ID
+urls      (string[], 1-10)      — Several URLs/IDs in one call (fetched concurrently)
+maxLength (number, max 200000)  — Max content length per URL (with several URLs the default
+                                  is a ~60k-character total budget, split evenly)
 startChar (number)              — Start reading from this character offset (0-based)
 endChar   (number)              — Read up to this offset (exclusive)
 find      (string)              — Literal substring to search in the fetched text (find mode)
@@ -402,17 +464,33 @@ truncates the window list. Empty needle is rejected; zero hits return a hint sug
 different keywords.
 
 Smart fetching strategy:
-- **Zhihu** → signed API (requires `d_c0` in `FETCH_COOKIES`)
+- **Zhihu** → signed API: question pages are expanded with their top 5 answers. Requires a **logged-in** session stored for `zhihu.com` — `d_c0` alone now gets `403 need_login`, so `z_c0` is needed too (use `import_cookies` to log in once, then import)
 - **CSDN** → direct HTML extraction
 - **Discourse** forums → JSON API
 - **WeChat articles** (`mp.weixin.qq.com`) → MicroMessenger UA direct fetch
 - **Sogou WeChat links** (`weixin.sogou.com/link?url=...`) → JS-URL resolution + fetch
 - **GitHub issues/PRs** → page body + all comments appended via the public REST API (comments are client-side rendered on the HTML page, so they are fetched from `api.github.com` and appended as markdown)
-- **Bilibili videos** (`bilibili.com/video/BVxxx`, optional `?p=N` for multi-part) → subtitle track returned as SRT (requires `SESSDATA` in `FETCH_COOKIES` — Bilibili only serves the subtitle list to logged-in users)
+- **Bilibili videos** (`bilibili.com/video/BVxxx`, optional `?p=N` for multi-part) → subtitle track returned as SRT (requires `SESSDATA` stored for `bilibili.com` — Bilibili only serves the subtitle list to logged-in users)
 - **YouTube videos** (`youtube.com/watch?v=ID`, `/shorts/ID`, `/live/ID`, `/embed/ID`, `youtu.be/ID`) → caption track returned as SRT via the Innertube ANDROID player API (anonymous, no login; needs proxy egress outside mainland China). Track priority: manual English > manual any language > auto English > first available. Non-video pages (channel, playlist, search) fall through to the generic fetch path
 - **arXiv papers** → accepts a paper ID (`2401.12345`, `arXiv:2401.12345`, or an `arxiv.org/abs/...` URL) and returns the paper's HTML content (official `arxiv.org/html/` conversion, falling back to ar5iv for older papers)
 - **JS-heavy sites** → Jina Reader fallback
 - **Normal sites** → direct HTTP with HTML-to-Markdown
+
+### Fetch log
+
+Set `ADVENT_FETCH_LOG=1` to append one JSON object per fetch to
+`%LOCALAPPDATA%\advent-mcp\fetch-log.jsonl` (override with
+`ADVENT_FETCH_LOG_PATH`). It records the URL, host, ok/failure, HTTP status,
+extracted and returned character counts, duration, which strategy produced the
+content (`direct`, `jina`, `zhihu-api`, ...) and the **names** of the stored
+cookies that were attached. Cookie values and response bodies are never logged.
+
+```jsonc
+{"ts":"2026-10-20T11:37:05Z","url":"https://www.bing.com/search?q=rust","host":"www.bing.com",
+ "site":"Bing","mode":"content","ok":true,"status":200,"totalChars":17264,"returnedChars":17264,
+ "truncated":false,"ms":692,"via":"direct","cookies":19,"cookieNames":["MUID","SRCHD","..."],
+ "batch":1,"index":1,"retried":false}
+```
 
 ---
 

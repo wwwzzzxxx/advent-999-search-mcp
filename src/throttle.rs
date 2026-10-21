@@ -19,7 +19,7 @@
 //!   `deepseek.rs`); it has its own process semaphore there.
 //!
 //! A global semaphore caps total concurrent engine calls so that
-//! `N queries × M engines` from `web_batch` cannot open hundreds of
+//! `N queries × M engines` from one batched `web` call cannot open hundreds of
 //! connections through the proxy at once.
 
 use std::sync::OnceLock;

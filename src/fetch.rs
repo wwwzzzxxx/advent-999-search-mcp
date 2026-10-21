@@ -355,8 +355,8 @@ pub struct FetchResult {
     /// HTTP status code of the response. 200 on success; 404/410/451 carry
     /// the error-page body so callers can distinguish "page gone" from content.
     pub status_code: u16,
-    #[allow(dead_code)]
-    pub via: String, // "direct" or "jina"
+    /// How the content was obtained: "direct", "jina", "zhihu-api", ...
+    pub via: String,
 }
 
 /// Fetch a URL and extract its readable content.
@@ -486,11 +486,11 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
 
     // Quick check for known blocked domains (skip if jina-preferred)
     if !prefer_jina && BLOCKED_DOMAINS.iter().any(|d| host.contains(d)) {
-        if !config.fetch_cookies.is_empty() {
+        if !config.cookies_for(host).is_empty() {
             // User provided cookies, try direct fetch
         } else {
             return Err(FetchError::Blocked(format!(
-                "{} is blocked by anti-bot measures. Try setting FETCH_COOKIES with your login cookies.",
+                "{} is blocked by anti-bot measures. Store login cookies for it with set_cookies.",
                 host
             )));
         }
@@ -1133,11 +1133,15 @@ fn zhihu_json_to_markdown(json: &serde_json::Value) -> String {
         }
     }
 
-    // Content (HTML to markdown via existing infra)
-    if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
-        if !content.trim().is_empty() {
-            let text_md = cooked_html_to_text(content);
-            md.push_str(&text_md);
+    // Content (HTML to markdown via existing infra). Questions carry `detail`,
+    // answers/articles carry `content`.
+    for key in ["content", "detail"] {
+        if let Some(content) = json.get(key).and_then(|v| v.as_str()) {
+            if !content.trim().is_empty() {
+                let text_md = cooked_html_to_text(content);
+                md.push_str(&text_md);
+                md.push_str("\n\n");
+            }
         }
     }
 
@@ -1151,6 +1155,99 @@ fn zhihu_json_to_markdown(json: &serde_json::Value) -> String {
     md
 }
 
+/// Render `/api/v4/questions/{id}/answers` into markdown.
+fn zhihu_answers_to_markdown(json: &serde_json::Value) -> String {
+    let mut md = String::new();
+    let Some(list) = json.get("data").and_then(|v| v.as_array()) else {
+        return md;
+    };
+    for (i, answer) in list.iter().enumerate() {
+        let author = answer
+            .get("author")
+            .and_then(|a| a.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("匿名用户");
+        let votes = answer.get("voteup_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        md.push_str(&format!("## 回答 {} · {}（赞同 {}）\n\n", i + 1, author, votes));
+        if let Some(content) = answer.get("content").and_then(|v| v.as_str()) {
+            md.push_str(&cooked_html_to_text(content));
+            md.push_str("\n\n");
+        }
+    }
+    md
+}
+
+/// Signed JSON GET against the Zhihu API.
+async fn zhihu_api_json(
+    client: &reqwest::Client,
+    api_url: &str,
+    d_c0: &str,
+    cookies: &str,
+    host: &str,
+) -> Result<serde_json::Value, FetchError> {
+    let signed_headers = zhihu_sign::sign_zhihu_request(api_url, d_c0, None);
+
+    let mut request = client
+        .get(api_url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, build_user_agent(host))
+        .header(reqwest::header::REFERER, "https://www.zhihu.com/")
+        .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS));
+
+    for (name, value) in &signed_headers {
+        if let Ok(hv) = reqwest::header::HeaderValue::from_str(value) {
+            if let Ok(hname) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
+                request = request.header(hname, hv);
+            }
+        }
+    }
+    if !cookies.is_empty() {
+        if let Ok(cookie_header) = reqwest::header::HeaderValue::from_str(cookies) {
+            request = request.header(reqwest::header::COOKIE, cookie_header);
+        }
+    }
+
+    let resp = request.send().await.map_err(|e| {
+        if e.is_timeout() {
+            FetchError::Timeout
+        } else if e.is_connect() {
+            FetchError::Network(format!("Connection failed: {}", e))
+        } else {
+            FetchError::Http(format!("Zhihu API request failed: {}", e))
+        }
+    })?;
+
+    let status = resp.status();
+    if status == 403 {
+        // Keep a short body snippet: zhihu distinguishes "bad signature",
+        // "bad d_c0" and "captcha" only in the response.
+        let body: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
+        return Err(FetchError::Blocked(format!(
+            "Zhihu API returned 403. d_c0 may be stale, or the request came from a different \
+             egress IP than the one that minted it, or zhihu now wants a login (z_c0). \
+             Body: {}",
+            body.replace('\n', " ")
+        )));
+    }
+    if !status.is_success() {
+        return Err(FetchError::HttpStatus(status.as_u16(), status.as_str().to_string()));
+    }
+
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| FetchError::Parse(format!("Zhihu API JSON: {}", e)))
+}
+
+/// `question/{id}` (with or without a trailing answer) → question id.
+fn zhihu_question_id(parsed: &url::Url) -> Option<String> {
+    let path = parsed.path().trim_end_matches('/');
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segments.as_slice() {
+        ["question", qid] | ["question", qid, "answer", _] => Some((*qid).to_string()),
+        _ => None,
+    }
+}
+
 /// Fetch Zhihu content via signed API requests.
 ///
 /// Uses `zhihu_sign::sign_zhihu_request` to compute the x-zse-96 header,
@@ -1162,67 +1259,20 @@ async fn fetch_zhihu(url: &str, host: &str, config: &Config) -> Result<FetchResu
     // Convert page URL to API URL
     let api_url = zhihu_page_to_api_url(&parsed)?;
 
-    // Extract d_c0 from cookies
-    let d_c0 = extract_cookie_value(&config.fetch_cookies, "d_c0");
+    // Extract d_c0 from this host's domain-scoped cookies
+    let cookies = config.cookies_for(host);
+    let d_c0 = extract_cookie_value(&cookies, "d_c0");
     if d_c0.is_empty() {
         return Err(FetchError::Blocked(
-            "Zhihu requires d_c0 cookie. Set FETCH_COOKIES env var with d_c0=... \n\
-             Get it from browser DevTools → Application → Cookies → zhihu.com".into()
+            "Zhihu requires d_c0 cookie. Store it with set_cookies (domain: zhihu.com) 
+             or import it from the browser. Get it from DevTools → Application → Cookies → zhihu.com".into()
         ));
     }
 
-    // Compute signed headers using zhihu_sign crate
-    let signed_headers = zhihu_sign::sign_zhihu_request(&api_url, &d_c0, None);
-
-    // Build HTTP client
     let client = build_fetch_client(config, host)?;
-    let mut request = client.get(&api_url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::USER_AGENT, build_user_agent(host))
-        .header(reqwest::header::REFERER, "https://www.zhihu.com/")
-        .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS));
+    let json = zhihu_api_json(&client, &api_url, &d_c0, &cookies, host).await?;
 
-    // Add signed headers (x-zse-93, x-zse-96, x-requested-with)
-    for (name, value) in &signed_headers {
-        if let Ok(hv) = reqwest::header::HeaderValue::from_str(value) {
-            if let Ok(hname) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
-                request = request.header(hname, hv);
-            }
-        }
-    }
-
-    // Add cookies
-    if !config.fetch_cookies.is_empty() {
-        if let Ok(cookie_header) = reqwest::header::HeaderValue::from_str(&config.fetch_cookies) {
-            request = request.header(reqwest::header::COOKIE, cookie_header);
-        }
-    }
-
-    // Send request
-    let resp = request.send().await.map_err(|e| {
-        if e.is_timeout() { FetchError::Timeout }
-        else if e.is_connect() { FetchError::Network(format!("Connection failed: {}", e)) }
-        else { FetchError::Http(format!("Zhihu API request failed: {}", e)) }
-    })?;
-
-    let status = resp.status();
-    if status == 403 {
-        return Err(FetchError::Blocked(
-            "Zhihu API returned 403. d_c0 may be expired or you need z_c0 login cookie. \
-             Refresh cookies in browser and update your FETCH_COOKIES env var.".into()
-        ));
-    }
-    if !status.is_success() {
-        return Err(FetchError::HttpStatus(status.as_u16(), status.as_str().to_string()));
-    }
-
-    let bytes = resp.bytes().await
-        .map_err(|e| FetchError::Http(format!("Failed to read Zhihu API response: {}", e)))?;
-
-    let json: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| FetchError::Parse(format!("Zhihu API JSON: {}", e)))?;
-
-    // Extract title from JSON
+    // Title: questions carry `title`, answers carry `question.title`.
     let title = json.get("title")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -1234,8 +1284,21 @@ async fn fetch_zhihu(url: &str, host: &str, config: &Config) -> Result<FetchResu
         })
         .unwrap_or_default();
 
-    // Convert JSON to markdown
-    let content = zhihu_json_to_markdown(&json);
+    let mut content = zhihu_json_to_markdown(&json);
+
+    // A question object is only a title (plus an optional detail); the actual
+    // content lives in its answers. Pull the top few so the page is readable.
+    if let Some(qid) = zhihu_question_id(&parsed) {
+        let answers_url = format!(
+            "https://www.zhihu.com/api/v4/questions/{}/answers?include=data[*].content,data[*].author,data[*].voteup_count&limit=5&offset=0&sort_by=default",
+            qid
+        );
+        match zhihu_api_json(&client, &answers_url, &d_c0, &cookies, host).await {
+            Ok(answers) => content.push_str(&zhihu_answers_to_markdown(&answers)),
+            Err(e) => eprintln!("⚠️ zhihu answers fetch failed: {}", e),
+        }
+    }
+
     if content.trim().len() < MIN_CONTENT_LEN {
         return Err(FetchError::EmptyContent);
     }
@@ -1708,10 +1771,10 @@ async fn fetch_bilibili_buvid(client: &reqwest::Client) -> Option<String> {
     }
 }
 
-/// Compose the Cookie header: user cookies from FETCH_COOKIES, plus an
-/// anonymous buvid3 when the user's cookies don't include one.
+/// Compose the Cookie header: this host's stored cookies, plus an
+/// anonymous buvid3 when they don't include one.
 async fn build_bilibili_cookie(config: &Config, client: &reqwest::Client) -> String {
-    let mut cookie = config.fetch_cookies.clone();
+    let mut cookie = config.cookies_for("bilibili.com");
     if !cookie.contains("buvid3") {
         if let Some(buvid) = fetch_bilibili_buvid(client).await {
             if cookie.is_empty() { cookie = buvid; } else { cookie = format!("{}; {}", cookie, buvid); }
@@ -1873,8 +1936,9 @@ async fn fetch_csdn(url: &str, host: &str, config: &Config) -> Result<FetchResul
         .headers(build_headers(host))
         .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS));
 
-    if !config.fetch_cookies.is_empty() {
-        if let Ok(cookie_header) = reqwest::header::HeaderValue::from_str(&config.fetch_cookies) {
+    let cookies = config.cookies_for(host);
+    if !cookies.is_empty() {
+        if let Ok(cookie_header) = reqwest::header::HeaderValue::from_str(&cookies) {
             request = request.header(reqwest::header::COOKIE, cookie_header);
         }
     }
@@ -1924,8 +1988,9 @@ async fn fetch_direct(url: &str, config: &Config) -> Result<FetchResult, FetchEr
         .headers(build_headers(&domain))
         .timeout(Duration::from_secs(DIRECT_FETCH_TIMEOUT_SECS));
 
-    if !config.fetch_cookies.is_empty() {
-        if let Ok(cookie_header) = reqwest::header::HeaderValue::from_str(&config.fetch_cookies) {
+    let cookies = config.cookies_for(&domain);
+    if !cookies.is_empty() {
+        if let Ok(cookie_header) = reqwest::header::HeaderValue::from_str(&cookies) {
             request = request.header(reqwest::header::COOKIE, cookie_header);
         }
     }
@@ -2353,9 +2418,11 @@ async fn fetch_via_jina(url: &str, config: &Config) -> Result<FetchResult, Fetch
         .header("X-Timeout", "30")
         .header("X-Return-Format", "markdown");
 
-    // Forward user cookies to Jina so authenticated content is accessible
-    if !config.fetch_cookies.is_empty() {
-        req = req.header("X-Set-Cookie", &config.fetch_cookies);
+    // Forward this host's cookies to Jina so authenticated content is
+    // accessible. Only the matching domain's cookies leave the machine.
+    let cookies = config.cookies_for(&domain);
+    if !cookies.is_empty() {
+        req = req.header("X-Set-Cookie", &cookies);
     }
 
     let resp = req

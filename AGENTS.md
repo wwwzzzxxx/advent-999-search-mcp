@@ -3,10 +3,10 @@
 ## 项目概览
 
 Rust 编写的 MCP 服务器，提供三类工具：
-- **`web`** — 网络搜索（11 个引擎：exa, bing, csdn, juejin, startpage, sogou, weixin, dblp, cnki + 凭据门控的 deepseek, ieee）。v0.9.0 起：引擎**并发执行**（`tokio::task::JoinSet`，引擎以 `Arc<dyn SearchEngine>` 持有）、跨引擎 URL 去重、按请求过滤（freshness/topic/includeDomains/excludeDomains）。过滤能力按 `FreshnessTier` 三档如实上报：applied=exa/sogou/csdn/ieee（已实测生效）、best_effort=juejin/cnki/dblp/bing（bing 实测大陆出口无效果，仍照发参数）、unsupported=startpage/weixin
-- **`web_batch`** — 多主题批量搜索（v0.10.0 起，一个调用 N 个 query）。服务端把（query × engine）扇出到同一个 `JoinSet`，经 `src/throttle.rs` 限流：sogou/weixin 共用 1 permit 整次串行、dblp/startpage 各 cap 2、无状态引擎只受全局 32 cap。stdio 顶层 `tools/call` 也改为 spawn 并发处理（stdout 写加锁、按 id 配对），模型直接发多个 `web` 也能真并行；但多主题优先用一次 `web_batch`（单次往返 + 统一限流）
+- **`web`** — 网络搜索（11 个引擎：exa, bing, csdn, juejin, startpage, sogou, weixin, dblp, cnki + 凭据门控的 deepseek, ieee）。v0.9.0 起：引擎**并发执行**（`tokio::task::JoinSet`，引擎以 `Arc<dyn SearchEngine>` 持有）、跨引擎 URL 去重、按请求过滤（freshness/topic/includeDomains/excludeDomains）。过滤能力按 `FreshnessTier` 三档如实上报：applied=exa/sogou/csdn/ieee（已实测生效）、best_effort=juejin/cnki/dblp/bing（bing 实测大陆出口无效果，仍照发参数）、unsupported=startpage/weixin。v0.11.0 起**批量并入 `web`**：`queries`（1–10）与 `query` 同一工具，逐条独立报错（`{query, error}`），不再有 `web_batch` 工具
 - **`local`** — 本地文件搜索（Everything / es.exe，未配置时工具不出现）
-- **`get_page`** — 抓取网页正文（自动回退策略，支持需要登录 cookie 的站点；支持 find 服务端子串搜索模式，只返回匹配上下文窗口以省 token；支持 highlights 模式，按查询相关性返回最相关的 N 个片段）
+- **`get_page`** — 抓取网页正文（自动回退策略，支持需要登录 cookie 的站点；支持 find 服务端子串搜索模式，只返回匹配上下文窗口以省 token；支持 highlights 模式，按查询相关性返回最相关的 N 个片段）。v0.11.0 起支持 `urls`（1–10）批量抓取：按 host 限 1 并发、全局 6，单条失败不影响其他条；多 URL 时默认把 ~60k 字符总预算均分给各页
+- **`set_cookies`** — 本地**按域** Cookie 存储的 set/list/clear。每个条目绑定域名，请求只拿到自己 host 的 Cookie
 - get_page 的 find 模式在 `src/main.rs::handle_fetch` 实现：先正常抓取再做字面子串匹配（默认 ASCII 大小写不敏感）→ 合并重叠窗口 → 只返回 matches 上下文（带绝对字符偏移），忽略 startChar/endChar/maxLength，totalMatches 始终为全量命中数
 - get_page 的 YouTube 字幕在 `src/fetch.rs::fetch_youtube_subtitle` 实现：watch 页取 INNERTUBE_API_KEY → Innertube player API（ANDROID 20.10.38，WEB 会被 POT/BotGuard 拦）→ captionTracks 选轨（手动英文 > 手动任意 > 自动英文 > 首个）→ timedtext json3 转 SRT；强制走代理（不可进 DIRECT_DOMAINS），匿名即可；非视频页（channel/playlist）回落通用抓取
 
@@ -32,15 +32,17 @@ cargo build --release                # 产物 target/release/advent-999-search-m
 | `src/main.rs` | MCP 入口，JSON-RPC 消息循环，工具分发 |
 | `src/config.rs` | 全部配置均来自环境变量；`DEFAULT_DIRECT_DOMAINS` 默认国内直连域名表。完整环境变量清单见 [README.md 第 3 节](README.md)。门控要点：`EXA_API_KEY` 开 exa、`DEEPSEEK_API_KEY` 开 deepseek、`EVERYTHING_ES_PATH` 开 local 工具（未设置则 local 工具不注册）、`DEEPSEEK_MODEL` 覆盖模型名 |
 | `src/anubis.rs` | **Anubis 工作量证明反爬求解器**（dblp / startpage 都用）。`detect()` 从 `<script id="anubis_challenge">` 取 `randomData`/`id`/`difficulty`；`solve()` 多线程暴力找 nonce 使 `sha256hex(randomData + nonce)` 有 `difficulty` 个**前导零十六进制位**；`pass()` GET `/.within.website/x/cmd/anubis/api/pass-challenge` 拿 auth cookie（**client 必须 `cookie_store(true)`**）。cookie 名随站点前缀变化（dblp=`dblp_org-auth-*`、startpage=`spchal-auth`），靠 jar 自动处理，勿写死名字 |
-| `src/cookie_cache.rs` | **短时反爬 Cookie 的本地缓存**（搜狗 SNUID 等）。文件在 `%LOCALAPPDATA%\advent-mcp\cookie-cache.json`（**仓库外**），按 mtime 判断变更 → **重新播种后下次搜索即生效，无需重启**。`filter_cookie_header()` 只保留引擎需要的 cookie；`fingerprint()` 输出不可逆指纹（`SNUID(D04E…1AF4, len 32)`）供日志使用，**永不打印真实值**。配套 CLI：`tests/manual/seed_cookies.py`（`--show` / `--path` / `--clear` / `--stdin` / `--file`） |
-| `src/throttle.rs` | **并行限流**（v0.10.0 起）：跨引擎永远并发，引擎族内限流。`sogou`+`weixin` 共用 1 个 permit（同一后端信任桶，整次 search 串行）；`dblp`/`startpage` 各 2 个（Anubis PoW 满核求解，防 CPU 争抢）；其余无状态引擎只受全局 32 并发 cap。`deepseek-go` 另有 python 子进程 2 并发 cap（`deepseek.rs::GO_PY_SEM`）。`web`/`web_batch` 的每个 engine 调用都经 `throttle::acquire` 持证执行 |
+| `src/cookie_cache.rs` | **按域 Cookie 存储**（v0.11.0 起取代原先的两个独立通道）。文件在 `%LOCALAPPDATA%\advent-mcp\cookie-cache.json`（**仓库外**），v2 格式 `{version, entries:{domain:{cookies,saved_at,source}}}`，v1（`{"sogou":{...}}`）读时自动迁移。请求只拿自己 host 的 Cookie（`cookies_for_host` + `merge_for_host`，后缀匹配、父域更长者优先），所以登录态不会泄漏给无关站点。`FETCH_COOKIES` 仍是入口，但按 cookie 名归属拆域名（`seed_env`），**无法识别归属的名字直接丢弃**。`filter_cookie_header()` 给引擎收窄名字；`list()` 只暴露名字/字节数，永不返回值。配套 CLI：`tests/manual/seed_cookies.py`（`--show` / `--path` / `--clear` / `--stdin` / `--file`） |
+| `src/browser_cookies.rs` | **可选浏览器导入**（`ADVENT_ALLOW_COOKIE_IMPORT=1` 才注册 `import_cookies`）。用独立 `--user-data-dir`（`%LOCALAPPDATA%\advent-mcp\edge-profile`）启动 `msedge.exe` + `--remote-debugging-port=0`，读 `DevToolsActivePort`，手写 WebSocket（无新依赖）连 CDP，`Storage.getCookies`（失败回落 `Network.getAllCookies`）。**两阶段**：先 `--headless=new` 无窗口探测，已够用就直接返回（绝不为了读 Cookie 弹窗）；只有缺「可用会话」且 `waitSeconds>0` 才开有头窗口登录——可用性按关键 Cookie 判定（zhihu `z_c0`、bilibili `SESSDATA`、sogou `SNUID`，其他站点任意 Cookie），见 `key_cookie()`。不走 DPAPI、不读 Cookie DB、不注入：当前 Edge 用 App-Bound Encryption（v20），而且运行中的 Cookies 文件对普通进程 EACCES；Chromium 136+ 还不允许默认 profile 开调试端口。整个导入用 `IMPORT_LOCK` 串行。收尾用 CDP `Browser.close`，兜底按 profile 路径杀 `msedge.exe`（**别只 kill 启动器 PID**——它会交接给真正的浏览器进程后自己退出） |
+| `src/fetch_log.rs` | **可选抓取日志**（`ADVENT_FETCH_LOG=1`，路径可用 `ADVENT_FETCH_LOG_PATH` 覆盖，默认 `%LOCALAPPDATA%\advent-mcp\fetch-log.jsonl`）。每次 `get_page` 的每个 URL 一行 JSON：ts/url/host/site/mode/ok/status/totalChars/returnedChars/truncated/ms/via/cookies/cookieNames/batch/index/retried/error。**只记 Cookie 名，不记值**；8 MB 轮转一次。由 `main.rs::fetch_one` 统一写入，成功/失败都写 |
+| `src/throttle.rs` | **并行限流**（v0.10.0 起）：跨引擎永远并发，引擎族内限流。`sogou`+`weixin` 共用 1 个 permit（同一后端信任桶，整次 search 串行）；`dblp`/`startpage` 各 2 个（Anubis PoW 满核求解，防 CPU 争抢）；其余无状态引擎只受全局 32 并发 cap。`deepseek-go` 另有 python 子进程 2 并发 cap（`deepseek.rs::GO_PY_SEM`）。`web`（含 `queries` 批量）的每个 engine 调用都经 `throttle::acquire` 持证执行 |
 | `src/models.rs` | `SearchResult`（含 `summary: Option<String>`、`engines: Vec<String>`，均按需跳过序列化）、`SearchError`、`SearchResponse`（含 `duplicatesRemoved` 与 `filters` 元数据）等。**注意**：给 `SearchResult` 加字段必须同步所有构造点（各 engine 内共 12 处，均带 `engines: Vec::new()`） |
 | `src/filters.rs` | 按请求过滤：`Freshness`（day/week/month/year 或 `YYYY-MM-DD..YYYY-MM-DD`）、`Topic`、`SearchOptions`、`FreshnessTier`（applied/best_effort/unsupported），以及不依赖 chrono 的 civil date 换算（`days_from_civil`/`civil_from_days`）。时间窗口按 **UTC** 计算 |
 | `src/dedupe.rs` | URL 规范化 + 精确去重。`canonical_url()` 先拆 Bing `/ck/` 跳转壳，再统一 scheme/host/尾斜杠/去 fragment，**只删已知追踪参数**（列表见 `TRACKING_PARAMS`），**绝不砍整个 query string**（否则 B 站 `?p=2` 会被误合并——这是照抄 Tavily `split('?')[0]` 的坑）。不做内容级去重 |
 | `src/snippets.rs` | `get_page` 的 highlights 片段排序（`highlight()`）。纯本地无 LLM：ASCII 按词、CJK 按 bigram 匹配，窗口按**不同查询词覆盖数优先**打分，偏移为字符级半开区间 |
 | `src/engines/mod.rs` | `SearchEngine` trait、`create_engine_map()`、`credential_gated_engines()` |
 | `src/engines/*.rs` | 各引擎实现 |
-| `src/fetch.rs` | HTTP 抓取与正文提取：代理/直连分流、cookie、超时。**~2300 行大文件**，含 ElementRef→markdown 转换管线、zhihu 签名抓取（zhihu_sign）、反爬回退策略。改动前务必通读相关段落，勿盲目重写。定位入口：`fetch_url` 按域名分流——zhihu → `fetch_zhihu`（需 `FETCH_COOKIES` + `d_c0` 签名）、weixin → `fetch_weixin_article`、sogou 微信跳转 → `fetch_sogou_weixin_link`、YouTube 视频（watch/shorts/live/embed/youtu.be）→ `fetch_youtube_subtitle`（Innertube ANDROID client，自建强制走代理的 reqwest client，**不可**用 `build_fetch_client` 因为 youtube 绝不能进 DIRECT_DOMAINS；youtube-nocookie.com 无视频 id，直接回落通用抓取）、bilibili 视频 → `fetch_bilibili_subtitle`（`bilibili_api_get` 浏览器头过 WAF，`finger/spi` 补 buvid3；SESSDATA 缺失时字幕列表为空属正常）、GitHub issue/PR（`github.com/{owner}/{repo}/issues|pull/{n}`）→ 页面抓取后追加 `fetch_github_comments`（公开 REST API 免鉴权 60 req/h，评论是客户端渲染的，best-effort 失败不影响正文）、其他 → `fetch_direct` 失败/低质量再 `fetch_via_jina` |
+| `src/fetch.rs` | HTTP 抓取与正文提取：代理/直连分流、cookie、超时。**~2300 行大文件**，含 ElementRef→markdown 转换管线、zhihu 签名抓取（zhihu_sign）、反爬回退策略。改动前务必通读相关段落，勿盲目重写。定位入口：`fetch_url` 按域名分流——zhihu → `fetch_zhihu`（签名 API，需要 `d_c0` **且** 登录态 `z_c0`；2026-10 实测匿名只返回 `403 need_login`。问题页会再请求 `/api/v4/questions/{id}/answers` 补前 5 个回答；文章/回答走 `content`，问题走 `detail`）、weixin → `fetch_weixin_article`、sogou 微信跳转 → `fetch_sogou_weixin_link`、YouTube 视频（watch/shorts/live/embed/youtu.be）→ `fetch_youtube_subtitle`（Innertube ANDROID client，自建强制走代理的 reqwest client，**不可**用 `build_fetch_client` 因为 youtube 绝不能进 DIRECT_DOMAINS；youtube-nocookie.com 无视频 id，直接回落通用抓取）、bilibili 视频 → `fetch_bilibili_subtitle`（`bilibili_api_get` 浏览器头过 WAF，`finger/spi` 补 buvid3；SESSDATA 缺失时字幕列表为空属正常）、GitHub issue/PR（`github.com/{owner}/{repo}/issues|pull/{n}`）→ 页面抓取后追加 `fetch_github_comments`（公开 REST API 免鉴权 60 req/h，评论是客户端渲染的，best-effort 失败不影响正文）、其他 → `fetch_direct` 失败/低质量再 `fetch_via_jina` |
 | `src/local_search.rs` | Everything 本地搜索（es.exe）——Windows 专属；Linux/macOS 上无 es.exe，`EVERYTHING_ES_PATH` 未设置时 local 工具自动不注册 |
 | `src/python_embed.rs` | 内嵌 Python 运行时（**Windows**：解压 `python-embed.zip` 到 `%LOCALAPPDATA%`；**Linux/macOS**：直接返回系统 `python3`，需装 requests，不嵌入 zip） |
 | `scripts/prepare_python_embed.ps1` | 下载 Python 3.12 embeddable + 安装 requests，重打包为 `python-embed.zip` |
@@ -108,14 +110,16 @@ cargo build --release                # 产物 target/release/advent-999-search-m
 - **Anubis 实测技巧**：挑战页是 **gzip 压缩**的，curl/python 直接看原始字节会漏判（看不到 "anubis"），必须 `--compressed` 或先解压；`difficulty` 单位是**十六进制位数**（JS `Math.pow(16, -difficulty)`）不是 bit
 - sogou 的验证码是**入口 IP 级累积风控**：被封后叫用户做一次人机验证，再用 `set_cookies` 工具或 `tests/manual/seed_cookies.py` 写入 Cookie 缓存（**不要用环境变量**——用户 2026-09-10 明确要求短时 Cookie 走缓存文件，这样刷新无需重启）
 
-### 3. 两种 Cookie 的分工（不要混用）
-| | `FETCH_COOKIES`（env） | cookie 缓存（文件） |
-|---|---|---|
-| 用途 | 长期**登录**凭证（知乎 `d_c0`、B站 `SESSDATA`），`fetch.rs` 用 | 短时**反爬**凭证（搜狗 `SNUID`/`SUV`），`sogou.rs`/`weixin.rs` 用 |
-| 加载 | 启动时读一次（改了必须重启） | 按 mtime 重读（**改了立即生效**） |
-| 位置 | 用户 MCP 配置 | `%LOCALAPPDATA%\advent-mcp\cookie-cache.json` |
-- 两者都在**仓库外**；日志只允许打印 `fingerprint()` 结果
-- 对应 MCP 工具 `set_cookies`（`src/main.rs::handle_set_cookies`）
+### 3. Cookie 的三种来源（不要混用）
+| | `FETCH_COOKIES`（env） | cookie 存储（文件） | `import_cookies`（工具） |
+|---|---|---|---|
+| 用途 | 旧式长期**登录**凭证（知乎 `d_c0`、B站 `SESSDATA`） | 任意域名的 set/list/clear，长短期都能放 | 从专用 Edge profile 自动取指定域名 |
+| 加载 | 启动时读一次（改了必须重启） | 按 mtime 重读（**改了立即生效**） | 调用时写文件，立即生效 |
+| 位置 | 用户 MCP 配置 | `%LOCALAPPDATA%\advent-mcp\cookie-cache.json` | `%LOCALAPPDATA%\advent-mcp\edge-profile` |
+- 三者在**仓库外**；日志只允许打印 cookie 名/数量（旧 `fingerprint()` 仍保留给测试/工具）
+- 环境变量入口会按 cookie 名拆域名，未知名字丢弃并告警；新增站点请用 `set_cookies` 显式指定 domain
+- `import_cookies` 默认不注册，须 `ADVENT_ALLOW_COOKIE_IMPORT=1`；它不读用户日常 Edge
+- 对应 MCP 工具：`set_cookies`（`src/main.rs::handle_set_cookies`）、`import_cookies`（`src/main.rs::handle_import_cookies`）
 
 ## 添加新引擎的工作流
 

@@ -9,6 +9,8 @@ mod fetch;
 mod python_embed;
 mod anubis;
 mod cookie_cache;
+mod browser_cookies;
+mod fetch_log;
 mod throttle;
 
 use config::Config;
@@ -37,6 +39,9 @@ async fn main() {
         eprintln!("🔍 Allowed engines: {}", config.allowed_search_engines.join(", "));
     }
     eprintln!("🔍 Default engine: {}", config.default_search_engine);
+    if let Some(path) = fetch_log::path() {
+        eprintln!("📝 get_page fetch log: {}", path.display());
+    }
     if config.use_proxy {
         if let Some(ref url) = config.proxy_url {
             eprintln!("🌐 Using proxy: {}", url);
@@ -94,7 +99,7 @@ async fn main() {
                         },
                         "serverInfo": {
                             "name": "advent-999-search-mcp",
-                            "version": "0.10.0"
+                            "version": "0.11.0"
                         }
                     }
                 });
@@ -219,7 +224,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
     let search_tool = serde_json::json!({
         "name": "web",
         "description": format!(
-            "Search the web using these engines: {}. Academic search tips: use dblp for CS papers, cnki for Chinese papers, ieee for IEEE Xplore; then pass any arXiv ID / URL or paper links from results to get_page to read the full text. WeChat article results (weixin.sogou.com/link?url=...) can also be passed directly to get_page. searchMode meanings: omit or set auto to use the server configured SEARCH_MODE; request forces request-based search; playwright forces browser-based search. For multiple topics, prefer ONE web_batch call over parallel web calls: engines run concurrently across queries, while sogou/weixin (shared trust bucket) serialize and dblp/startpage are capped, so batching is faster and less likely to trigger captchas.",
+            "Search the web using these engines: {}. Academic search tips: use dblp for CS papers, cnki for Chinese papers, ieee for IEEE Xplore; then pass any arXiv ID / URL or paper links from results to get_page to read the full text. WeChat article results (weixin.sogou.com/link?url=...) can also be passed directly to get_page. searchMode meanings: omit or set auto to use the server configured SEARCH_MODE; request forces request-based search; playwright forces browser-based search. For several topics pass `queries` (up to 10) in ONE call instead of several web calls: the server fans out (query x engine) concurrently under one per-engine throttle, which saves round-trips and, on clients that run tool calls one at a time, is simply faster. Each topic's results come back separately; a bad topic does not lose the others.",
             engines_desc
         ),
         "inputSchema": {
@@ -227,11 +232,18 @@ fn list_tools(config: &Config) -> Vec<Value> {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query"
+                    "description": "Search query for a single topic. Use either `query` or `queries`, not both."
+                },
+                "queries": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "description": "Several topics in one call (1-10). Same options apply to all of them. Returns one result object per topic, in input order; an invalid or failing topic is reported as {query, error} and does not abort the rest."
                 },
                 "limit": {
                     "type": "number",
-                    "description": "Max results (1-50)",
+                    "description": "Max results per query (1-50)",
                     "default": 10
                 },
                 "engines": {
@@ -270,7 +282,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
                     "default": true
                 }
             },
-            "required": ["query"]
+            "required": []
         }
     });
 
@@ -311,17 +323,24 @@ fn list_tools(config: &Config) -> Vec<Value> {
 
     let fetch_tool = serde_json::json!({
         "name": "get_page",
-        "description": "Fetch the content of a web page and extract its readable text. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). Bilibili video URLs (bilibili.com/video/BVxxx, optional ?p=N for multi-part videos) return the subtitle track as SRT — requires SESSDATA in FETCH_COOKIES, since Bilibili only serves the subtitle list to logged-in users. YouTube video URLs (youtube.com/watch?v=ID, /shorts/ID, /live/ID, /embed/ID, youtu.be/ID) return the caption track as SRT — anonymous, no login needed (needs proxy egress outside mainland). For academic papers: search first with web (engines: dblp, cnki, ieee, exa), then use this tool to read the full text. To read long content in chunks, pass startChar/endChar (0-based character offsets; the response includes totalLength so you can continue with startChar=endChar of the previous call). To avoid reading the full text, pass find (a literal substring): the server searches the fetched text and returns only the matching contexts — much cheaper than pulling the whole page and scanning it yourself. In find mode startChar/endChar/maxLength are ignored; the response carries matches (merged context windows, each with the hits inside) plus totalMatches instead of content. The response includes statusCode — non-200 (e.g. 404) means the target returned an error page. XML (RSS/Atom/sitemap) and text/plain (markdown/robots.txt) are returned verbatim without HTML extraction. Uses proxy if configured. Returns the page title and extracted content as markdown. Hyperlinks are stripped to their visible text by default; pass includeLinks:true to keep [text](url).",
+        "description": "Fetch the content of a web page and extract its readable text. Zhihu requires a logged-in session in the cookie store (d_c0 + z_c0; import it once with import_cookies); question pages are expanded with their top answers. One call can fetch several URLs: pass `urls` (up to 10) instead of `url`; each URL comes back as its own object, a failing URL does not abort the others, and the default maxLength is split into a total budget of ~60k characters so a batch cannot blow up the context. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). Bilibili video URLs (bilibili.com/video/BVxxx, optional ?p=N for multi-part videos) return the subtitle track as SRT — requires stored SESSDATA cookies, since Bilibili only serves the subtitle list to logged-in users. YouTube video URLs (youtube.com/watch?v=ID, /shorts/ID, /live/ID, /embed/ID, youtu.be/ID) return the caption track as SRT — anonymous, no login needed (needs proxy egress outside mainland). For academic papers: search first with web (engines: dblp, cnki, ieee, exa), then use this tool to read the full text. To read long content in chunks, pass startChar/endChar (0-based character offsets, applied per URL; the response includes totalLength so you can continue with startChar=endChar of the previous call). To avoid reading the full text, pass find (a literal substring): the server searches the fetched text and returns only the matching contexts — much cheaper than pulling the whole page and scanning it yourself. In find mode startChar/endChar/maxLength are ignored; the response carries matches (merged context windows, each with the hits inside) plus totalMatches instead of content. The response includes statusCode — non-200 (e.g. 404) means the target returned an error page. XML (RSS/Atom/sitemap) and text/plain (markdown/robots.txt) are returned verbatim without HTML extraction. Uses proxy if configured. Returns the page title and extracted content as markdown. Hyperlinks are stripped to their visible text by default; pass includeLinks:true to keep [text](url).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "URL to fetch, or an arXiv paper ID"
+                    "description": "URL to fetch, or an arXiv paper ID. Use either `url` or `urls`, not both."
+                },
+                "urls": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "description": "Several URLs (or arXiv IDs) to fetch in one call. Fetched concurrently (one request per host at a time). Returns {count, results:[...]} with one object per URL in input order."
                 },
                 "maxLength": {
                     "type": "number",
-                    "description": "Maximum characters to return (default: 50000, max: 200000)",
+                    "description": "Maximum characters to return per URL (max 200000). Default: 50000 for one URL, and a ~60000-character total budget split across `urls` for several.",
                     "default": 50000
                 },
                 "startChar": {
@@ -367,155 +386,368 @@ fn list_tools(config: &Config) -> Vec<Value> {
                     "default": false
                 }
             },
-            "required": ["url"]
+            "required": []
         }
     });
 
-    // Session-cookie seeding for captcha-walled engines (sogou / weixin).
-    //
-    // Sogou rate-limits by egress IP and answers with a "请依次点击" click
-    // captcha. A human solves it in a browser; the resulting SNUID cookie is
-    // then replayed. Storing it via a tool (rather than an env var) means a
-    // refresh takes effect on the next search, with no server restart.
+    // Per-domain cookie store. Two jobs:
+    //  - short-lived anti-bot cookies (Sogou SNUID) refreshed without a restart;
+    //  - long-lived login cookies (Bilibili SESSDATA, Zhihu d_c0) used by
+    //    get_page, scoped so they are only sent to their own domain.
     let set_cookies_tool = serde_json::json!({
         "name": "set_cookies",
-        "description": "Store fresh browser session cookies for captcha-walled engines (sogou, weixin). Use when search reports a Sogou verification page: solve the captcha in a browser, read document.cookie, and pass it here. Values are filtered down to the cookies the engines need, then cached locally (outside the repo) and picked up on the next search — no restart. The tool reports only a non-reversible fingerprint, never the values.",
+        "description": "Manage the local, domain-scoped cookie store used by search engines and get_page. action=set (default): paste a Cookie header value from the browser for ONE domain — required after solving a Sogou captcha (SNUID) or to give get_page a login session (bilibili.com SESSDATA, zhihu.com d_c0). action=list: show which domains have cookies (names only, never values). action=clear: forget one domain, or every domain with domain=\"*\". Values are cached outside the repo and take effect on the next request — no restart. With ADVENT_ALLOW_COOKIE_IMPORT=1 an `import_cookies` tool is also available to pull cookies from a dedicated browser profile automatically.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cookies": {
+                "action": {
                     "type": "string",
-                    "description": "Cookie header value, e.g. \"SNUID=...; SUV=...; SUID=...; ABTEST=...; IPLOC=...\" (the whole document.cookie dump is fine; unrelated cookies are dropped)"
+                    "enum": ["set", "list", "clear"],
+                    "description": "set (default) | list | clear"
+                },
+                "domain": {
+                    "type": "string",
+                    "description": "Domain that owns the cookies, e.g. \"sogou.com\", \"bilibili.com\", \"zhihu.com\" (subdomains match too). Short aliases sogou/weixin/bilibili/zhihu are accepted. Required for set and clear; use \"*\" with clear to remove everything."
                 },
                 "site": {
                     "type": "string",
-                    "description": "Which engine the cookies belong to (default: sogou, shared with weixin)",
-                    "default": "sogou"
+                    "description": "Deprecated alias for domain (default: sogou.com, shared by the sogou and weixin engines)."
+                },
+                "cookies": {
+                    "type": "string",
+                    "description": "Cookie header value, e.g. \"SNUID=...; SUV=...\" or \"SESSDATA=...\". A whole document.cookie dump is fine. Required for action=set."
                 }
             },
-            "required": ["cookies"]
+            "required": []
         }
     });
 
-    // Batched parallel search: one call, N topics. The server fans out
-    // (query × engine) concurrently with per-family throttling
-    // (sogou/weixin serialize, dblp/startpage capped, the rest unbounded
-    // up to a global cap), so this is faster and safer than N parallel
-    // `web` calls. Each item mirrors `web` arguments.
-    let batch_tool = serde_json::json!({
-        "name": "web_batch",
-        "description": format!(
-            "Search multiple topics in one call (parallel backend). Same engines as web ({}). Use this instead of parallel web calls when you have several queries: cross-engine work runs concurrently while rate-limited engines (sogou/weixin share one permit; dblp/startpage capped) stay safe. Returns one result object per query in input order.",
-            engines_desc
-        ),
+    // Optional (opt-in) browser import. Registered only when the user set
+    // ADVENT_ALLOW_COOKIE_IMPORT=1: it is a credential-access capability and
+    // should be gated separately from pasting a cookie.
+    let import_cookies_tool = serde_json::json!({
+        "name": "import_cookies",
+        "description": "Read cookies for specific domains from a dedicated Edge profile via the DevTools protocol. It probes the profile HEADLESSLY first (no window at all): if every requested domain already has a usable session (zhihu z_c0, bilibili SESSDATA, sogou SNUID, or any cookie for other sites) the cookies are stored and nothing is opened. Only when a login is missing and waitSeconds > 0 does it show an Edge window for the user to log in, waits, then stores the cookies and closes it. It never touches the user's everyday browser profile and only keeps the requested domains. Disabled unless the server was started with ADVENT_ALLOW_COOKIE_IMPORT=1. Warn the user before calling it in a way that can open a window (waitSeconds > 0 and a login may be missing).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "queries": {
+                "domains": {
                     "type": "array",
-                    "description": "Topics to search (1-10). Each item takes the same arguments as web.",
+                    "items": { "type": "string" },
                     "minItems": 1,
-                    "maxItems": 10,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "query": { "type": "string", "description": "Search query" },
-                            "limit": { "type": "number", "description": "Max results (1-50)", "default": 10 },
-                            "engines": {
-                                "type": "array",
-                                "items": engine_schema.clone(),
-                                "description": "Search engines to use"
-                            },
-                            "freshness": {
-                                "type": "string",
-                                "description": "day | week | month | year, or YYYY-MM-DD..YYYY-MM-DD"
-                            },
-                            "topic": {
-                                "type": "string",
-                                "enum": ["news", "general"]
-                            },
-                            "includeDomains": {
-                                "type": "array",
-                                "items": { "type": "string" }
-                            },
-                            "excludeDomains": {
-                                "type": "array",
-                                "items": { "type": "string" }
-                            },
-                            "dedupe": {
-                                "type": "boolean",
-                                "description": "Fold duplicate URLs (default true)",
-                                "default": true
-                            }
-                        },
-                        "required": ["query"]
-                    }
+                    "maxItems": 5,
+                    "description": "Domains to import, e.g. [\"bilibili.com\"], [\"zhihu.com\", \"sogou.com\"]. No wildcards; each is matched with its subdomains."
+                },
+                "loginUrl": {
+                    "type": "string",
+                    "description": "Page to open for logging in (default: https://<domain>/ for each domain)."
+                },
+                "waitSeconds": {
+                    "type": "number",
+                    "description": "How long to wait for the login before giving up (default 90, max 300). Cookies already present are returned immediately.",
+                    "default": 90
+                },
+                "keepOpen": {
+                    "type": "boolean",
+                    "description": "Leave the Edge window open after importing (default false).",
+                    "default": false
                 }
             },
-            "required": ["queries"]
+            "required": ["domains"]
         }
     });
 
-    let mut tools = vec![search_tool, batch_tool, fetch_tool, set_cookies_tool];
+    let mut tools = vec![search_tool, fetch_tool, set_cookies_tool];
+    if config.cookie_import_enabled {
+        tools.push(import_cookies_tool);
+    }
     if find_es_exe().is_some() {
         tools.insert(1, local_tool);
     }
     tools
 }
 
-/// Handle `set_cookies`: filter, validate, and persist to the cookie cache.
+/// Manage the domain-scoped cookie store: set / list / clear.
 fn handle_set_cookies(args: &Value) -> String {
     use crate::cookie_cache;
 
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("set")
+        .trim()
+        .to_lowercase();
+
+    match action.as_str() {
+        "list" => {
+            let rows = cookie_cache::list();
+            let out = serde_json::json!({
+                "status": "ok",
+                "count": rows.len(),
+                "entries": rows,
+                "cache_file": cookie_cache::cache_path().display().to_string(),
+                "note": "Values are never returned. Use action=clear with a domain to forget one.",
+            });
+            serde_json::to_string_pretty(&out).unwrap_or_default()
+        }
+        "clear" => {
+            let raw_domain = args
+                .get("domain")
+                .or_else(|| args.get("site"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if raw_domain.is_empty() {
+                return json_error("set_cookies(action=clear) requires a `domain` (or \"*\" for everything)");
+            }
+            if raw_domain == "*" {
+                return match cookie_cache::clear_all() {
+                    Ok(n) => serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "ok",
+                        "cleared": "*",
+                        "removedEntries": n,
+                    }))
+                    .unwrap_or_default(),
+                    Err(e) => json_error(&format!("Failed to update the cookie store: {}", e)),
+                };
+            }
+            let domain = match cookie_cache::canonical_domain(raw_domain) {
+                Some(d) => d,
+                None => return json_error(&format!("'{}' is not a valid cookie domain", raw_domain)),
+            };
+            match cookie_cache::clear(&domain) {
+                Ok(removed) => serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "ok",
+                    "domain": domain,
+                    "removed": removed,
+                }))
+                .unwrap_or_default(),
+                Err(e) => json_error(&format!("Failed to update the cookie store: {}", e)),
+            }
+        }
+        _ => set_cookie_entry(args),
+    }
+}
+
+fn set_cookie_entry(args: &Value) -> String {
+    use crate::cookie_cache;
+
     let raw = args.get("cookies").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let site = args.get("site").and_then(|v| v.as_str()).unwrap_or("sogou").trim();
+    let raw_domain = args
+        .get("domain")
+        .or_else(|| args.get("site"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("sogou")
+        .trim();
 
     if raw.is_empty() {
         return json_error("set_cookies requires a non-empty `cookies` argument");
     }
-    if site.is_empty() {
-        return json_error("set_cookies requires a non-empty `site` argument");
-    }
-
-    // Sending unrelated cookies (bilibili SESSDATA, zhihu d_c0, ...) to every
-    // host is itself a bot signal, so narrow to what Sogou's trust check needs.
-    const NAMES: &[&str] = &["SNUID", "SUV", "SUID", "ABTEST", "IPLOC", "cuid", "PHPSESSID"];
-    let filtered = match cookie_cache::filter_cookie_header(raw, NAMES) {
-        Some(f) => f,
+    let domain = match cookie_cache::canonical_domain(raw_domain) {
+        Some(d) => d,
         None => {
-            return json_error(
-                "None of the expected cookies were found. Sogou needs at least `SNUID` \
-                 (issued only after solving the captcha in a browser) plus `SUV`/`SUID`. \
-                 Copy `document.cookie` from a page you just passed the captcha on.",
-            )
+            return json_error(&format!(
+                "'{}' is not a valid cookie domain — pass one like \"bilibili.com\" or \"zhihu.com\"",
+                raw_domain
+            ))
         }
     };
 
-    if !filtered.to_uppercase().contains("SNUID=") {
+    // Sogou's trust check only needs its own handful of names; a 30-cookie
+    // grab-bag is itself a bot signal. Other domains keep everything the user
+    // pasted (still capped), because we cannot know what their site needs.
+    let stored = if crate::cookie_cache::domain_matches("sogou.com", &domain) {
+        const SOGOU_NAMES: &[&str] =
+            &["SNUID", "SUV", "SUID", "ABTEST", "IPLOC", "cuid", "PHPSESSID"];
+        let filtered = match cookie_cache::filter_cookie_header(raw, SOGOU_NAMES) {
+            Some(f) => f,
+            None => {
+                return json_error(
+                    "None of the expected Sogou cookies were found. Sogou needs at least `SNUID` \
+                     (issued only after solving the captcha in a browser) plus `SUV`/`SUID`. \
+                     Copy `document.cookie` from a page you just passed the captcha on.",
+                )
+            }
+        };
+        if !filtered.to_uppercase().contains("SNUID=") {
+            return json_error(
+                "No `SNUID` in the supplied cookies. SNUID is issued only after the \
+                 captcha is solved — make sure you copied document.cookie from the \
+                 browser session that passed it.",
+            );
+        }
+        filtered
+    } else {
+        let pairs = cookie_cache::cookie_pairs(raw);
+        if pairs.is_empty() {
+            return json_error("`cookies` contains no name=value pairs");
+        }
+        if pairs.len() > 50 {
+            return json_error("Refusing to store more than 50 cookies for one domain; \
+                               paste only what that site needs.");
+        }
+        let header: Vec<String> = pairs
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        let header = header.join("; ");
+        if header.len() > 8192 {
+            return json_error("Cookie header exceeds 8 KB — paste only the cookies that site needs");
+        }
+        header
+    };
+
+    let domain = match cookie_cache::put(&domain, &stored, "paste") {
+        Ok(d) => d,
+        Err(e) => return json_error(&format!("Failed to write the cookie store: {}", e)),
+    };
+
+    let names = cookie_cache::cookie_names(&stored);
+    let sogou = crate::cookie_cache::domain_matches("sogou.com", &domain);
+    let out = serde_json::json!({
+        "status": "ok",
+        "domain": domain,
+        "site": domain,
+        "stored": names,
+        "cache_file": cookie_cache::cache_path().display().to_string(),
+        "note": if sogou {
+            "Takes effect on the next search — no restart needed. \
+             Sogou's SNUID typically lasts ~20 minutes."
+        } else {
+            "Takes effect on the next request to this domain or its subdomains — no restart needed. \
+             Cookies are never sent to any other host."
+        },
+    });
+    serde_json::to_string_pretty(&out).unwrap_or_default()
+}
+
+/// Handle `import_cookies` (only registered when ADVENT_ALLOW_COOKIE_IMPORT=1).
+async fn handle_import_cookies(args: &Value, config: &Config) -> String {
+    use crate::cookie_cache;
+
+    if !config.cookie_import_enabled {
         return json_error(
-            "No `SNUID` in the supplied cookies. SNUID is issued only after the \
-             captcha is solved — make sure you copied document.cookie from the \
-             browser session that passed it.",
+            "import_cookies is disabled. Set ADVENT_ALLOW_COOKIE_IMPORT=1 in the MCP server \
+             environment and restart the client.",
         );
     }
 
-    if let Err(e) = cookie_cache::put(site, &filtered) {
-        return json_error(&format!("Failed to write the cookie cache: {}", e));
+    let mut domains: Vec<String> = Vec::new();
+    for raw in string_list(&args["domains"]) {
+        match cookie_cache::canonical_domain(&raw) {
+            Some(d) => {
+                if !domains.contains(&d) {
+                    domains.push(d);
+                }
+            }
+            None => return json_error(&format!("'{}' is not a valid domain", raw)),
+        }
+    }
+    if domains.is_empty() {
+        return json_error("import_cookies requires `domains` (1-5 entries)");
+    }
+    if domains.len() > 5 {
+        return json_error("At most 5 domains per import; run it twice for more");
     }
 
-    let names: Vec<&str> = filtered
-        .split(';')
-        .filter_map(|p| p.split('=').next())
-        .map(|s| s.trim())
-        .collect();
+    let req = crate::browser_cookies::ImportRequest {
+        domains: domains.clone(),
+        login_url: args
+            .get("loginUrl")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        wait_secs: (args["waitSeconds"].as_f64().unwrap_or(90.0) as u64).min(300),
+        keep_open: args["keepOpen"].as_bool().unwrap_or(false),
+    };
+    eprintln!(
+        "🔓 import_cookies: opening Edge profile for {} (wait {}s)",
+        domains.join(", "),
+        req.wait_secs
+    );
+
+    let outcome = match tokio::task::spawn_blocking(move || crate::browser_cookies::import(&req)).await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return json_error(&format!("Cookie import failed: {}", e)),
+        Err(e) => return json_error(&format!("Cookie import task failed: {}", e)),
+    };
+
+    // Group by the requested domain, first value wins on duplicates.
+    let mut written: Vec<Value> = Vec::new();
+    for domain in &domains {
+        let mut seen: Vec<String> = Vec::new();
+        let mut pairs: Vec<String> = Vec::new();
+        for c in &outcome.cookies {
+            let host = c.domain.trim_start_matches('.');
+            if !cookie_cache::domain_matches(host, domain) {
+                continue;
+            }
+            if seen.iter().any(|n| n == &c.name) {
+                continue;
+            }
+            let pair = format!("{}={}", c.name, c.value);
+            if reqwest::header::HeaderValue::from_str(&pair).is_err() {
+                continue;
+            }
+            seen.push(c.name.clone());
+            pairs.push(pair);
+        }
+        let key = crate::browser_cookies::key_cookie(domain);
+        let usable = match key {
+            Some(k) => seen.iter().any(|n| n.eq_ignore_ascii_case(k)),
+            None => !pairs.is_empty(),
+        };
+        if pairs.is_empty() {
+            written.push(serde_json::json!({
+                "domain": domain,
+                "count": 0,
+                "stored": [],
+                "usable": false,
+                "missingKey": key,
+                "note": "No cookies found — were you logged in in the window that opened?",
+            }));
+            continue;
+        }
+        match cookie_cache::put(domain, &pairs.join("; "), "browser") {
+            Ok(_) => {
+                let mut row = serde_json::json!({
+                    "domain": domain,
+                    "count": pairs.len(),
+                    "stored": seen,
+                    "usable": usable,
+                });
+                if !usable {
+                    if let Some(k) = key {
+                        row["missingKey"] = serde_json::json!(k);
+                    }
+                }
+                written.push(row);
+            }
+            Err(e) => written.push(serde_json::json!({
+                "domain": domain,
+                "error": e,
+            })),
+        }
+    }
+
+    let has_missing = written.iter().any(|v| {
+        v["count"].as_u64() == Some(0) || v["usable"].as_bool() == Some(false)
+    });
 
     let out = serde_json::json!({
         "status": "ok",
-        "site": site,
-        "stored": names,
+        "profile": outcome.profile.display().to_string(),
+        "domains": written,
         "cache_file": cookie_cache::cache_path().display().to_string(),
-        "note": "Takes effect on the next search — no restart needed. \
-                 Sogou's SNUID typically lasts ~20 minutes.",
+        "note": if !has_missing {
+            "Cookies are stored per domain and take effect immediately. \
+             The import window closes automatically unless keepOpen was set."
+        } else {
+            "Some domains still need a login (see usable/missingKey). Call import_cookies again \
+             with waitSeconds > 0 and log in in the Edge window it opens; the profile keeps the \
+             session for next time."
+        },
     });
     serde_json::to_string_pretty(&out).unwrap_or_default()
 }
@@ -532,10 +764,10 @@ async fn handle_tool_call(
 ) -> String {
     match name {
         "web" => handle_web_search(args, config, engine_map).await,
-        "web_batch" => handle_web_batch(args, config, engine_map).await,
         "local" => handle_local_search(args),
         "get_page" => handle_fetch(args, config).await,
         "set_cookies" => handle_set_cookies(args),
+        "import_cookies" => handle_import_cookies(args, config).await,
         _ => {
             let err = serde_json::json!({
                 "error": format!("Unknown tool: {}", name)
@@ -563,9 +795,23 @@ async fn handle_web_search(
     config: &Config,
     engine_map: &[Arc<dyn SearchEngine>],
 ) -> String {
+    // One tool, two shapes: `queries` for several topics in one call, `query`
+    // for the common single-topic case.
+    let batch = args
+        .get("queries")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if batch {
+        if args.get("query").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            return json_error("Use either `query` (single) or `queries` (several), not both");
+        }
+        return handle_web_queries(args, config, engine_map).await;
+    }
+
     let query = args["query"].as_str().unwrap_or("").to_string();
     if query.trim().is_empty() {
-        return json_error("Query must not be empty");
+        return json_error("Query must not be empty (pass `query`, or `queries` for several topics)");
     }
 
     let limit = std::cmp::min(args["limit"].as_f64().unwrap_or(10.0) as usize, 50);
@@ -741,20 +987,17 @@ async fn handle_web_search(
 /// `throttle::acquire`, so sogou/weixin serialize on their shared permit
 /// while stateless engines overlap freely. Per-query assembly (ordering,
 /// dedupe, domain filters, `filters` meta) mirrors `handle_web_search`.
-async fn handle_web_batch(
+async fn handle_web_queries(
     args: &Value,
     config: &Config,
     engine_map: &[Arc<dyn SearchEngine>],
 ) -> String {
-    let items = match args.get("queries").and_then(|v| v.as_array()) {
-        Some(a) => a.clone(),
-        None => return json_error("web_batch requires a `queries` array (1-10 items)"),
-    };
-    if items.is_empty() {
-        return json_error("queries must not be empty");
+    let raw_items = args.get("queries").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if raw_items.is_empty() {
+        return json_error("`queries` must not be empty");
     }
-    if items.len() > 10 {
-        return json_error("queries supports at most 10 topics per call; split into two web_batch calls");
+    if raw_items.len() > 10 {
+        return json_error("`queries` supports at most 10 topics per call; split into two calls");
     }
 
     struct SubQuery {
@@ -767,14 +1010,48 @@ async fn handle_web_batch(
         do_dedupe: bool,
     }
 
-    let mut subs: Vec<SubQuery> = Vec::with_capacity(items.len());
-    for (i, item) in items.iter().enumerate() {
-        let query = item["query"].as_str().unwrap_or("").to_string();
+    /// One entry of the batch: either a runnable query or a per-item error.
+    struct Prepared {
+        label: String,
+        sub: Option<SubQuery>,
+        error: Option<String>,
+    }
+
+    // A query item may be a bare string (the common form) or an object that
+    // overrides any top-level option. Invalid items become per-item errors so
+    // one typo cannot lose the other nine topics.
+    let mut subs: Vec<Prepared> = Vec::with_capacity(raw_items.len());
+    for (i, item) in raw_items.iter().enumerate() {
+        let pick = |key: &str| -> Value {
+            item.get(key)
+                .cloned()
+                .or_else(|| args.get(key).cloned())
+                .unwrap_or(Value::Null)
+        };
+        let query = match item {
+            Value::String(s) => s.clone(),
+            _ => pick("query").as_str().unwrap_or("").to_string(),
+        };
+        let label = if query.trim().is_empty() {
+            format!("(item {})", i)
+        } else {
+            query.clone()
+        };
         if query.trim().is_empty() {
-            return json_error(&format!("queries[{}].query must not be empty", i));
+            subs.push(Prepared {
+                label,
+                sub: None,
+                error: Some(format!("queries[{}].query must not be empty", i)),
+            });
+            continue;
         }
-        let limit = std::cmp::min(item["limit"].as_f64().unwrap_or(10.0) as usize, 50).max(1);
-        let requested: Vec<String> = item["engines"]
+
+        let limit = std::cmp::min(
+            pick("limit").as_f64().unwrap_or(10.0) as usize,
+            50,
+        )
+        .max(1);
+        let requested: Vec<String> = pick("engines")
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -784,44 +1061,66 @@ async fn handle_web_batch(
             })
             .unwrap_or_else(|| vec![config.default_search_engine.clone()]);
         let resolved = config.resolve_engines(&requested);
-        let freshness = match item.get("freshness").and_then(|v| v.as_str()) {
+
+        let freshness = match pick("freshness").as_str() {
             Some(raw) => match Freshness::parse(raw) {
                 Some(f) => Some(f),
                 None => {
-                    return json_error(&format!(
-                        "queries[{}].freshness must be one of day|week|month|year, or a range like 2026-01-01..2026-02-01", i
-                    ))
+                    subs.push(Prepared {
+                        label,
+                        sub: None,
+                        error: Some(format!(
+                            "queries[{}].freshness must be day|week|month|year, or a range like 2026-01-01..2026-02-01",
+                            i
+                        )),
+                    });
+                    continue;
                 }
             },
             None => None,
         };
-        let topic = match item.get("topic").and_then(|v| v.as_str()) {
+        let topic = match pick("topic").as_str() {
             Some(raw) => match Topic::parse(raw) {
                 Some(t) => Some(t),
-                None => return json_error(&format!("queries[{}].topic must be news or general", i)),
+                None => {
+                    subs.push(Prepared {
+                        label,
+                        sub: None,
+                        error: Some(format!("queries[{}].topic must be news or general", i)),
+                    });
+                    continue;
+                }
             },
             None => None,
         };
-        subs.push(SubQuery {
-            query,
-            limit,
-            engines: resolved,
-            opts: SearchOptions {
-                freshness,
-                topic,
-                include_domains: string_list(&item["includeDomains"]),
-                exclude_domains: string_list(&item["excludeDomains"]),
-            },
-            include_domains: string_list(&item["includeDomains"]),
-            exclude_domains: string_list(&item["excludeDomains"]),
-            do_dedupe: item["dedupe"].as_bool().unwrap_or(true),
+
+        let include_domains = string_list(&pick("includeDomains"));
+        let exclude_domains = string_list(&pick("excludeDomains"));
+        subs.push(Prepared {
+            label,
+            sub: Some(SubQuery {
+                query,
+                limit,
+                engines: resolved,
+                opts: SearchOptions {
+                    freshness,
+                    topic,
+                    include_domains: include_domains.clone(),
+                    exclude_domains: exclude_domains.clone(),
+                },
+                include_domains,
+                exclude_domains,
+                do_dedupe: pick("dedupe").as_bool().unwrap_or(true),
+            }),
+            error: None,
         });
     }
 
     eprintln!(
         "Batch searching {} topics: {}",
-        subs.len(),
+        subs.iter().filter(|p| p.sub.is_some()).count(),
         subs.iter()
+            .filter_map(|p| p.sub.as_ref())
             .map(|s| format!("{:?}({})", s.query, s.engines.join("+")))
             .collect::<Vec<_>>()
             .join("; ")
@@ -829,7 +1128,8 @@ async fn handle_web_batch(
 
     // ── fan out (query × engine) ─────────────────────────────────────────
     let mut set = tokio::task::JoinSet::new();
-    for (qi, sub) in subs.iter().enumerate() {
+    for (qi, entry) in subs.iter().enumerate() {
+        let Some(sub) = entry.sub.as_ref() else { continue };
         let n_engines = sub.engines.len();
         let per_engine = if n_engines > 0 { sub.limit / n_engines } else { sub.limit };
         let remainder = if n_engines > 0 { sub.limit % n_engines } else { 0 };
@@ -878,7 +1178,7 @@ async fn handle_web_batch(
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok((qi, name, Ok(results))) => {
-                eprintln!("✅ [{}] {} returned {} results", subs[qi].query, name, results.len());
+                eprintln!("✅ [{}] {} returned {} results", subs[qi].label, name, results.len());
                 collected[qi].insert(name, Ok(results));
             }
             Ok((qi, name, Err(err))) => {
@@ -890,7 +1190,7 @@ async fn handle_web_batch(
                         message: format!("Unsupported search engine: {}", name),
                     });
                 } else {
-                    eprintln!("⚠️ [{}] {} search failed: {}", subs[qi].query, name, msg);
+                    eprintln!("⚠️ [{}] {} search failed: {}", subs[qi].label, name, msg);
                     collected[qi].insert(name, Err(msg));
                 }
             }
@@ -902,7 +1202,17 @@ async fn handle_web_batch(
 
     // ── reassemble per query, in input order ─────────────────────────────
     let mut out_queries = Vec::with_capacity(subs.len());
-    for (qi, sub) in subs.iter().enumerate() {
+    for (qi, entry) in subs.iter().enumerate() {
+        let sub = match entry.sub.as_ref() {
+            Some(s) => s,
+            None => {
+                out_queries.push(serde_json::json!({
+                    "query": entry.label,
+                    "error": entry.error.clone().unwrap_or_default(),
+                }));
+                continue;
+            }
+        };
         let mut all_results = Vec::new();
         let mut partial_failures = unsupported[qi].clone();
         for name in &sub.engines {
@@ -1060,16 +1370,181 @@ fn handle_local_search(args: &Value) -> String {
     }
 }
 
+/// Per-URL token budget, so a 10-URL call cannot dump half a million
+/// characters into the caller's context.
+struct FetchBudget {
+    max_length: usize,
+    max_matches: usize,
+    max_highlights: usize,
+}
+
+/// Collect `url` / `urls`, de-duplicated and capped.
+fn collect_urls(args: &Value) -> Result<Vec<String>, String> {
+    let mut urls: Vec<String> = Vec::new();
+    if let Some(u) = args.get("url").and_then(|v| v.as_str()) {
+        let u = u.trim();
+        if !u.is_empty() {
+            urls.push(u.to_string());
+        }
+    }
+    if let Some(arr) = args.get("urls").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(u) = v.as_str() {
+                let u = u.trim();
+                if !u.is_empty() && !urls.iter().any(|x| x == u) {
+                    urls.push(u.to_string());
+                }
+            }
+        }
+    }
+    if urls.is_empty() {
+        return Err("URL must not be empty (pass `url`, or `urls` for several)".to_string());
+    }
+    if urls.len() > 10 {
+        return Err(format!(
+            "At most 10 URLs per call ({} given); split into two calls",
+            urls.len()
+        ));
+    }
+    Ok(urls)
+}
+
+/// Concurrency limits for multi-URL fetches: at most one request per host and
+/// a small global cap, so ten links to one site do not look like an attack.
+static FETCH_GLOBAL_SEM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+static FETCH_HOST_SEMS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
+> = std::sync::OnceLock::new();
+
+async fn fetch_permits(
+    url: &str,
+) -> (
+    tokio::sync::OwnedSemaphorePermit,
+    tokio::sync::OwnedSemaphorePermit,
+) {
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| url.to_string());
+    let host_sem = {
+        let mut guard = FETCH_HOST_SEMS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard
+            .entry(host)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone()
+    };
+    let host_permit = host_sem
+        .acquire_owned()
+        .await
+        .expect("fetch host semaphore closed");
+    let global_sem = FETCH_GLOBAL_SEM
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(6)))
+        .clone();
+    let global_permit = global_sem
+        .acquire_owned()
+        .await
+        .expect("fetch global semaphore closed");
+    (host_permit, global_permit)
+}
+
 async fn handle_fetch(args: &Value, config: &Config) -> String {
-    let url = args["url"].as_str().unwrap_or("").to_string();
-    if url.trim().is_empty() {
-        return serde_json::to_string_pretty(&serde_json::json!({
-            "error": "URL must not be empty"
-        })).unwrap_or_default();
+    let urls = match collect_urls(args) {
+        Ok(u) => u,
+        Err(e) => return json_error(&e),
+    };
+
+    // Validate these once: they would otherwise fail identically in every
+    // per-URL task.
+    if args.get("find").is_some() && args["find"].as_str().unwrap_or("").is_empty() {
+        return json_error("find must not be empty");
+    }
+    if args.get("highlights").is_some() && args["highlights"].as_str().unwrap_or("").trim().is_empty()
+    {
+        return json_error("highlights must not be empty");
     }
 
-    let max_length = args["maxLength"].as_f64().unwrap_or(50000.0) as usize;
-    let max_length = std::cmp::min(max_length, 200000);
+    let n = urls.len();
+    let explicit_max = args["maxLength"].as_f64().map(|v| v as usize);
+    let max_length = match explicit_max {
+        Some(m) => m.clamp(1, 200_000),
+        // Several URLs: split a single ~60k-character budget instead of
+        // handing each page the full 50k default.
+        None if n > 1 => (60_000 / n).clamp(4_000, 50_000),
+        None => 50_000,
+    };
+    let max_matches = match args["maxMatches"].as_f64() {
+        Some(m) => (m as usize).clamp(1, 50),
+        None if n > 1 => (20 / n).max(3),
+        None => 20,
+    };
+    let max_highlights = match args["maxHighlights"].as_f64() {
+        Some(m) => (m as usize).clamp(1, 20),
+        None if n > 1 => 2,
+        None => 5,
+    };
+    let budget = FetchBudget { max_length, max_matches, max_highlights };
+
+    if n == 1 {
+        let value = fetch_one(&urls[0], args, config, &budget, 1, 1).await;
+        return serde_json::to_string_pretty(&value).unwrap_or_default();
+    }
+
+    eprintln!("🌐 Fetching {} URLs concurrently", n);
+    let mut set = tokio::task::JoinSet::new();
+    for (i, url) in urls.iter().cloned().enumerate() {
+        let args = args.clone();
+        let config = config.clone();
+        let budget_len = budget.max_length;
+        let budget_matches = budget.max_matches;
+        let budget_highlights = budget.max_highlights;
+        set.spawn(async move {
+            let _permits = fetch_permits(&url).await;
+            let b = FetchBudget {
+                max_length: budget_len,
+                max_matches: budget_matches,
+                max_highlights: budget_highlights,
+            };
+            (i, fetch_one(&url, &args, &config, &b, n, i + 1).await)
+        });
+    }
+
+    let mut slots: Vec<Option<Value>> = (0..n).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((i, value)) => slots[i] = Some(value),
+            Err(e) => eprintln!("⚠️ fetch task panicked: {}", e),
+        }
+    }
+
+    let results: Vec<Value> = slots
+        .into_iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            slot.unwrap_or_else(|| {
+                serde_json::json!({
+                    "url": urls[i],
+                    "error": "fetch task failed",
+                })
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&serde_json::json!({
+        "count": results.len(),
+        "results": results,
+    }))
+    .unwrap_or_default()
+}
+
+/// Fetch and shape one URL. The returned object matches the single-URL
+/// response shape exactly (content / find / highlights modes), plus per-URL
+/// errors which never abort a batch.
+async fn fetch_one(url: &str, args: &Value, config: &Config, budget: &FetchBudget, batch: usize, index: usize) -> Value {
+    let max_length = budget.max_length;
 
     // Optional character-range reading (0-based, half-open [start, end)).
     let start_char = args["startChar"].as_f64().unwrap_or(0.0) as usize;
@@ -1082,210 +1557,298 @@ async fn handle_fetch(args: &Value, config: &Config) -> String {
 
     // One automatic retry on timeout — Sogou redirect chains occasionally
     // exceed the fetch timeout on the first attempt.
-    let mut fetch_result = fetch::fetch_url(&url, config).await;
+    let mode = if args.get("find").is_some() {
+        "find"
+    } else if args.get("highlights").is_some() {
+        "highlights"
+    } else {
+        "content"
+    };
+    let started = std::time::Instant::now();
+
+    // Stored cookie names for this host (names only — the log must never
+    // contain a usable credential).
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let cookie_names = crate::cookie_cache::cookie_names(&config.cookies_for(&host));
+
+    let retried = std::sync::atomic::AtomicBool::new(false);
+    let log = |site: &str,
+               ok: bool,
+               status: Option<u16>,
+               error: Option<&str>,
+               total_chars: usize,
+               returned_chars: usize,
+               truncated: bool,
+               via: &str| {
+        crate::fetch_log::write(&crate::fetch_log::Entry {
+            url,
+            host: &host,
+            site,
+            mode,
+            ok,
+            status,
+            error,
+            total_chars,
+            returned_chars,
+            truncated,
+            duration_ms: started.elapsed().as_millis(),
+            via,
+            cookie_names: cookie_names.clone(),
+            index,
+            batch,
+            retried: retried.load(std::sync::atomic::Ordering::Relaxed),
+        });
+    };
+
+    // One automatic retry on timeout — Sogou redirect chains occasionally
+    // exceed the fetch timeout on the first attempt.
+    let mut fetch_result = fetch::fetch_url(url, config).await;
     if matches!(fetch_result, Err(fetch::FetchError::Timeout)) {
         eprintln!("⏱️ Timeout on first attempt, retrying once...");
-        fetch_result = fetch::fetch_url(&url, config).await;
+        retried.store(true, std::sync::atomic::Ordering::Relaxed);
+        fetch_result = fetch::fetch_url(url, config).await;
     }
 
-    match fetch_result {
-        Ok(result) => {
-            let full = fetch::apply_link_policy(result.content, &result.content_type, keep_links);
-            let total = full.chars().count();
-
-            // ── find mode: literal substring search over the fetched text ──
-            // Returns only merged context windows around matches, so callers
-            // don't have to pull the full page and scan it with attention.
-            // startChar/endChar/maxLength are ignored in this mode.
-            if args.get("find").is_some() {
-                let needle = args["find"].as_str().unwrap_or("");
-                if needle.is_empty() {
-                    return serde_json::to_string_pretty(&serde_json::json!({
-                        "error": "find must not be empty"
-                    })).unwrap_or_default();
-                }
-                let context_chars = (args["contextChars"].as_f64().unwrap_or(200.0) as usize).min(2000);
-                let max_matches = (args["maxMatches"].as_f64().unwrap_or(20.0) as usize).clamp(1, 50);
-                let match_case = args["matchCase"].as_bool().unwrap_or(false);
-
-                let hay: Vec<char> = full.chars().collect();
-                let pat: Vec<char> = needle.chars().collect();
-                let mut hits: Vec<(usize, usize)> = Vec::new();
-                if pat.len() <= hay.len() {
-                    for i in 0..=hay.len() - pat.len() {
-                        let mut ok = true;
-                        for j in 0..pat.len() {
-                            let (c, p) = (hay[i + j], pat[j]);
-                            if c != p && (match_case || !c.eq_ignore_ascii_case(&p)) {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if ok {
-                            hits.push((i, i + pat.len()));
-                        }
-                    }
-                }
-                let total_matches = hits.len();
-                eprintln!("🔎 find {:?} → {} matches (case={})", needle, total_matches, match_case);
-
-                // Merge overlapping/adjacent context windows.
-                let mut windows: Vec<(usize, usize)> = Vec::new();
-                for (s, e) in &hits {
-                    let ws = s.saturating_sub(context_chars);
-                    let we = std::cmp::min(e + context_chars, total);
-                    if let Some(last) = windows.last_mut() {
-                        if ws <= last.1 {
-                            last.1 = last.1.max(we);
-                            continue;
-                        }
-                    }
-                    windows.push((ws, we));
-                }
-                let total_windows = windows.len();
-                let truncated = total_windows > max_matches;
-                windows.truncate(max_matches);
-
-                // Attribute hits to their (possibly merged) window.
-                let mut matches = Vec::new();
-                let mut hi = 0;
-                for (ws, we) in &windows {
-                    let mut win_hits = Vec::new();
-                    while hi < hits.len() && hits[hi].0 < *we {
-                        // Defensive: skip any hit ending before this window.
-                        if hits[hi].1 > *ws {
-                            win_hits.push(serde_json::json!({
-                                "startChar": hits[hi].0,
-                                "endChar": hits[hi].1,
-                            }));
-                        }
-                        hi += 1;
-                    }
-                    let context: String = hay[*ws..*we].iter().collect();
-                    matches.push(serde_json::json!({
-                        "startChar": ws,
-                        "endChar": we,
-                        "hits": win_hits,
-                        "context": context,
-                    }));
-                }
-
-                let mut response = serde_json::json!({
-                    "url": result.url,
-                    "title": result.title,
-                    "site": result.site_name,
-                    "contentType": result.content_type,
-                    "statusCode": result.status_code,
-                    "find": needle,
-                    "matchCase": match_case,
-                    "contextChars": context_chars,
-                    "totalLength": total,
-                    "totalMatches": total_matches,
-                    "totalWindows": total_windows,
-                    "truncated": truncated,
-                    "matches": matches,
-                });
-                if total_matches == 0 {
-                    response["hint"] = serde_json::json!(
-                        "No matches found. Try different keywords (find is a literal substring, case-insensitive by default) or fetch the full content without find."
-                    );
-                }
-                return serde_json::to_string_pretty(&response).unwrap_or_default();
-            }
-
-            // ── highlights mode: rank passages against a query ──────────────
-            // Like find, but instead of an exact literal it takes a query and
-            // returns the passages that cover the most distinct query terms.
-            // Purely local; startChar/endChar/maxLength/find are ignored.
-            if args.get("highlights").is_some() {
-                let hq = args["highlights"].as_str().unwrap_or("");
-                if hq.trim().is_empty() {
-                    return json_error("highlights must not be empty");
-                }
-                let context_chars = (args["contextChars"].as_f64().unwrap_or(200.0) as usize).min(2000);
-                let max_highlights = (args["maxHighlights"].as_f64().unwrap_or(5.0) as usize).clamp(1, 20);
-
-                let snips = snippets::highlight(&full, hq, context_chars, max_highlights);
-                eprintln!("✨ highlights {:?} → {} snippets", hq, snips.len());
-
-                let snippets_json: Vec<Value> = snips
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "startChar": s.start_char,
-                            "endChar": s.end_char,
-                            "score": s.score,
-                            "terms": s.terms,
-                            "context": s.context,
-                        })
-                    })
-                    .collect();
-
-                let mut response = serde_json::json!({
-                    "url": result.url,
-                    "title": result.title,
-                    "site": result.site_name,
-                    "contentType": result.content_type,
-                    "statusCode": result.status_code,
-                    "highlights": hq,
-                    "contextChars": context_chars,
-                    "totalLength": total,
-                    "totalSnippets": snips.len(),
-                    "snippets": snippets_json,
-                });
-                if snips.is_empty() {
-                    response["hint"] = serde_json::json!(
-                        "No query terms matched this page. Try different keywords, or fetch the full content without highlights."
-                    );
-                }
-                return serde_json::to_string_pretty(&response).unwrap_or_default();
-            }
-            let start = std::cmp::min(start_char, total);
-            let end = match end_char {
-                Some(e) => std::cmp::min(e, total),
-                None => std::cmp::min(start + max_length, total),
-            };
-            let window_len = end.saturating_sub(start);
-            let window_len = std::cmp::min(window_len, max_length);
-
-            let mut content: String = full.chars().skip(start).take(window_len).collect();
-
-            // Truncate if the window itself exceeds max_length (defensive).
-            let chars_len = content.chars().count();
-            if chars_len > max_length {
-                content = content.chars().take(max_length).collect::<String>();
-            }
-
-            // Note when we are not at the end of the document.
-            let actual_end = start + content.chars().count();
-            let truncated = actual_end < total;
-            if truncated {
-                content.push_str(&format!(
-                    "\n\n... [内容较长，已读取第 {}–{} 字符，共 {} 字符。继续读取请调用 get_page 并传 startChar={}]\n",
-                    start, actual_end, total, actual_end
-                ));
-            }
-
-            let response = serde_json::json!({
-                "url": result.url,
-                "title": result.title,
-                "site": result.site_name,
-                "content": content,
-                "contentType": result.content_type,
-                "statusCode": result.status_code,
-                "startChar": start,
-                "endChar": actual_end,
-                "totalLength": total,
-            });
-
-            serde_json::to_string_pretty(&response).unwrap_or_default()
-        }
+    let result = match fetch_result {
+        Ok(result) => result,
         Err(e) => {
             eprintln!("❌ Fetch failed for {}: {}", url, e);
-            serde_json::to_string_pretty(&serde_json::json!({
+            log("", false, None, Some(&e.to_string()), 0, 0, false, "");
+            return serde_json::json!({
                 "url": url,
                 "error": e.to_string()
-            })).unwrap_or_default()
+            });
         }
+    };
+
+    let full = fetch::apply_link_policy(result.content, &result.content_type, keep_links);
+    let total = full.chars().count();
+
+    // ── find mode: literal substring search over the fetched text ──
+    // Returns only merged context windows around matches, so callers don't
+    // have to pull the full page and scan it with attention.
+    // startChar/endChar/maxLength are ignored in this mode.
+    if args.get("find").is_some() {
+        let needle = args["find"].as_str().unwrap_or("");
+        if needle.is_empty() {
+            return serde_json::json!({ "url": result.url, "error": "find must not be empty" });
+        }
+        let context_chars = (args["contextChars"].as_f64().unwrap_or(200.0) as usize).min(2000);
+        let max_matches = budget.max_matches;
+        let match_case = args["matchCase"].as_bool().unwrap_or(false);
+
+        let hay: Vec<char> = full.chars().collect();
+        let pat: Vec<char> = needle.chars().collect();
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        if pat.len() <= hay.len() {
+            for i in 0..=hay.len() - pat.len() {
+                let mut ok = true;
+                for j in 0..pat.len() {
+                    let (c, p) = (hay[i + j], pat[j]);
+                    if c != p && (match_case || !c.eq_ignore_ascii_case(&p)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    hits.push((i, i + pat.len()));
+                }
+            }
+        }
+        let total_matches = hits.len();
+        eprintln!(
+            "🔎 find {:?} → {} matches (case={})",
+            needle, total_matches, match_case
+        );
+
+        // Merge overlapping/adjacent context windows.
+        let mut windows: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in &hits {
+            let ws = s.saturating_sub(context_chars);
+            let we = std::cmp::min(e + context_chars, total);
+            if let Some(last) = windows.last_mut() {
+                if ws <= last.1 {
+                    last.1 = last.1.max(we);
+                    continue;
+                }
+            }
+            windows.push((ws, we));
+        }
+        let total_windows = windows.len();
+        let truncated = total_windows > max_matches;
+        windows.truncate(max_matches);
+
+        // Attribute hits to their (possibly merged) window.
+        let mut matches = Vec::new();
+        let mut hi = 0;
+        for (ws, we) in &windows {
+            let mut win_hits = Vec::new();
+            while hi < hits.len() && hits[hi].0 < *we {
+                // Defensive: skip any hit ending before this window.
+                if hits[hi].1 > *ws {
+                    win_hits.push(serde_json::json!({
+                        "startChar": hits[hi].0,
+                        "endChar": hits[hi].1,
+                    }));
+                }
+                hi += 1;
+            }
+            let context: String = hay[*ws..*we].iter().collect();
+            matches.push(serde_json::json!({
+                "startChar": ws,
+                "endChar": we,
+                "hits": win_hits,
+                "context": context,
+            }));
+        }
+
+        let mut response = serde_json::json!({
+            "url": result.url,
+            "title": result.title,
+            "site": result.site_name,
+            "contentType": result.content_type,
+            "statusCode": result.status_code,
+            "find": needle,
+            "matchCase": match_case,
+            "contextChars": context_chars,
+            "totalLength": total,
+            "totalMatches": total_matches,
+            "totalWindows": total_windows,
+            "truncated": truncated,
+            "matches": matches,
+        });
+        if total_matches == 0 {
+            response["hint"] = serde_json::json!(
+                "No matches found. Try different keywords (find is a literal substring, case-insensitive by default) or fetch the full content without find."
+            );
+        }
+        let returned: usize = matches
+            .iter()
+            .filter_map(|m| m["context"].as_str().map(|c| c.chars().count()))
+            .sum();
+        log(
+            &result.site_name,
+            true,
+            Some(result.status_code),
+            None,
+            total,
+            returned,
+            truncated,
+            &result.via,
+        );
+        return response;
     }
+
+    // ── highlights mode: rank passages against a query ──
+    // Like find, but instead of an exact literal it takes a query and returns
+    // the passages that cover the most distinct query terms. Purely local;
+    // startChar/endChar/maxLength/find are ignored.
+    if args.get("highlights").is_some() {
+        let hq = args["highlights"].as_str().unwrap_or("");
+        if hq.trim().is_empty() {
+            return serde_json::json!({ "url": result.url, "error": "highlights must not be empty" });
+        }
+        let context_chars = (args["contextChars"].as_f64().unwrap_or(200.0) as usize).min(2000);
+        let max_highlights = budget.max_highlights;
+
+        let snips = snippets::highlight(&full, hq, context_chars, max_highlights);
+        eprintln!("✨ highlights {:?} → {} snippets", hq, snips.len());
+
+        let snippets_json: Vec<Value> = snips
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "startChar": s.start_char,
+                    "endChar": s.end_char,
+                    "score": s.score,
+                    "terms": s.terms,
+                    "context": s.context,
+                })
+            })
+            .collect();
+
+        let mut response = serde_json::json!({
+            "url": result.url,
+            "title": result.title,
+            "site": result.site_name,
+            "contentType": result.content_type,
+            "statusCode": result.status_code,
+            "highlights": hq,
+            "contextChars": context_chars,
+            "totalLength": total,
+            "totalSnippets": snips.len(),
+            "snippets": snippets_json,
+        });
+        if snips.is_empty() {
+            response["hint"] = serde_json::json!(
+                "No query terms matched this page. Try different keywords, or fetch the full content without highlights."
+            );
+        }
+        let returned: usize = snips.iter().map(|s| s.context.chars().count()).sum();
+        log(
+            &result.site_name,
+            true,
+            Some(result.status_code),
+            None,
+            total,
+            returned,
+            false,
+            &result.via,
+        );
+        return response;
+    }
+
+    let start = std::cmp::min(start_char, total);
+    let end = match end_char {
+        Some(e) => std::cmp::min(e, total),
+        None => std::cmp::min(start + max_length, total),
+    };
+    let window_len = end.saturating_sub(start);
+    let window_len = std::cmp::min(window_len, max_length);
+
+    let mut content: String = full.chars().skip(start).take(window_len).collect();
+
+    // Truncate if the window itself exceeds max_length (defensive).
+    let chars_len = content.chars().count();
+    if chars_len > max_length {
+        content = content.chars().take(max_length).collect::<String>();
+    }
+
+    // Note when we are not at the end of the document.
+    let actual_end = start + content.chars().count();
+    let truncated = actual_end < total;
+    if truncated {
+        content.push_str(&format!(
+            "\n\n... [内容较长，已读取第 {}–{} 字符，共 {} 字符。继续读取请调用 get_page 并传 startChar={}]\n",
+            start, actual_end, total, actual_end
+        ));
+    }
+
+    let returned = content.chars().count();
+    log(
+        &result.site_name,
+        true,
+        Some(result.status_code),
+        None,
+        total,
+        returned,
+        truncated,
+        &result.via,
+    );
+
+    serde_json::json!({
+        "url": result.url,
+        "title": result.title,
+        "site": result.site_name,
+        "content": content,
+        "contentType": result.content_type,
+        "statusCode": result.status_code,
+        "startChar": start,
+        "endChar": actual_end,
+        "totalLength": total,
+        "truncated": truncated,
+    })
 }

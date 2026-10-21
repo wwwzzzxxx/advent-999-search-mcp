@@ -26,7 +26,10 @@ pub struct Config {
     pub use_proxy: bool,
     /// Domain substrings that must bypass the proxy (mainland direct access).
     pub direct_domains: Vec<String>,
-    pub fetch_cookies: String,
+    /// Cookies seeded from the legacy `FETCH_COOKIES` env var, already split
+    /// by owning domain. Requests only receive the entries matching their own
+    /// host — see [`Config::cookies_for`].
+    pub env_cookies: Vec<(String, String)>,
     pub fetch_timeout_secs: u64,
     /// DeepSeek web-search key — either DeepSeek official API key
     /// (`sk-` + 32 hex, 35 chars) or an OpenCode Go subscription key
@@ -49,6 +52,9 @@ pub struct Config {
     /// matching the observed lifetime of Sogou's `SNUID`.
     /// Override with `COOKIE_CACHE_TTL` (0 disables the warning).
     pub cookie_cache_ttl_secs: u64,
+    /// Whether the `import_cookies` tool is available. Off unless
+    /// `ADVENT_ALLOW_COOKIE_IMPORT=1`; the tool is then not even registered.
+    pub cookie_import_enabled: bool,
 }
 
 impl Config {
@@ -74,9 +80,30 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
         };
-        let fetch_cookies = env::var("FETCH_COOKIES").unwrap_or_default();
-        if !fetch_cookies.is_empty() {
-            eprintln!("🍪 Loaded {} bytes of cookies from FETCH_COOKIES env var", fetch_cookies.len());
+        // Long-lived login cookies. The env var is a flat, domain-less blob, so
+        // it is split by cookie owner here; unknown names are dropped and
+        // reported instead of being sprayed across every fetched host.
+        let raw_fetch_cookies = env::var("FETCH_COOKIES").unwrap_or_default();
+        let (env_cookies, unknown_cookies) = crate::cookie_cache::seed_env(&raw_fetch_cookies);
+        if !raw_fetch_cookies.is_empty() {
+            let domains: Vec<String> = env_cookies
+                .iter()
+                .map(|(d, h)| {
+                    format!("{} ({})", d, crate::cookie_cache::cookie_names(h).join(","))
+                })
+                .collect();
+            eprintln!(
+                "🍪 FETCH_COOKIES: {} bytes, scoped to {}",
+                raw_fetch_cookies.len(),
+                if domains.is_empty() { "no known domain".to_string() } else { domains.join("; ") }
+            );
+            if !unknown_cookies.is_empty() {
+                eprintln!(
+                    "⚠️ FETCH_COOKIES: dropped unrecognized cookies (no known owner domain): {}. \
+                     Store them per domain with set_cookies instead.",
+                    unknown_cookies.join(",")
+                );
+            }
         }
         let fetch_timeout = env::var("FETCH_TIMEOUT")
             .ok()
@@ -120,6 +147,16 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1200);
 
+        // Browser cookie import is a credential-access capability, so it is
+        // off unless the user explicitly turns it on. When off the tool is not
+        // registered at all.
+        let cookie_import_enabled = env::var("ADVENT_ALLOW_COOKIE_IMPORT")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        if cookie_import_enabled {
+            eprintln!("🔓 ADVENT_ALLOW_COOKIE_IMPORT=1: import_cookies tool enabled");
+        }
+
         // Anti-bot session cookies (sogou/weixin SNUID & friends) live in a
         // small local file rather than an env var, so refreshing them takes
         // effect on the next search instead of requiring a restart.
@@ -134,13 +171,28 @@ impl Config {
             proxy_url,
             use_proxy,
             direct_domains,
-            fetch_cookies,
+            env_cookies,
             fetch_timeout_secs: fetch_timeout,
             deepseek_api_key,
             deepseek_api_mode,
             ieee_api_key,
             cookie_cache_ttl_secs,
+            cookie_import_enabled,
         }
+    }
+
+    /// `Cookie:` header value to send to `host`, or an empty string.
+    ///
+    /// Only entries whose domain is `host` or a parent of it are included, so
+    /// a Bilibili session never reaches an unrelated site. Cache entries
+    /// override env-seeded ones on name collisions (the cache is the fresher
+    /// source: `set_cookies` / `import_cookies` write there).
+    pub fn cookies_for(&self, host: &str) -> String {
+        crate::cookie_cache::merge_for_host(
+            &self.env_cookies,
+            &crate::cookie_cache::cookies_for_host(host),
+            host,
+        )
     }
 
     /// Whether the DeepSeek engine is available (DEEPSEEK_API_KEY env var set).
