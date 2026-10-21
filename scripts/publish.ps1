@@ -118,16 +118,17 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $ExePath)) { Fail "找不到 $ExePath（可用 -SkipBuild 跳过构建）" }
 Ok "二进制: $ExePath ($((Get-Item $ExePath).Length) bytes)"
-# Linux 附件：WSL 构建后复制到 target\release\advent-999-search-mcp-linux。
-# 不存在则只发 Windows 版（警告不断发布）；存在则双系统一起发布。
-$LinuxAssets = @()
-if (Test-Path $LinuxPath) {
-  $LinuxAssets = @($LinuxPath)
-  Ok "Linux 二进制: $LinuxPath ($((Get-Item $LinuxPath).Length) bytes)"
+# Linux 附件：在 Linux 机器上构建后复制到 target\release\advent-999-search-mcp-linux-<arch>。
+# 支持两份（x86_64 / aarch64）；一个都没有则只发 Windows 版（仅警告，不阻断发布）。
+$LinuxAssets = @(Get-ChildItem (Join-Path $ProjectDir "target\release") -Filter "advent-999-search-mcp-linux*" -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -notlike "*.stale*" } |
+                 ForEach-Object { $_.FullName })
+if ($LinuxAssets.Count -gt 0) {
+  foreach ($a in $LinuxAssets) { Ok "Linux 二进制: $a ($((Get-Item $a).Length) bytes)" }
 } else {
-  Warn "找不到 $LinuxPath —— 只发布 Windows 版。如需双系统发布，先在 WSL 构建并复制过来："
-  Warn "  wsl --exec sh -c 'export CARGO_TARGET_DIR=/home/user/advent-target; ...; cargo build --release'"
-  Warn "  wsl --exec cp /home/user/advent-target/release/advent-999-search-mcp <repo>/target/release/advent-999-search-mcp-linux"
+  Warn "找不到 Linux 二进制（target\release\advent-999-search-mcp-linux-*）—— 只发布 Windows 版。"
+  Warn "  在 Linux 机器上构建后拷回：cargo build --release && cp target/release/advent-999-search-mcp <repo>/target/release/advent-999-search-mcp-linux-x86_64"
+  Warn "  ARM（树莓派）：同样构建后命名为 advent-999-search-mcp-linux-aarch64"
 }
 
 # ---------- 4. Tag 处理 ----------
