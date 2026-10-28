@@ -66,6 +66,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Native tools emit UTF-8; PowerShell otherwise decodes their stdout with the
+# console codepage (GBK here), which corrupts any non-ASCII JSON/notes.
+$OutputEncoding = [System.Text.Encoding]::UTF8
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
 $GH_REPO     = "wwwzzzxxx/advent-999-search-mcp"
 $GITEE_REPO  = "pzwzx/advent-999-search-mcp"
 $ProjectDir  = Split-Path -Parent $PSScriptRoot
@@ -221,12 +226,15 @@ function Invoke-GiteeJson {
       $args += "--data-urlencode"; $args += "$k@$tmp"
     }
   }
+  $respFile = Join-Path $env:TEMP ("gitee-resp-" + [guid]::NewGuid().ToString("N") + ".json")
   try {
-    $out = & curl.exe @args $url
+    & curl.exe @args $url -o $respFile
+    if ($LASTEXITCODE -ne 0) { Fail "Gitee API 请求失败（curl $LASTEXITCODE）" }
+    $out = if (Test-Path $respFile) { Get-Content -Raw -Encoding UTF8 $respFile } else { "" }
   } finally {
     foreach ($f in $tmpFiles) { Remove-Item $f -ErrorAction SilentlyContinue }
+    Remove-Item $respFile -ErrorAction SilentlyContinue
   }
-  if ($LASTEXITCODE -ne 0) { Fail "Gitee API 请求失败: $out" }
   if (-not $out -or $out -eq "null") { return $null }
   $obj = $out | ConvertFrom-Json
   # Gitee 列表类 API（如 /releases、/attach_files）返回 JSON 数组。
@@ -290,9 +298,12 @@ function Publish-Gitee {
       }
     }
     Info "上传附件 $assetName ..."
-    $up = & curl.exe -s --max-time 180 -X POST -F "access_token=$Token" -F "file=@$asset" `
-          "https://gitee.com/api/v5/repos/$GITEE_REPO/releases/$relId/attach_files"
-    if ($LASTEXITCODE -ne 0) { Fail "上传附件失败: $up" }
+    $upFile = Join-Path $env:TEMP ("gitee-up-" + [guid]::NewGuid().ToString("N") + ".json")
+    & curl.exe -s --max-time 180 -X POST -F "access_token=$Token" -F "file=@$asset" `
+          "https://gitee.com/api/v5/repos/$GITEE_REPO/releases/$relId/attach_files" -o $upFile
+    if ($LASTEXITCODE -ne 0) { Fail "上传附件失败（curl $LASTEXITCODE）" }
+    $up = Get-Content -Raw -Encoding UTF8 $upFile
+    Remove-Item $upFile -ErrorAction SilentlyContinue
     $af = $up | ConvertFrom-Json
     if ($af.message) { Fail "上传附件错误: $($af.message)" }
     Ok "Gitee 附件: $($af.browser_download_url)"
