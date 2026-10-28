@@ -26,6 +26,12 @@ pub struct Config {
     pub use_proxy: bool,
     /// Domain substrings that must bypass the proxy (mainland direct access).
     pub direct_domains: Vec<String>,
+    /// `twscrape` executable used for X/Twitter reads (default `twscrape`).
+    /// The engine and `get_page` silently fall back when it is not installed.
+    pub twscrape_path: String,
+    /// Minimum spacing between consecutive `twscrape` calls, in ms.
+    /// A random 0–3s jitter is added on top so the cadence is not robotic.
+    pub x_min_interval_ms: u64,
     /// Cookies seeded from the legacy `FETCH_COOKIES` env var, already split
     /// by owning domain. Requests only receive the entries matching their own
     /// host — see [`Config::cookies_for`].
@@ -45,6 +51,11 @@ pub struct Config {
     /// during US business hours before first use). Read ONLY from this
     /// env var (never from any file).
     pub ieee_api_key: Option<String>,
+    /// Optional keys for the keyed web-search engines, keyed by engine name
+    /// (`firecrawl`, `octen`, `parallel`). Read from `FIRECRAWL_API_KEY` and
+    /// `OCTEN_API_KEY` / `PARALLEL_API_KEY` — engines without a key are not
+    /// registered.
+    pub search_api_keys: std::collections::HashMap<String, String>,
     /// How long a cookie-cache entry is considered fresh, in seconds.
     ///
     /// Advisory only: stale entries are still used (the remote server is the
@@ -55,12 +66,18 @@ pub struct Config {
     /// Whether the `import_cookies` tool is available. Off unless
     /// `ADVENT_ALLOW_COOKIE_IMPORT=1`; the tool is then not even registered.
     pub cookie_import_enabled: bool,
+    /// Whether `web` may attach related Engram memories.
+    pub engram_search_enabled: bool,
+    /// Child MCP client used for optional Engram searches.
+    pub engram: crate::engram::EngramClient,
 }
 
 impl Config {
     pub fn from_env() -> Self {
+        // Out-of-the-box default. Override per deployment with
+        // DEFAULT_SEARCH_ENGINE (e.g. `exa` where its key is configured).
         let default_engine = env::var("DEFAULT_SEARCH_ENGINE")
-            .unwrap_or_else(|_| "exa".to_string());
+            .unwrap_or_else(|_| "bing".to_string());
 
         let allowed = env::var("ALLOWED_SEARCH_ENGINES")
             .map(|s| s.split(',').map(|e| e.trim().to_string()).collect())
@@ -137,6 +154,24 @@ impl Config {
         let ieee_api_key = env::var("IEEE_API_KEY")
             .ok()
             .filter(|k| !k.trim().is_empty());
+        // Keyed services we can activate without a card:
+        // Firecrawl 1,000 credits/month, Octen one-time $5 credit,
+        // Parallel one-time $20 credit.
+        let mut search_api_keys = std::collections::HashMap::new();
+        for (engine, var) in [
+            ("firecrawl", "FIRECRAWL_API_KEY"),
+            ("octen", "OCTEN_API_KEY"),
+            ("parallel", "PARALLEL_API_KEY"),
+        ] {
+            if let Ok(k) = env::var(var) {
+                let k = k.trim().to_string();
+                if !k.is_empty() {
+                    eprintln!("🔑 {} set, {} engine enabled", var, engine);
+                    search_api_keys.insert(engine.to_string(), k);
+                }
+            }
+        }
+
         if ieee_api_key.is_some() {
             eprintln!("🔑 IEEE_API_KEY set, ieee engine enabled");
         }
@@ -157,6 +192,20 @@ impl Config {
             eprintln!("🔓 ADVENT_ALLOW_COOKIE_IMPORT=1: import_cookies tool enabled");
         }
 
+        let engram_search_enabled = env::var("ADVENT_ENGRAM_ENABLED")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        if engram_search_enabled {
+            eprintln!("🧠 ADVENT_ENGRAM_ENABLED=1: web searches will include up to 2 Engram memories by default");
+        }
+        let engram = crate::engram::EngramClient::from_env();
+
+        let twscrape_path = env::var("TWSCRAPE_PATH").unwrap_or_else(|_| "twscrape".to_string());
+        let x_min_interval_ms = env::var("X_MIN_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(8000);
+
         // Anti-bot session cookies (sogou/weixin SNUID & friends) live in a
         // small local file rather than an env var, so refreshing them takes
         // effect on the next search instead of requiring a restart.
@@ -172,12 +221,17 @@ impl Config {
             use_proxy,
             direct_domains,
             env_cookies,
+            twscrape_path,
+            x_min_interval_ms,
             fetch_timeout_secs: fetch_timeout,
             deepseek_api_key,
             deepseek_api_mode,
             ieee_api_key,
+            search_api_keys,
             cookie_cache_ttl_secs,
             cookie_import_enabled,
+            engram_search_enabled,
+            engram,
         }
     }
 
@@ -200,6 +254,12 @@ impl Config {
 
     /// Whether the IEEE engine is available (IEEE_API_KEY env var set).
     pub fn has_ieee_key(&self) -> bool { self.ieee_api_key.is_some() }
+
+    /// API key for a keyed web-search engine (`firecrawl`, `octen`,
+    /// `parallel`), if configured.
+    pub fn api_key(&self, engine: &str) -> Option<&str> {
+        self.search_api_keys.get(engine).map(|s| s.as_str())
+    }
 
     /// Whether requests to this host must bypass the proxy entirely.
     ///

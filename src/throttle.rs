@@ -27,6 +27,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Sogou + weixin share one permit: they are the same backend trust domain.
 static SOGOU_FAMILY_SEM: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
+/// DuckDuckGo serves an anti-bot page under bursts; one request at a time.
+static DDG_SEM: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
 static DBLP_SEM: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
 static STARTPAGE_SEM: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
 /// Global cap on concurrent engine calls across all queries.
@@ -34,6 +36,12 @@ static GLOBAL_SEM: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
 
 fn sogou_family_sem() -> std::sync::Arc<Semaphore> {
     SOGOU_FAMILY_SEM
+        .get_or_init(|| std::sync::Arc::new(Semaphore::new(1)))
+        .clone()
+}
+
+fn ddg_sem() -> std::sync::Arc<Semaphore> {
+    DDG_SEM
         .get_or_init(|| std::sync::Arc::new(Semaphore::new(1)))
         .clone()
 }
@@ -70,6 +78,7 @@ pub async fn acquire(engine: &str) -> Vec<OwnedSemaphorePermit> {
     let family = match engine {
         e if is_sogou_family(e) => Some(sogou_family_sem()),
         "dblp" => Some(dblp_sem()),
+        "duckduckgo" => Some(ddg_sem()),
         "startpage" => Some(startpage_sem()),
         _ => None,
     };

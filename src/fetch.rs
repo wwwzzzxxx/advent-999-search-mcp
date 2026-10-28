@@ -306,13 +306,8 @@ fn append_node_markdown(node: &ego_tree::NodeRef<'_, Node>, buf: &mut String) {
 const MIN_CONTENT_LEN: usize = 200;
 /// Direct fetch per-request timeout.
 const DIRECT_FETCH_TIMEOUT_SECS: u64 = 8;
-/// Jina Reader per-request timeout. Must exceed Jina's cold headless-render
-/// time for heavy SPA pages (measured ~15s for modelscope.cn on cold cache;
-/// warm cache is ~4s). Also matches the X-Timeout: 30 header sent to Jina.
-const JINA_TIMEOUT_SECS: u64 = 30;
-
-/// Domains known to require JS rendering — try Jina Reader directly first.
-const JINA_PREFERRED_DOMAINS: &[&str] = &[
+/// Domains known to require JS rendering — try the server-side reader first.
+const READER_PREFERRED_DOMAINS: &[&str] = &[
     "developer.aliyun.com",
     "cloud.tencent.com",
     "juejin.cn",
@@ -340,7 +335,7 @@ const JINA_PREFERRED_DOMAINS: &[&str] = &[
     "linux.do",
 ];
 
-/// Domains that are hopeless even with Jina (strong anti-bot).
+/// Domains that are hopeless even with a server-side reader (strong anti-bot).
 /// Note: zhihu.com is handled by signed API, not blocked.
 const BLOCKED_DOMAINS: &[&str] = &[
 ];
@@ -355,7 +350,7 @@ pub struct FetchResult {
     /// HTTP status code of the response. 200 on success; 404/410/451 carry
     /// the error-page body so callers can distinguish "page gone" from content.
     pub status_code: u16,
-    /// How the content was obtained: "direct", "jina", "zhihu-api", ...
+    /// How the content was obtained: "direct", "firecrawl", "mediawiki-api", ...
     pub via: String,
 }
 
@@ -363,10 +358,10 @@ pub struct FetchResult {
 ///
 /// Strategy:
 /// 1. Domain-specific: Discourse API, CSDN direct, Zhihu signed API.
-/// 2. If domain is JS-heavy (JINA_PREFERRED_DOMAINS), try Jina Reader directly.
+/// 2. If domain is JS-heavy (READER_PREFERRED_DOMAINS), try the reader first.
 /// 3. Otherwise try direct HTTP fetch first.
-/// 4. If direct fetch returns low-quality content (SPA shell), fallback to Jina.
-/// 5. If direct fetch fails (403/empty/timeout), fallback to Jina Reader.
+/// 4. If direct fetch returns low-quality content (SPA shell), use the reader.
+/// 5. If direct fetch fails (403/empty/timeout), use the reader (Firecrawl).
 /// 6. If domain is blocked, return error immediately.
 pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchError> {
     // ── arXiv paper ID / abs URL → official HTML version ──
@@ -376,8 +371,8 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
         return match fetch_arxiv_html(&arxiv_id, config).await {
             Ok(r) => Ok(r),
             Err(e) => {
-                // Last resort: Jina Reader on the abs page.
-                match fetch_via_jina(&format!("https://arxiv.org/abs/{}", arxiv_id), config).await {
+                // Last resort: the reader on the abs page.
+                match fetch_via_reader(&format!("https://arxiv.org/abs/{}", arxiv_id), config).await {
                     Ok(r) => Ok(r),
                     Err(_) => Err(e),
                 }
@@ -388,13 +383,25 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
     let parsed = url::Url::parse(url).map_err(|e| FetchError::InvalidUrl(e.to_string()))?;
     let host = parsed.host_str().unwrap_or("");
 
+    // ── MediaWiki (minecraft.wiki / wiki.gg / Fandom) → read-only API ──
+    // These wikis sit behind Cloudflare: a plain fetch gets a challenge page,
+    // while api.php answers in ~0.5s with clean plain text (no nav, no
+    // language lists). Falls through when the API does not answer.
+    if (parsed.path().starts_with("/wiki/") || parsed.path().starts_with("/w/"))
+        && mediawiki_api_root(host).is_some()
+    {
+        if let Some(r) = fetch_mediawiki(url, config).await {
+            return Ok(r);
+        }
+    }
+
     // ── Discourse forum (e.g. linux.do) → API-first ──
     let is_discourse = host.contains("linux.do");
     if is_discourse {
         match fetch_discourse(url, host, config).await {
             Ok(r) => return Ok(r),
             Err(_) => {
-                // API failed (CloudFlare?), fall through to Jina
+                // API failed (CloudFlare?), fall through to the reader
             }
         }
     }
@@ -406,7 +413,7 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
         match fetch_csdn(url, host, config).await {
             Ok(r) => return Ok(r),
             Err(_) => {
-                // Direct fetch failed, fall through to Jina
+                // Direct fetch failed, fall through to the reader
             }
         }
     }
@@ -417,9 +424,9 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
         match fetch_zhihu(url, host, config).await {
             Ok(r) => return Ok(r),
             Err(e) => {
-                // zhuanlan can fallback to Jina (useful when no cookies configured)
+                // zhuanlan can fall back to the reader (useful when no cookies configured)
                 if host.contains("zhuanlan") {
-                    if let Ok(r) = fetch_via_jina(url, config).await {
+                    if let Ok(r) = fetch_via_reader(url, config).await {
                         return Ok(r);
                     }
                 }
@@ -452,12 +459,12 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
 
     // ── WeChat official account article (mp.weixin.qq.com) → WeChat UA direct ──
     // WeChat serves full article HTML only to MicroMessenger UAs; a normal browser
-    // UA gets an "环境异常" block page. Jina Reader is kept as final fallback.
+    // UA gets an "环境异常" block page. The reader is kept as final fallback.
     if host.contains("mp.weixin.qq.com") {
         return match fetch_weixin_article(url, config).await {
             Ok(r) => Ok(r),
             Err(e) => {
-                match fetch_via_jina(url, config).await {
+                match fetch_via_reader(url, config).await {
                     Ok(r) => Ok(r),
                     Err(_) => Err(e),
                 }
@@ -472,7 +479,7 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
         return match fetch_sogou_weixin_link(url, config).await {
             Ok(r) => Ok(r),
             Err(e) => {
-                match fetch_via_jina(url, config).await {
+                match fetch_via_reader(url, config).await {
                     Ok(r) => Ok(r),
                     Err(_) => Err(e),
                 }
@@ -480,12 +487,12 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
         };
     }
 
-    // Determine strategy: Jina-first or direct-first
-    // Check JINA_PREFERRED first (more specific match) before BLOCKED
-    let prefer_jina = JINA_PREFERRED_DOMAINS.iter().any(|d| host.contains(d));
+    // Determine strategy: reader-first or direct-first
+    // Check READER_PREFERRED first (more specific match) before BLOCKED
+    let prefer_reader = READER_PREFERRED_DOMAINS.iter().any(|d| host.contains(d));
 
-    // Quick check for known blocked domains (skip if jina-preferred)
-    if !prefer_jina && BLOCKED_DOMAINS.iter().any(|d| host.contains(d)) {
+    // Quick check for known blocked domains (skip if reader-preferred)
+    if !prefer_reader && BLOCKED_DOMAINS.iter().any(|d| host.contains(d)) {
         if !config.cookies_for(host).is_empty() {
             // User provided cookies, try direct fetch
         } else {
@@ -503,20 +510,20 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
     // so we append them to the page content. Comment fetch is best-effort:
     // failure to get comments never fails the page fetch itself.
     if let Some((owner, repo, number)) = extract_github_issue(url) {
-        let mut result = if prefer_jina {
-            // JS-heavy site → try Jina first, fallback to direct
-            match fetch_via_jina(url, config).await {
+        let mut result = if prefer_reader {
+            // JS-heavy site → try the reader first, fallback to direct
+            match fetch_via_reader(url, config).await {
                 Ok(r) => r,
                 Err(_) => fetch_direct(url, config).await?,
             }
         } else {
-            // Normal site → try direct first, fallback to Jina
+            // Normal site → try direct first, fallback to the reader
             match fetch_direct(url, config).await {
                 Ok(r) => r,
                 Err(FetchError::PdfDetected(_)) | Err(_) => {
-                    match fetch_via_jina(url, config).await {
+                    match fetch_via_reader(url, config).await {
                         Ok(r) => r,
-                        Err(jina_err) => return Err(jina_err),
+                        Err(reader_err) => return Err(reader_err),
                     }
                 }
             }
@@ -529,28 +536,28 @@ pub async fn fetch_url(url: &str, config: &Config) -> Result<FetchResult, FetchE
         return Ok(result);
     }
 
-    if prefer_jina {
-        // JS-heavy site → try Jina first, fallback to direct
-        match fetch_via_jina(url, config).await {
+    if prefer_reader {
+        // JS-heavy site → try the reader first, fallback to direct
+        match fetch_via_reader(url, config).await {
             Ok(r) => return Ok(r),
             Err(_) => fetch_direct(url, config).await,
         }
     } else {
-        // Normal site → try direct first, fallback to Jina
+        // Normal site → try direct first, fallback to the reader
         match fetch_direct(url, config).await {
             Ok(r) => return Ok(r),
             Err(FetchError::PdfDetected(_)) => {
-                // PDF detected — Jina Reader converts PDFs to markdown.
-                match fetch_via_jina(url, config).await {
+                // PDF detected — Firecrawl converts PDFs to markdown.
+                match fetch_via_reader(url, config).await {
                     Ok(r) => Ok(r),
-                    Err(jina_err) => Err(jina_err),
+                    Err(reader_err) => Err(reader_err),
                 }
             }
             Err(FetchError::LowQuality(_, _)) | Err(_) => {
-                // Low quality or other error → try Jina as fallback
-                match fetch_via_jina(url, config).await {
+                // Low quality or other error → try the reader as fallback
+                match fetch_via_reader(url, config).await {
                     Ok(r) => Ok(r),
-                    Err(jina_err) => Err(jina_err),
+                    Err(reader_err) => Err(reader_err),
                 }
             }
         }
@@ -840,7 +847,7 @@ fn extract_arxiv_content(html: &str) -> String {
 ///
 /// Checks the Content-Type header and the `%PDF-` magic bytes. Binary
 /// documents must not be fed through the HTML pipeline — callers should
-/// fall back to a PDF-capable reader (Jina Reader converts PDFs to markdown).
+/// fall back to a PDF-capable reader (Firecrawl converts PDFs to markdown).
 fn is_pdf_response(content_type: &str, bytes: &[u8]) -> bool {
     let ct = content_type.to_lowercase();
     if ct.contains("application/pdf") || ct.contains("application/octet-stream") {
@@ -1925,7 +1932,7 @@ async fn fetch_bilibili_subtitle(url: &str, video: &BiliVideoRef, config: &Confi
 }
 
 /// CSDN blog article fetch — server-rendered static HTML, no JS required.
-/// Direct fetch is faster than Jina and our extract_csdn_content has tuned selectors.
+/// Direct fetch is faster than the reader and our extract_csdn_content has tuned selectors.
 async fn fetch_csdn(url: &str, host: &str, config: &Config) -> Result<FetchResult, FetchError> {
     let _parsed = url::Url::parse(url).map_err(|e| FetchError::InvalidUrl(e.to_string()))?;
     let site_name = detect_site(host);
@@ -1977,12 +1984,342 @@ async fn fetch_csdn(url: &str, host: &str, config: &Config) -> Result<FetchResul
     Ok(FetchResult { url: url.to_string(), title, content, content_type, site_name, status_code: 200, via: "csdn-direct".into() })
 }
 
-async fn fetch_direct(url: &str, config: &Config) -> Result<FetchResult, FetchError> {
+/// Which network path a request takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Egress {
+    /// Whatever DIRECT_DOMAINS / USE_PROXY decides for this host.
+    Configured,
+    /// Straight from this machine's own address.
+    Direct,
+    /// Through PROXY_URL even for hosts that normally go direct.
+    Proxied,
+}
+
+impl Egress {
+    fn flip(self) -> Egress {
+        match self {
+            Egress::Direct => Egress::Proxied,
+            Egress::Proxied => Egress::Direct,
+            Egress::Configured => Egress::Direct,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Egress::Direct => "direct",
+            Egress::Proxied => "proxy",
+            Egress::Configured => "configured",
+        }
+    }
+}
+
+/// Cloudflare / WAF interstitials. They come back with HTTP 200 and plenty of
+/// text, so they must be recognised before the body is accepted as content —
+/// otherwise a Turnstile screen is handed to the caller as the page.
+fn is_challenge_page(html: &str) -> bool {
+    let head: String = html.chars().take(20_000).collect::<String>().to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "just a moment...",
+        "enable javascript and cookies to continue",
+        "challenge-platform",
+        "cf-chl",
+        "cf_chl_",
+        "checking your browser before accessing",
+        "attention required! | cloudflare",
+        "challenges.cloudflare.com/turnstile",
+        "请稍候…",
+        "正在进行安全验证",
+        "本网站使用安全服务防护",
+    ];
+    MARKERS.iter().any(|m| head.contains(m))
+}
+
+/// Why a fetch failed decides how far the ladder climbs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FailureClass {
+    /// The page itself is the problem (JS shell, PDF, gone, empty). Another
+    /// address or another TLS fingerprint changes nothing — go to the reader.
+    Terminal,
+    /// "Who is asking?" — address or fingerprint. Worth every rung.
+    AntiBot,
+    /// Transport trouble; another egress may route around it, a different
+    /// fingerprint will not.
+    Transport,
+}
+
+fn classify_failure(err: &FetchError) -> FailureClass {
+    match err {
+        FetchError::Blocked(_) => FailureClass::AntiBot,
+        FetchError::HttpStatus(code, _) if matches!(code, 403 | 429 | 503) => FailureClass::AntiBot,
+        FetchError::Timeout | FetchError::Network(_) => FailureClass::Transport,
+        _ => FailureClass::Terminal,
+    }
+}
+
+fn reason_phrase(code: u16) -> &'static str {
+    match code {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
+    }
+}
+
+// ─── TLS/HTTP fingerprint impersonation (curl-impersonate) ───
+//
+// A 403 is not always about the address: Cloudflare also scores the TLS
+// ClientHello and the HTTP/2 frame order. Rust HTTP clients cannot reorder
+// them, so this rung shells out to an optional `curl-impersonate` build, which
+// speaks with a real browser's fingerprint over the same connection.
+//
+// Nothing links against it: when the binary is absent the rung is skipped and
+// the fetch behaves exactly as before. Measured 2026-10: with profile
+// `chrome150`, npm / linux.do / marktechpost / huggingface all returned real
+// HTML from this machine, where the plain client received an anti-bot screen.
+const IMPERSONATE_TIMEOUT_SECS: u64 = 25;
+const IMPERSONATE_MARKER: &str = "<<<ADVENT_META>>>";
+
+/// `CURL_IMPERSONATE_PATH`, else `<cache dir>/bin/curl-impersonate[.exe]`.
+fn curl_impersonate_path() -> Option<std::path::PathBuf> {
+    if let Ok(raw) = std::env::var("CURL_IMPERSONATE_PATH") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            let path = std::path::PathBuf::from(raw);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    let name = if cfg!(target_os = "windows") {
+        "curl-impersonate.exe"
+    } else {
+        "curl-impersonate"
+    };
+    let path = crate::cookie_cache::cache_path()
+        .parent()
+        .map(|dir| dir.join("bin").join(name))?;
+    path.is_file().then_some(path)
+}
+
+/// Browser profile to imitate; `CURL_IMPERSONATE_PROFILE`, default `chrome150`
+/// (older profiles were still challenged by Cloudflare in 2026-10).
+fn impersonate_profile() -> String {
+    std::env::var("CURL_IMPERSONATE_PROFILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "chrome150".to_string())
+}
+
+/// One attempt through curl-impersonate on the given egress.
+async fn fetch_impersonated(
+    url: &str,
+    config: &Config,
+    egress: Egress,
+) -> Result<FetchResult, FetchError> {
+    let bin = curl_impersonate_path()
+        .ok_or_else(|| FetchError::Config("curl-impersonate is not installed".to_string()))?;
     let parsed = url::Url::parse(url).map_err(|e| FetchError::InvalidUrl(e.to_string()))?;
     let domain = parsed.host_str().unwrap_or("unknown").to_string();
     let site_name = detect_site(&domain);
 
-    let client = build_fetch_client(config, &domain)?;
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("-sS")
+        // The impersonation profile sends the browser's Accept-Encoding, so
+        // the body arrives compressed unless curl is told to decode it.
+        .arg("--compressed")
+        // DOI links and shorteners answer 301/302; the plain client follows
+        // redirects, so this one must too.
+        .arg("-L")
+        .arg("--max-redirs")
+        .arg("10")
+        .arg("--impersonate")
+        .arg(impersonate_profile())
+        .arg("--max-time")
+        .arg(IMPERSONATE_TIMEOUT_SECS.to_string())
+        .arg("-H")
+        .arg("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .arg("-H")
+        .arg("Accept-Language: zh-CN,zh;q=0.9,en;q=0.8")
+        .arg("--write-out")
+        .arg(format!(
+            "\n{}\n%{{http_code}}\n%{{content_type}}\n",
+            IMPERSONATE_MARKER
+        ));
+
+    match egress {
+        Egress::Proxied => {
+            if let Some(proxy) = config.proxy_url.as_deref() {
+                cmd.arg("--proxy").arg(proxy);
+            }
+        }
+        _ => {
+            cmd.arg("--noproxy").arg("*");
+        }
+    }
+
+    let cookies = config.cookies_for(&domain);
+    if !cookies.is_empty() {
+        cmd.arg("-H").arg(format!("Cookie: {}", cookies));
+    }
+    cmd.arg("--").arg(url);
+    cmd.kill_on_drop(true);
+
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| FetchError::Http(format!("curl-impersonate spawn failed: {}", e)))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let Some((body, meta)) = stdout.rsplit_once(IMPERSONATE_MARKER) else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim().chars().take(200).collect::<String>();
+        return Err(if err.is_empty() {
+            FetchError::Http(format!("curl-impersonate exited with {}", out.status))
+        } else {
+            FetchError::Http(format!("curl-impersonate: {}", err))
+        });
+    };
+
+    let mut lines = meta.lines().filter(|l| !l.trim().is_empty());
+    let status_code: u16 = lines
+        .next()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let content_type = lines.next().unwrap_or("").trim().to_string();
+
+    if status_code == 0 {
+        let raw_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let lower = raw_err.to_ascii_lowercase();
+        return Err(if lower.contains("timed out") || lower.contains("timeout") {
+            FetchError::Timeout
+        } else {
+            FetchError::Network(format!(
+                "curl-impersonate: {}",
+                raw_err.chars().take(160).collect::<String>()
+            ))
+        });
+    }
+
+    let body = body.strip_prefix('\n').unwrap_or(body);
+    finish_response(
+        url,
+        &domain,
+        &site_name,
+        status_code,
+        &content_type,
+        body.as_bytes(),
+        "curl-impersonate",
+    )
+}
+
+/// Direct fetch with an egress retry ladder.
+///
+/// A 403 or a challenge screen is an answer about *who is asking*, not about
+/// the page: Cloudflare scores a datacenter proxy exit and this machine's own
+/// address very differently, so a page that fails through the proxy often
+/// loads straight from here — and the reverse (huggingface, google) also
+/// happens. Only anti-bot / transport failures are retried; a PDF or a JS
+/// shell goes to the reader instead, where another egress changes nothing.
+async fn fetch_direct(url: &str, config: &Config) -> Result<FetchResult, FetchError> {
+    let domain = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_default();
+
+    let mut first = if config.should_bypass_proxy(&domain) {
+        Egress::Direct
+    } else {
+        Egress::Proxied
+    };
+    if first == Egress::Proxied && config.proxy_url.is_none() {
+        first = Egress::Direct;
+    }
+
+    let has_impersonation = curl_impersonate_path().is_some();
+    let steps: [(Egress, bool); 4] = [
+        (first, false),
+        (first.flip(), false),
+        (first, true),
+        (first.flip(), true),
+    ];
+
+    let mut last: Option<FetchError> = None;
+    let mut plain_attempts = 0usize;
+    let mut anti_bot = false;
+    for (egress, impersonated) in steps {
+        if egress == Egress::Proxied && config.proxy_url.is_none() {
+            continue;
+        }
+        if impersonated {
+            // The fingerprint rung only answers an anti-bot verdict; on a
+            // timeout or a JS shell it just burns 25 seconds.
+            if !has_impersonation || !anti_bot {
+                continue;
+            }
+        } else {
+            if plain_attempts >= 2 {
+                continue;
+            }
+            plain_attempts += 1;
+        }
+
+        let attempt = if impersonated {
+            fetch_impersonated(url, config, egress).await
+        } else {
+            fetch_direct_egress(url, config, egress).await
+        };
+        match attempt {
+            Ok(result) => {
+                if egress != first || impersonated {
+                    eprintln!(
+                        "🔀 {} fetched via {}{} instead",
+                        domain,
+                        egress.label(),
+                        if impersonated { " + browser fingerprint" } else { "" }
+                    );
+                }
+                return Ok(result);
+            }
+            Err(err) => {
+                eprintln!(
+                    "⚠️ {} via {}{}: {}",
+                    domain,
+                    egress.label(),
+                    if impersonated { " + browser fingerprint" } else { "" },
+                    err
+                );
+                if classify_failure(&err) == FailureClass::AntiBot {
+                    anti_bot = true;
+                }
+                let terminal = classify_failure(&err) == FailureClass::Terminal;
+                last = Some(err);
+                if terminal {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or(FetchError::EmptyContent))
+}
+
+/// One HTTP attempt on a chosen egress, then the shared response pipeline.
+async fn fetch_direct_egress(
+    url: &str,
+    config: &Config,
+    egress: Egress,
+) -> Result<FetchResult, FetchError> {
+    let parsed = url::Url::parse(url).map_err(|e| FetchError::InvalidUrl(e.to_string()))?;
+    let domain = parsed.host_str().unwrap_or("unknown").to_string();
+    let site_name = detect_site(&domain);
+
+    let client = build_fetch_client_egress(config, &domain, egress)?;
 
     let mut request = client.get(url)
         .headers(build_headers(&domain))
@@ -2013,77 +2350,125 @@ async fn fetch_direct(url: &str, config: &Config) -> Result<FetchResult, FetchEr
     let bytes = resp.bytes().await
         .map_err(|e| FetchError::Http(format!("Failed to read body: {}", e)))?;
 
+    finish_response(url, &domain, &site_name, status_code, &content_type, &bytes, "direct")
+}
+
+/// Turn one HTTP response into a `FetchResult`, or into the error that tells
+/// the caller which fallback to use. Shared by the plain and impersonated
+/// clients so both extract content identically.
+fn finish_response(
+    url: &str,
+    domain: &str,
+    site_name: &str,
+    status_code: u16,
+    content_type: &str,
+    bytes: &[u8],
+    via: &str,
+) -> Result<FetchResult, FetchError> {
     // PDF (or other binary document) detection: check the Content-Type and
     // the %PDF magic bytes. Treating PDF bytes as HTML produces garbage,
-    // so signal a PdfDetected error to trigger the Jina Reader fallback
-    // (r.jina.ai parses PDFs into markdown).
-    if is_pdf_response(&content_type, &bytes) {
+    // so signal a PdfDetected error to trigger the Firecrawl fallback
+    // (it parses PDFs into markdown).
+    if is_pdf_response(content_type, bytes) {
         return Err(FetchError::PdfDetected(
             "the target returned a PDF document; retrying via PDF-capable reader".to_string(),
         ));
     }
 
+    // WAF interstitial: HTTP 200 with a "checking your browser" screen. It
+    // carries enough text to pass a length check, so reject it explicitly and
+    // let the caller retry on another egress / fingerprint.
+    if is_plain_text_type(content_type) || is_xml_content_type(content_type) {
+        // Raw payloads are returned verbatim; a challenge screen is HTML.
+    } else {
+        let peek = decode_html(bytes, content_type);
+        if is_challenge_page(&peek) {
+            return Err(FetchError::Blocked(format!(
+                "{} answered with an anti-bot challenge page",
+                domain
+            )));
+        }
+    }
+
     // Non-2xx: definitive client errors (404/410/451) return the body together
     // with the status code, so callers can tell "page gone" from real content.
-    // Anti-bot statuses (403/429/5xx) keep the Jina Reader fallback path.
-    if !status.is_success() {
+    // Anti-bot statuses (403/429/5xx) keep the reader fallback path.
+    if status_code >= 400 {
         if matches!(status_code, 404 | 410 | 451) {
-            let raw = decode_html(&bytes, &content_type);
+            let raw = decode_html(bytes, content_type);
             let title = clean_cdata(&extract_title(&raw));
-            let content = if is_xml_content_type(&content_type) || is_plain_text_type(&content_type) {
+            let content = if is_xml_content_type(content_type) || is_plain_text_type(content_type) {
                 raw
             } else {
-                extract_readable_content(&raw, &domain)
+                extract_readable_content(&raw, domain)
             };
             return Ok(FetchResult {
                 url: url.to_string(),
                 title,
                 content,
-                content_type,
-                site_name,
+                content_type: content_type.to_string(),
+                site_name: site_name.to_string(),
                 status_code,
-                via: "direct".into(),
+                via: via.to_string(),
             });
         }
-        return Err(FetchError::HttpStatus(status_code, status.as_str().to_string()));
+        return Err(FetchError::HttpStatus(
+            status_code,
+            reason_phrase(status_code).to_string(),
+        ));
     }
 
     // Structured/raw responses bypass the HTML extraction pipeline:
     // XML (RSS/Atom/sitemap) and text/plain (markdown, robots.txt) would
     // lose their structure or line layout to HTML parsing.
-    if is_xml_content_type(&content_type) || is_plain_text_type(&content_type) {
-        let raw = decode_html(&bytes, &content_type);
+    if is_xml_content_type(content_type) || is_plain_text_type(content_type) {
+        let raw = decode_html(bytes, content_type);
         return Ok(FetchResult {
             url: url.to_string(),
             title: clean_cdata(&extract_title(&raw)),
             content: raw,
-            content_type,
-            site_name,
+            content_type: content_type.to_string(),
+            site_name: site_name.to_string(),
             status_code,
-            via: "direct".into(),
+            via: via.to_string(),
         });
     }
 
-    let html = decode_html(&bytes, &content_type);
+    let html = decode_html(bytes, content_type);
 
     // SPA shell detection: if raw HTML looks JS-rendered, skip extraction
-    // and fallback to Jina Reader which can execute JavaScript.
+    // and fall back to the reader, which can execute JavaScript.
     if detect_spa_shell(&html) {
         return Err(FetchError::LowQuality(
-            "Page appears to be a JS-rendered SPA shell; try Jina reader".into(),
+            "Page appears to be a JS-rendered SPA shell; needs a rendering reader".into(),
             String::new(),
         ));
     }
 
     let title = extract_title(&html);
-    let content = extract_readable_content(&html, &domain);
+    let content = extract_readable_content(&html, domain);
 
-    if content.trim().len() < MIN_CONTENT_LEN {
-        return Err(FetchError::EmptyContent);
+    // Short pages are legitimate (example.com is ~150 characters), so only
+    // reject a document that has no real text at all. The old hard 200-char
+    // floor pushed short pages into the reader fallback, which then failed.
+    let text = content.trim();
+    if text.len() < MIN_CONTENT_LEN {
+        let words = text.split_whitespace().count();
+        // The general extractor falls back to the meta description when it
+        // finds no body text — a JS shell nearly always comes back that way.
+        // That is not a document, so it still goes to the reader fallback.
+        let (meta, visible) = page_text_stats(&html);
+        let is_meta_only = meta.as_deref().map(|m| m.trim() == text).unwrap_or(false);
+        // Extraction that kept only a sliver of a large page means the
+        // container was not found (SPA/partial render), not a short document.
+        let covered = visible == 0 || text.len() * 100 / visible.max(1) >= 25;
+        if text.len() < 40 || words < 6 || title.trim().is_empty() || is_meta_only || !covered {
+            return Err(FetchError::EmptyContent);
+        }
     }
 
     // Quality check: if content looks like an SPA shell (nav, sidebar, no body text),
-    // return LowQuality so the caller can fallback to Jina.
+    // return LowQuality so the caller can fall back to the reader.
     let quality = content_quality_score(&content);
     if quality < 0.15 {
         return Err(FetchError::LowQuality(
@@ -2093,9 +2478,17 @@ async fn fetch_direct(url: &str, config: &Config) -> Result<FetchResult, FetchEr
     }
 
     // Clean nav/sidebar junk from extracted content
-    let content = post_process_content(&content, &domain);
+    let content = post_process_content(&content, domain);
 
-    Ok(FetchResult { url: url.to_string(), title, content, content_type, site_name, status_code, via: "direct".into() })
+    Ok(FetchResult {
+        url: url.to_string(),
+        title,
+        content,
+        content_type: content_type.to_string(),
+        site_name: site_name.to_string(),
+        status_code,
+        via: via.to_string(),
+    })
 }
 
 // ─── WeChat Official Account (mp.weixin.qq.com) Fetcher ───
@@ -2400,100 +2793,271 @@ fn extract_weixin_content(html: &str) -> String {
     String::new()
 }
 
-/// Fetch via Jina Reader API — handles JS rendering server-side.
-/// Returns content as markdown. Zero extra memory, just an HTTP request.
-async fn fetch_via_jina(url: &str, config: &Config) -> Result<FetchResult, FetchError> {
+// ─── Reader fallback: Firecrawl scrape ───
+//
+// Server-side rendering covers SPA shells, anti-bot walls and PDFs. It has to
+// be somebody else's egress: Cloudflare rejects this network's IP, and running
+// a headless browser locally does not change the address that gets challenged
+// (measured 2026-10: local Chrome rendered mcmod/spark, but npm, marktechpost
+// and linux.do all answered with a Turnstile wall, and huggingface took 197s).
+async fn fetch_via_reader(url: &str, config: &Config) -> Result<FetchResult, FetchError> {
+    if config.api_key("firecrawl").is_none() {
+        return Err(FetchError::Blocked(
+            "this page needs JS rendering and FIRECRAWL_API_KEY is not set".to_string(),
+        ));
+    }
+    fetch_via_firecrawl(url, config).await
+}
+
+/// Fetch via Firecrawl scrape — renders JS, parses PDFs, returns markdown.
+///
+/// Docs: POST https://api.firecrawl.dev/v2/scrape with `Authorization: Bearer`.
+/// `onlyMainContent` drops obvious nav/boilerplate; heavy SPA pages can take
+/// 30s+ to render, hence the generous client timeout.
+async fn fetch_via_firecrawl(url: &str, config: &Config) -> Result<FetchResult, FetchError> {
+    let key = config
+        .api_key("firecrawl")
+        .ok_or_else(|| FetchError::Config("FIRECRAWL_API_KEY not set".to_string()))?;
     let parsed = url::Url::parse(url).map_err(|e| FetchError::InvalidUrl(e.to_string()))?;
     let domain = parsed.host_str().unwrap_or("unknown").to_string();
     let site_name = detect_site(&domain);
 
-    let client = config.build_reqwest_client()
+    let client = config
+        .build_reqwest_client_for("api.firecrawl.dev")
         .map_err(|e| FetchError::Config(e.to_string()))?;
 
-    let jina_url = format!("https://r.jina.ai/{}", url);
+    let body = serde_json::json!({
+        "url": url,
+        "formats": ["markdown"],
+        "onlyMainContent": true,
+        "timeout": 45000,
+    });
 
-    let mut req = client.get(&jina_url)
-        .header(reqwest::header::ACCEPT, "text/markdown")
-        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (compatible; omni-search/1.0)")
-        .header("X-Timeout", "30")
-        .header("X-Return-Format", "markdown");
-
-    // Forward this host's cookies to Jina so authenticated content is
-    // accessible. Only the matching domain's cookies leave the machine.
-    let cookies = config.cookies_for(&domain);
-    if !cookies.is_empty() {
-        req = req.header("X-Set-Cookie", &cookies);
-    }
-
-    let resp = req
-        .timeout(Duration::from_secs(JINA_TIMEOUT_SECS))
+    let resp = client
+        .post("https://api.firecrawl.dev/v2/scrape")
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", key))
+        .json(&body)
+        .timeout(Duration::from_secs(90))
         .send()
         .await
         .map_err(|e| {
-            if e.is_timeout() { FetchError::Timeout }
-            else { FetchError::Http(format!("Jina request failed: {}", e)) }
+            if e.is_timeout() {
+                FetchError::Timeout
+            } else {
+                FetchError::Http(format!("Firecrawl request failed: {}", e))
+            }
         })?;
 
     let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| FetchError::Http(format!("Failed to read Firecrawl response: {}", e)))?;
+
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| FetchError::Parse(format!("Firecrawl returned non-JSON: {}", e)))?;
+
+    if v["success"].as_bool() == Some(false) {
+        return Err(FetchError::Http(format!(
+            "Firecrawl: {}",
+            v["error"].as_str().unwrap_or("scrape failed")
+        )));
+    }
     if !status.is_success() {
-        return Err(FetchError::HttpStatus(status.as_u16(), format!("Jina returned {}", status)));
+        return Err(FetchError::HttpStatus(
+            status.as_u16(),
+            format!("Firecrawl returned {}: {}", status, text.chars().take(160).collect::<String>()),
+        ));
     }
 
-    let bytes = resp.bytes().await
-        .map_err(|e| FetchError::Http(format!("Failed to read Jina response: {}", e)))?;
-    let text = String::from_utf8_lossy(&bytes).to_string();
+    let data = &v["data"];
+    let markdown = data["markdown"].as_str().unwrap_or("").trim().to_string();
+    let title = data["metadata"]["title"].as_str().unwrap_or("").to_string();
 
-    // Parse Jina response format:
-    // Title: xxx
-    // URL Source: xxx
-    // Markdown Content:
-    // ...
-    let title = text.lines()
-        .find(|l| l.starts_with("Title: "))
-        .map(|l| l.trim_start_matches("Title: ").trim().to_string())
-        .unwrap_or_default();
-
-    // Extract markdown content (after "Markdown Content:" or "Markdown Content:\n")
-    let content = if let Some(idx) = text.find("Markdown Content:\n") {
-        let after = &text[idx + "Markdown Content:\n".len()..];
-        after.trim().to_string()
-    } else if let Some(idx) = text.find("Markdown Content:") {
-        let after = &text[idx + "Markdown Content:".len()..];
-        after.trim().to_string()
-    } else {
-        text.clone()
-    };
-
-    // Check for error indicators in Jina response
-    // Only reject if the ENTIRE content is just a warning/error message.
-    // Many pages return a short warning line followed by real content.
-    let trimmed_content = content.trim();
-    if trimmed_content.len() < MIN_CONTENT_LEN {
-        // Little to no content — check if it's an error response
-        if trimmed_content.contains("Target URL returned error")
-            || trimmed_content.contains("Warning: This page maybe")
-            || trimmed_content.is_empty()
-        {
-            return Err(FetchError::EmptyContent);
-        }
+    if markdown.len() < 40 {
+        return Err(FetchError::EmptyContent);
     }
-
-    // Clean nav/sidebar junk — Jina often includes full page nav
-    let content = post_process_content(&content, &domain);
 
     Ok(FetchResult {
         url: url.to_string(),
         title,
-        content,
+        content: post_process_content(&markdown, &domain),
         content_type: "text/markdown".into(),
         site_name,
+        status_code: data["metadata"]["statusCode"].as_u64().unwrap_or(200) as u16,
+        via: "firecrawl".into(),
+    })
+}
+
+// ─── MediaWiki API ───
+//
+// MediaWiki hosts (minecraft.wiki, wiki.gg, Fandom) sit behind Cloudflare and
+// answer a plain HTTP fetch with a challenge page, while their read-only API
+// is open and fast. `prop=extracts` returns clean plain text (no nav, no
+// language lists) in well under a second — a 390k-character rendered page
+// becomes ~8k characters of article.
+const MEDIAWIKI_HOST_SUFFIXES: &[&str] = &["minecraft.wiki", "wiki.gg", "fandom.com"];
+
+/// MediaWiki's API is an API, not a browser page: sending a Chrome UA without
+/// a matching TLS fingerprint makes Cloudflare answer 403.
+const MEDIAWIKI_UA: &str = "advent-999-search-mcp/0.11 (MediaWiki API client)";
+
+fn mediawiki_api_root(host: &str) -> Option<String> {
+    let h = host.to_ascii_lowercase();
+    if !MEDIAWIKI_HOST_SUFFIXES
+        .iter()
+        .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
+    {
+        return None;
+    }
+    Some(format!("https://{}/api.php", host))
+}
+
+/// Minimal percent-encoding for a query value (titles contain spaces, `&`, `%`).
+fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Fetch a MediaWiki article through `api.php`.
+///
+/// `None` means "not a MediaWiki article URL, or the API did not answer like
+/// one" — the caller then continues with the normal fetch path.
+async fn fetch_mediawiki(url: &str, config: &Config) -> Option<FetchResult> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let root = mediawiki_api_root(&host)?;
+    // MediaWiki answers under both /wiki/<Title> and /w/<Title>.
+    let title = parsed
+        .path()
+        .strip_prefix("/wiki/")
+        .or_else(|| parsed.path().strip_prefix("/w/"))
+        .unwrap_or("");
+    if title.is_empty() || title.contains(':') || title.starts_with("Special") {
+        return None;
+    }
+
+    let site_name = detect_site(&host);
+    let client = build_fetch_client(config, &host).ok()?;
+    let title_q = encode_query_value(&title.replace('_', " "));
+
+    // 1) Plain-text extract (TextExtracts extension). Compact and clean.
+    let extract_url = format!(
+        "{}?action=query&prop=extracts&explaintext=1&redirects=1&titles={}&format=json&formatversion=2",
+        root, title_q
+    );
+    let mut page_title = String::new();
+    if let Ok(resp) = client
+        .get(&extract_url)
+        .header(reqwest::header::USER_AGENT, MEDIAWIKI_UA)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                if let Some(page) = v["query"]["pages"].get(0) {
+                    page_title = page["title"].as_str().unwrap_or("").to_string();
+                    // Missing page: report it as a 404 instead of paying for a
+                    // Firecrawl render of the wiki's error page.
+                    if page["missing"].as_bool() == Some(true) {
+                        let name = if page_title.is_empty() {
+                            title.to_string()
+                        } else {
+                            page_title.clone()
+                        };
+                        return Some(FetchResult {
+                            url: url.to_string(),
+                            title: name.clone(),
+                            content: format!("The wiki page \"{}\" does not exist.", name),
+                            content_type: "text/plain".into(),
+                            site_name,
+                            status_code: 404,
+                            via: "mediawiki-api".into(),
+                        });
+                    }
+                    let extract = page["extract"].as_str().unwrap_or("").trim();
+                    if extract.len() >= MIN_CONTENT_LEN {
+                        return Some(FetchResult {
+                            url: url.to_string(),
+                            title: page_title,
+                            content: extract.to_string(),
+                            content_type: "text/plain".into(),
+                            site_name,
+                            status_code: 200,
+                            via: "mediawiki-api".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) Rendered HTML (`prop=text`) for wikis without TextExtracts, run
+    //    through the normal HTML extractor.
+    let parse_url = format!(
+        "{}?action=parse&page={}&prop=text&disableeditsection=1&redirects=1&format=json&formatversion=2",
+        root, title_q
+    );
+    let resp = client
+        .get(&parse_url)
+        .header(reqwest::header::USER_AGENT, MEDIAWIKI_UA)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .ok()?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let name = title.replace('_', " ");
+        return Some(FetchResult {
+            url: url.to_string(),
+            title: name.clone(),
+            content: format!("The wiki page \"{}\" does not exist.", name),
+            content_type: "text/plain".into(),
+            site_name,
+            status_code: 404,
+            via: "mediawiki-api".into(),
+        });
+    }
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let html = v["parse"]["text"].as_str()?;
+    let title = v["parse"]["title"].as_str().unwrap_or(&page_title);
+    let content = extract_readable_content(html, &host);
+    if content.trim().len() < MIN_CONTENT_LEN {
+        return None;
+    }
+    Some(FetchResult {
+        url: url.to_string(),
+        title: title.to_string(),
+        content,
+        content_type: "text/html".into(),
+        site_name,
         status_code: 200,
-        via: "jina".into(),
+        via: "mediawiki-api".into(),
     })
 }
 
 /// Build a reqwest client specifically for fetching (longer timeout, redirect handling)
 fn build_fetch_client(config: &Config, domain: &str) -> Result<reqwest::Client, FetchError> {
+    build_fetch_client_egress(config, domain, Egress::Configured)
+}
+
+/// Build a client pinned to one egress.
+fn build_fetch_client_egress(
+    config: &Config,
+    domain: &str,
+    egress: Egress,
+) -> Result<reqwest::Client, FetchError> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(config.fetch_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
@@ -2509,8 +3073,13 @@ fn build_fetch_client(config: &Config, domain: &str) -> Result<reqwest::Client, 
 
     // Mainland domains (sogou/weixin/baidu/...) must bypass the proxy:
     // they either block datacenter IPs with captchas or are unreachable
-    // through foreign egress. Controlled by DIRECT_DOMAINS env var.
-    let use_proxy = !config.should_bypass_proxy(domain);
+    // through foreign egress. Controlled by DIRECT_DOMAINS env var; the retry
+    // ladder can override it for one attempt in either direction.
+    let use_proxy = match egress {
+        Egress::Configured => !config.should_bypass_proxy(domain),
+        Egress::Direct => false,
+        Egress::Proxied => config.proxy_url.is_some(),
+    };
     if use_proxy {
         if let Some(ref url) = config.proxy_url {
             let proxy = reqwest::Proxy::all(url).map_err(|e| {
@@ -2704,6 +3273,28 @@ fn extract_title(html: &str) -> String {
 }
 
 /// Extract readable content from HTML, tailored for Chinese sites
+/// Description and visible-text size of a document.
+///
+/// Two signals are needed to judge a short extraction: whether the text *is*
+/// the meta description (the extractor's fallback for a JS shell), and how
+/// much of the page's visible text the extraction actually captured. A real
+/// short page (example.com, ~150 chars) is captured completely; a failed
+/// extraction on a 23k-character page (huggingface) is not.
+fn page_text_stats(html: &str) -> (Option<String>, usize) {
+    let doc = Html::parse_document(html);
+    let mut meta = None;
+    for sel in ["meta[name='description']", "meta[property='og:description']"] {
+        if let Ok(s) = Selector::parse(sel) {
+            if let Some(content) = doc.select(&s).next().and_then(|el| el.value().attr("content")) {
+                meta = Some(content.to_string());
+                break;
+            }
+        }
+    }
+    let visible = doc.root_element().text().map(|t| t.chars().count()).sum();
+    (meta, visible)
+}
+
 fn extract_readable_content(html: &str, domain: &str) -> String {
     let doc = Html::parse_document(html);
 
@@ -3049,7 +3640,7 @@ pub enum FetchError {
     Blocked(String),
     Config(String),
     /// The response is a PDF (or other binary document) — not HTML.
-    /// Callers should retry via a PDF-capable fallback (e.g. Jina Reader).
+    /// Callers should retry via a PDF-capable fallback (e.g. Firecrawl).
     PdfDetected(String),
 }
 
@@ -3079,7 +3670,7 @@ impl std::error::Error for FetchError {}
 ///
 /// Checks text-to-HTML ratio, content tag density, and SPA framework markers.
 /// Returns true when the page is likely a client-side rendered shell that needs
-/// a JS-enabled renderer (Jina Reader) to produce meaningful content.
+/// a JS-enabled renderer (Firecrawl) to produce meaningful content.
 fn detect_spa_shell(html: &str) -> bool {
     let total = html.len();
     if total < 5000 {
@@ -3606,6 +4197,66 @@ fn clean_markdown_content(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn challenge_pages_are_recognised() {
+        assert!(is_challenge_page("<html><title>Just a moment...</title></html>"));
+        assert!(is_challenge_page(
+            "<script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script>"
+        ));
+        assert!(is_challenge_page("<p>请稍候… 正在进行安全验证</p>"));
+        assert!(!is_challenge_page(
+            "<html><body><article>Cloudflare Workers is a platform for running code</article></body></html>"
+        ));
+    }
+
+    #[test]
+    fn failures_are_classified_for_the_retry_ladder() {
+        assert_eq!(
+            classify_failure(&FetchError::HttpStatus(403, "Forbidden".into())),
+            FailureClass::AntiBot
+        );
+        assert_eq!(
+            classify_failure(&FetchError::Blocked("challenge".into())),
+            FailureClass::AntiBot
+        );
+        assert_eq!(classify_failure(&FetchError::Timeout), FailureClass::Transport);
+        assert_eq!(
+            classify_failure(&FetchError::EmptyContent),
+            FailureClass::Terminal
+        );
+        assert_eq!(
+            classify_failure(&FetchError::PdfDetected("pdf".into())),
+            FailureClass::Terminal
+        );
+        assert_eq!(Egress::Direct.flip(), Egress::Proxied);
+        assert_eq!(Egress::Proxied.flip(), Egress::Direct);
+    }
+
+    #[test]
+    fn mediawiki_hosts_are_recognised() {
+        assert_eq!(
+            mediawiki_api_root("minecraft.wiki").as_deref(),
+            Some("https://minecraft.wiki/api.php")
+        );
+        assert_eq!(
+            mediawiki_api_root("zh.minecraft.wiki").as_deref(),
+            Some("https://zh.minecraft.wiki/api.php")
+        );
+        assert_eq!(
+            mediawiki_api_root("mcdf.wiki.gg").as_deref(),
+            Some("https://mcdf.wiki.gg/api.php")
+        );
+        assert!(mediawiki_api_root("www.mcmod.cn").is_none());
+        assert!(mediawiki_api_root("notminecraft.wiki.example.com").is_none());
+    }
+
+    #[test]
+    fn mediawiki_titles_are_percent_encoded() {
+        assert_eq!(encode_query_value("TNT"), "TNT");
+        assert_eq!(encode_query_value("Java Edition 1.21"), "Java%20Edition%201.21");
+        assert_eq!(encode_query_value("A&B"), "A%26B");
+    }
 
     #[test]
     fn strips_inline_image_and_relative_links() {

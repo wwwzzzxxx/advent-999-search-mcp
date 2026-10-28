@@ -8,9 +8,9 @@
 
 基于 Rust 的 MCP 服务器，为你的 AI 助手提供**网络搜索**、**本地文件搜索**和**网页抓取**能力。
 
-- **`web`** — 11 个搜索引擎（Exa、Bing、CSDN、掘金、Startpage、搜狗、微信、DBLP、知网 + 凭据门控的 DeepSeek、IEEE），支持**按请求过滤**（`freshness`、`topic`、`includeDomains`、`excludeDomains`）、**跨引擎去重**，以及**一次调用搜多个主题**（`queries`）
+- **`web`** — 16 个搜索引擎（Exa、Bing、CSDN、掘金、Startpage、搜狗、微信、DBLP、知网、DuckDuckGo + 凭据门控的 DeepSeek、IEEE、X/Twitter、Firecrawl、Octen、Parallel），支持**按请求过滤**（`freshness`、`topic`、`includeDomains`、`excludeDomains`）、**跨引擎去重**，以及**一次调用搜多个主题**（`queries`）
 - **`local`** — 通过 Everything (voidtools) 搜索本地文件
-- **`get_page`** — 抓取任意网页并提取可读内容，支持 `find`（字面子串）与 `highlights`（按查询相关性）两种模式，一次可抓 10 个 URL
+- **`get_page`** — 抓取任意网页并提取可读内容，支持 `find`（字面子串）与 `highlights`（按查询相关性）两种模式，一次可抓 10 个 URL。X/Twitter 链接有特殊规则：存了 x.com 登录 Cookie 时，主页链接返回资料 + 最近推文，推文链接返回正文 + 回复串，经 `twscrape` 渲染成 markdown
 - **`set_cookies`** — 本地**按域隔离**的 Cookie 存储：随时 set / list / clear，无需重启
 - **`import_cookies`** — 需显式开启（`ADVENT_ALLOW_COOKIE_IMPORT=1`）：通过 DevTools 协议从专用 Edge 配置自动读取 Cookie
 
@@ -127,7 +127,7 @@ IEEE_API_KEY=你的密钥
 # （可选）限制可用引擎（逗号分隔）
 # 重要：如果设置了这个变量，务必把想用的引擎都写进去——
 # 包括配置了 key 后的 deepseek：
-ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,deepseek,ieee
+ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,duckduckgo,deepseek,ieee,x,firecrawl,octen,parallel
 
 # （可选）浏览器 Cookie，用于抓取需登录的页面（如知乎）
 # 格式与 HTTP 的 Cookie 请求头相同：
@@ -135,7 +135,16 @@ FETCH_COOKIES="d_c0=ABC...; z_c0=DEF...; SESSIONID=GHI..."
 
 # （可选）本地文件搜索（见第 2 步）
 EVERYTHING_ES_PATH=C:\path\to\es.exe
+
+# （可选）搜索时附带 Engram 记忆（需安装/配置 Engram MCP）
+ADVENT_ENGRAM_ENABLED=1
+ENGRAM_MCP_COMMAND=engram
+ENGRAM_MCP_ARGS_JSON='["mcp","--tools=agent"]'
 ```
+
+设置 `ADVENT_ENGRAM_ENABLED=1` 后，`web` 默认会为每个搜索主题附带两条 Engram 标题摘要，格式为 `#<id> <title>`；检索范围默认覆盖所有项目，不附带记忆正文或 preview。Agent 可在单次调用中传 `includeEngram: false` 跳过。未设置时功能关闭，不会启动 Engram 子进程。`ENGRAM_MCP_COMMAND` 默认是 `engram`，`ENGRAM_MCP_ARGS_JSON` 默认是 `["mcp","--tools=agent"]`。如需使用自定义启动器，可把命令和参数分别配置在 MCP `env` 中。连接或查询失败会以 `engramError` 标注，网页搜索结果仍照常返回。单主题响应返回 `engramMemories`，批量响应把摘要放在各主题结果对象内。
+
+例如，Windows 上可将现有 PowerShell 启动器配置为 `ENGRAM_MCP_COMMAND=powershell.exe`，并把 `ENGRAM_MCP_ARGS_JSON` 设为包含 `-NoProfile`、`-WindowStyle`、`Hidden`、`-ExecutionPolicy`、`Bypass`、`-File` 和启动器路径的 JSON 字符串数组。
 
 ### 4. 注册为 MCP 服务器
 
@@ -154,7 +163,9 @@ EVERYTHING_ES_PATH=C:\path\to\es.exe
         "PROXY_URL": "http://127.0.0.1:7890",
         "USE_PROXY": "true",
         "EXA_API_KEY": "你的密钥",
-        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF..."
+        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF...",
+        "ADVENT_ENGRAM_ENABLED": "1",
+        "ENGRAM_MCP_ARGS_JSON": "[\"mcp\",\"--tools=agent\"]"
       }
     }
   }
@@ -175,7 +186,9 @@ EVERYTHING_ES_PATH=C:\path\to\es.exe
         "PROXY_URL": "http://127.0.0.1:7890",
         "USE_PROXY": "true",
         "EXA_API_KEY": "你的密钥",
-        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF..."
+        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF...",
+        "ADVENT_ENGRAM_ENABLED": "1",
+        "ENGRAM_MCP_ARGS_JSON": "[\"mcp\",\"--tools=agent\"]"
       },
       "type": "local"
     }
@@ -197,13 +210,23 @@ EVERYTHING_ES_PATH=C:\path\to\es.exe
 | `DEEPSEEK_API_MODE` | 否 | 自动 | 强制后端：`official`（api.deepseek.com）或 `go`（opencode.ai） |
 | `DEEPSEEK_MODEL` | 否 | `deepseek-v4-flash` | deepseek 引擎使用的模型 |
 | `IEEE_API_KEY` | 否 | — | IEEE Xplore 元数据搜索 API 密钥（[developer.ieee.org](https://developer.ieee.org)）——启用 `ieee` 引擎 |
+| `CURL_IMPERSONATE_PATH` | 否 | `%LOCALAPPDATA%\advent-mcp\bin\curl-impersonate.exe` | 可选的 [curl-impersonate](https://github.com/lexiforest/curl-impersonate) v2 二进制（支持 `--impersonate`）。启用"浏览器指纹"这一级：同一条连接、真实 Chrome 的 TLS/JA4 握手。没有它这一级自动跳过 |
+| `CURL_IMPERSONATE_PROFILE` | 否 | `chrome150` | 传给 `--impersonate` 的档位。2026-10 实测 chrome136 及更旧仍会被 Cloudflare 挑战 |
+| `FIRECRAWL_API_KEY` | 否 | — | Firecrawl API 密钥（[firecrawl.dev](https://www.firecrawl.dev)）——启用 `firecrawl` 引擎。免费：1,000 credits/月（≈500 次搜索） |
+| `OCTEN_API_KEY` | 否 | — | Octen Search API 密钥（[octen.ai](https://octen.ai)）——启用 `octen` 引擎。只有一次性 $5 注册余额 |
+| `PARALLEL_API_KEY` | 否 | — | Parallel Search API 密钥（[platform.parallel.ai](https://platform.parallel.ai)）——启用 `parallel` 引擎。新账号一次性送 $20；每月 $5 免费额度需要绑卡 |
 | `FETCH_COOKIES` | 否 | — | 旧式长期**登录** Cookie，扁平格式 `key=value; key2=value2`。现在会按 Cookie 归属域名拆分：`d_c0`/`z_c0` → `zhihu.com`，`SESSDATA`/`buvid3`/`bili_jct`/… → `bilibili.com`，`SNUID`/`SUV` → `sogou.com`；**无法识别归属的名字会被丢弃**（否则会被发给任意被抓站点）。推荐改用 `set_cookies` / `import_cookies` 按域存储。**切勿提交真实 Cookie** |
 | `COOKIE_CACHE_TTL` | 否 | `1200` | 缓存 Cookie 超过该秒数后在日志里提醒「可能已失效」。仅提示——过期条目仍会使用，真实有效性以远端为准。`0` 关闭提醒 |
 | `ADVENT_ALLOW_COOKIE_IMPORT` | 否 | `0` | 设为 `1` 才注册 `import_cookies` 工具。默认关闭：这是读取凭据的能力，应单独授权 |
 | `ADVENT_FETCH_LOG` | 否 | `0` | 设为 `1` 后每次 `get_page` 抓取追加一行 JSON（链接、host、成败、状态码、字符数、耗时、抓取路径、附带的 Cookie 名）。永不记录 Cookie 值 |
 | `ADVENT_FETCH_LOG_PATH` | 否 | `<cookie 目录>/fetch-log.jsonl` | 抓取日志路径（超过 8 MB 轮转一次） |
 | `EVERYTHING_ES_PATH` | 否 | — | ES.exe 路径（必须设置才能启用本地搜索） |
-| `DEFAULT_SEARCH_ENGINE` | 否 | `exa` | 默认搜索引擎 |
+| `TWSCRAPE_PATH` | 否 | `twscrape` | X/Twitter 读取所用的 `twscrape` 可执行文件。用 `uv tool install twscrape` 安装；未安装或没有 x.com 登录 Cookie 时，`get_page` 回落到公开 SSR 页面 |
+| `X_MIN_INTERVAL_MS` | 否 | `8000` | 两次 `twscrape` 调用之间的最小间隔（毫秒），另加 0–3 秒随机抖动。X 按端点和账号限流，调用本身也是串行的 |
+| `ADVENT_ENGRAM_ENABLED` | 否 | `0` | 设为 `1` 后允许 `web` 搜索附带 Engram 记忆；默认关闭。单次调用可用 `includeEngram: false` 跳过 |
+| `ENGRAM_MCP_COMMAND` | 否 | `engram` | 启动 Engram stdio MCP 的可执行文件或启动器 |
+| `ENGRAM_MCP_ARGS_JSON` | 否 | `["mcp","--tools=agent"]` | 传给 Engram MCP 启动器的参数 JSON 数组 |
+| `DEFAULT_SEARCH_ENGINE` | 否 | `bing` | 调用方不传 `engines` 时 `web` 使用的默认引擎。按部署环境设成合适的（例如配了 Exa key 就设 `exa`）；Bing 只是开箱默认值 |
 | `ALLOWED_SEARCH_ENGINES` | 否 | *（全部）* | 允许的搜索引擎列表（逗号分隔） |
 | `FETCH_TIMEOUT` | 否 | `30` | 抓取超时（秒） |
 
@@ -271,7 +294,7 @@ dedupe         (boolean, 默认 true) — 跨引擎合并重复 URL
 **不做**的去重：同一篇文章转载到不同域名。这需要抓取每个页面正文，会把快速
 搜索路径变成慢速路径，而且基于标题的启发式会误合并真正不同的页面。
 
-支持的搜索引擎（11 个，均已实测）：Exa（默认）、Bing、CSDN、掘金、Startpage、搜狗、微信（公众号文章）、DBLP（计算机文献）、知网、DeepSeek（LLM 搜索，需密钥）、IEEE（Xplore 元数据，需密钥）。
+支持的搜索引擎（16 个）：Exa、Bing（默认；用 `DEFAULT_SEARCH_ENGINE` 改成别的，例如 `exa`）、CSDN、掘金、Startpage、搜狗、微信（公众号文章）、DBLP（计算机文献）、知网、DuckDuckGo（免费无 key），以及门控引擎：DeepSeek（LLM 搜索，需密钥）、IEEE（Xplore 元数据，需密钥）、X/Twitter（需要 x.com 登录 cookie + `twscrape`）、Firecrawl、Octen、Parallel（各自需要 API key）。
 
 凭据门控引擎（已实现，设置密钥前隐藏——配置环境变量后自动出现在 `tools/list`）：
 - **`deepseek`** — 基于 LLM 的搜索，通过 Anthropic 兼容 Messages API 调用服务端 `web_search_20250305` 工具。按 key 格式自动检测后端：
@@ -408,6 +431,13 @@ maxHighlights (number, 默认 5, 最大 20) — highlights 模式最多返回的
 includeLinks (boolean, 默认 false) — 保留 Markdown 超链接 [text](url)；默认剥离为可见文本以省 token
 ```
 
+**X / Twitter 规则。** 存有 x.com 登录 Cookie 时，`x.com/<user>` 和
+`x.com/<user>/status/<id>`（含 `twitter.com`）不再当普通网页抓取，而是经
+`twscrape` 调 X 的 GraphQL：主页返回简介、计数和最近 10 条推文；推文返回
+正文、互动数、引用推文和 10 条回复。未登录或没装 `twscrape` 时回落到原抓取
+路径——主页只剩很薄的 SSR 外壳，`/search` 是空的登录墙。`find` /
+`highlights` 对渲染后的文本照常可用。
+
 **highlights 模式**（`highlights`）是读取长页面最省 token 的方式：不返回全文，
 而是按查询对段落排序，只返回最相关的若干段。纯本地、确定性（不调用 LLM），
 排序**以命中的不同查询词数量优先**——一段覆盖多个不同查询词，胜过反复出现同
@@ -446,14 +476,15 @@ find 模式（服务端子串搜索，省 token）：设置 `find` 后先正常�
 - **B 站视频**（`bilibili.com/video/BVxxx`，多 P 视频可用 `?p=N` 选集）→ 返回字幕轨的 SRT 格式文本（需为 `bilibili.com` 存好 `SESSDATA`——B 站只向登录用户返回字幕列表）
 - **YouTube 视频**（`youtube.com/watch?v=ID`、`shorts`/`live`/`embed`、`youtu.be/ID`）→ 经 Innertube ANDROID player API 返回字幕轨 SRT（匿名即可，无需登录；需可出境的代理）。选轨优先级：手动英文 > 手动任意语言 > 自动英文 > 首个。非视频页（频道、播放列表、搜索页）回落通用抓取
 - **arXiv 论文** → 接受论文号（`2401.12345`、`arXiv:2401.12345` 或 `arxiv.org/abs/...` 链接），返回论文 HTML 内容（优先官方 `arxiv.org/html/` 转换版，老论文自动降级到 ar5iv）
-- **JS 密集型站点** → 自动降级到 Jina Reader
+- **MediaWiki wiki**（`minecraft.wiki`、`zh.minecraft.wiki`、`*.wiki.gg`、Fandom）→ 走 `api.php` 纯文本接口，约 0.5 秒拿到干净正文，既绕开 Cloudflare 验证页，也不用渲染 20 万字符的整页
+- **JS 密集型站点 / 反爬墙 / PDF** → 逐级升级：先用另一条出口（直连 ↔ 代理）重试，再用 `curl-impersonate` 重放一次（可选二进制，真实浏览器的 TLS/JA4 + HTTP-2 指纹），最后才用 Firecrawl（`FIRECRAWL_API_KEY`，每页 1 credit）。403 多数是"谁在问"的问题，不是页面坏了，所以先用便宜的手段
 - **普通站点** → 直接 HTTP + HTML 转 Markdown
 
 ### 抓取日志
 
 设置 `ADVENT_FETCH_LOG=1` 后，每次抓取会向 `%LOCALAPPDATA%\advent-mcp\fetch-log.jsonl`
 追加一行 JSON（可用 `ADVENT_FETCH_LOG_PATH` 改路径）。字段包括：链接、host、成败、HTTP 状态码、
-正文总字符数 / 实际返回字符数、耗时、抓取路径（`direct`、`jina`、`zhihu-api`…），以及本次附带的
+正文总字符数 / 实际返回字符数、耗时、抓取路径（`direct`、`firecrawl`、`mediawiki-api`、`zhihu-api`…），以及本次附带的
 **Cookie 名字**。Cookie 值和响应正文永不写入。
 
 ```jsonc

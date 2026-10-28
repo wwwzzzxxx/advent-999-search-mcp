@@ -12,6 +12,8 @@ mod cookie_cache;
 mod browser_cookies;
 mod fetch_log;
 mod throttle;
+mod engram;
+mod x;
 
 use config::Config;
 use filters::{Freshness, FreshnessTier, SearchOptions, Topic};
@@ -194,6 +196,13 @@ fn list_tools(config: &Config) -> Vec<Value> {
             "semantic_scholar" => "Semantic Scholar".to_string(),
             "ieee" => "IEEE Xplore".to_string(),
             "cnki" => "CNKI(知网)".to_string(),
+            "brave" => "Brave".to_string(),
+            "parallel" => "Parallel".to_string(),
+            "perplexity" => "Perplexity".to_string(),
+            "firecrawl" => "Firecrawl".to_string(),
+            "octen" => "Octen".to_string(),
+            "duckduckgo" => "DuckDuckGo".to_string(),
+            "x" => "X/Twitter".to_string(),
             _ => e.chars().next().map(|c| c.to_uppercase().to_string() + &e[1..]).unwrap_or_default(),
         }).collect();
         labeled.join(", ")
@@ -208,6 +217,13 @@ fn list_tools(config: &Config) -> Vec<Value> {
                 "semantic_scholar" => "Semantic Scholar".to_string(),
                 "ieee" => "IEEE Xplore".to_string(),
                 "cnki" => "CNKI(知网)".to_string(),
+            "brave" => "Brave".to_string(),
+            "parallel" => "Parallel".to_string(),
+            "perplexity" => "Perplexity".to_string(),
+            "firecrawl" => "Firecrawl".to_string(),
+            "octen" => "Octen".to_string(),
+            "duckduckgo" => "DuckDuckGo".to_string(),
+            "x" => "X/Twitter".to_string(),
                 _ => e.chars().next().map(|c| c.to_uppercase().to_string() + &e[1..]).unwrap_or_default(),
             })
             .collect::<Vec<_>>()
@@ -224,7 +240,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
     let search_tool = serde_json::json!({
         "name": "web",
         "description": format!(
-            "Search the web using these engines: {}. Academic search tips: use dblp for CS papers, cnki for Chinese papers, ieee for IEEE Xplore; then pass any arXiv ID / URL or paper links from results to get_page to read the full text. WeChat article results (weixin.sogou.com/link?url=...) can also be passed directly to get_page. searchMode meanings: omit or set auto to use the server configured SEARCH_MODE; request forces request-based search; playwright forces browser-based search. For several topics pass `queries` (up to 10) in ONE call instead of several web calls: the server fans out (query x engine) concurrently under one per-engine throttle, which saves round-trips and, on clients that run tool calls one at a time, is simply faster. Each topic's results come back separately; a bad topic does not lose the others.",
+            "Search the web using these engines: {}. Academic search tips: use dblp for CS papers, cnki for Chinese papers, ieee for IEEE Xplore; then pass any arXiv ID / URL or paper links from results to get_page to read the full text. WeChat article results (weixin.sogou.com/link?url=...) can also be passed directly to get_page. searchMode meanings: omit or set auto to use the server configured SEARCH_MODE; request forces request-based search; playwright forces browser-based search. For several topics pass `queries` (up to 10) in ONE call instead of several web calls: the server fans out (query x engine) concurrently under one per-engine throttle, which saves round-trips and, on clients that run tool calls one at a time, is simply faster. Each topic's results come back separately; a bad topic does not lose the others. When ADVENT_ENGRAM_ENABLED=1, two relevant Engram memories are attached by default; set includeEngram=false to skip them for this call.",
             engines_desc
         ),
         "inputSchema": {
@@ -259,7 +275,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
                 },
                 "freshness": {
                     "type": "string",
-                    "description": "Restrict results by publish/insert time: day | week | month | year, or an explicit range YYYY-MM-DD..YYYY-MM-DD. Honoured natively by exa/sogou/csdn/ieee; approximated by a newest-first sort on juejin/cnki; sent but unverified on bing; not supported by weixin/startpage. The response's `filters.freshnessByEngine` reports which engines actually applied it."
+                    "description": "Restrict results by publish/insert time: day | week | month | year, or an explicit range YYYY-MM-DD..YYYY-MM-DD. Honoured natively by exa/sogou/csdn/ieee; approximated by a newest-first sort on juejin/cnki; mapped to X's since:/until: operators for x (best effort); sent but unverified on bing; not supported by weixin/startpage. The response's `filters.freshnessByEngine` reports which engines actually applied it."
                 },
                 "topic": {
                     "type": "string",
@@ -279,6 +295,11 @@ fn list_tools(config: &Config) -> Vec<Value> {
                 "dedupe": {
                     "type": "boolean",
                     "description": "Fold duplicate URLs across engines into one result (default true). Tracking parameters are stripped; URLs that differ in a meaningful parameter (e.g. a bilibili ?p=2) are kept separate.",
+                    "default": true
+                },
+                "includeEngram": {
+                    "type": "boolean",
+                    "description": "Include the two most relevant Engram memories with this search. Defaults to true when ADVENT_ENGRAM_ENABLED=1; false skips Engram for this call.",
                     "default": true
                 }
             },
@@ -323,7 +344,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
 
     let fetch_tool = serde_json::json!({
         "name": "get_page",
-        "description": "Fetch the content of a web page and extract its readable text. Zhihu requires a logged-in session in the cookie store (d_c0 + z_c0; import it once with import_cookies); question pages are expanded with their top answers. One call can fetch several URLs: pass `urls` (up to 10) instead of `url`; each URL comes back as its own object, a failing URL does not abort the others, and the default maxLength is split into a total budget of ~60k characters so a batch cannot blow up the context. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). Bilibili video URLs (bilibili.com/video/BVxxx, optional ?p=N for multi-part videos) return the subtitle track as SRT — requires stored SESSDATA cookies, since Bilibili only serves the subtitle list to logged-in users. YouTube video URLs (youtube.com/watch?v=ID, /shorts/ID, /live/ID, /embed/ID, youtu.be/ID) return the caption track as SRT — anonymous, no login needed (needs proxy egress outside mainland). For academic papers: search first with web (engines: dblp, cnki, ieee, exa), then use this tool to read the full text. To read long content in chunks, pass startChar/endChar (0-based character offsets, applied per URL; the response includes totalLength so you can continue with startChar=endChar of the previous call). To avoid reading the full text, pass find (a literal substring): the server searches the fetched text and returns only the matching contexts — much cheaper than pulling the whole page and scanning it yourself. In find mode startChar/endChar/maxLength are ignored; the response carries matches (merged context windows, each with the hits inside) plus totalMatches instead of content. The response includes statusCode — non-200 (e.g. 404) means the target returned an error page. XML (RSS/Atom/sitemap) and text/plain (markdown/robots.txt) are returned verbatim without HTML extraction. Uses proxy if configured. Returns the page title and extracted content as markdown. Hyperlinks are stripped to their visible text by default; pass includeLinks:true to keep [text](url).",
+        "description": "Fetch the content of a web page and extract its readable text. Zhihu requires a logged-in session in the cookie store (d_c0 + z_c0; import it once with import_cookies); question pages are expanded with their top answers. One call can fetch several URLs: pass `urls` (up to 10) instead of `url`; each URL comes back as its own object, a failing URL does not abort the others, and the default maxLength is split into a total budget of ~60k characters so a batch cannot blow up the context. Supports: Chinese websites (Zhihu, CSDN, Juejin, Bilibili), WeChat articles (mp.weixin.qq.com URLs or weixin.sogou.com/link?url=... redirects from web search), and arXiv papers — pass a paper ID directly (2401.12345, arXiv:2401.12345, math/0501001, or an arxiv.org/abs/... URL) to get the paper's HTML content (official arxiv.org/html conversion, falling back to ar5iv for older papers). Bilibili video URLs (bilibili.com/video/BVxxx, optional ?p=N for multi-part videos) return the subtitle track as SRT — requires stored SESSDATA cookies, since Bilibili only serves the subtitle list to logged-in users. YouTube video URLs (youtube.com/watch?v=ID, /shorts/ID, /live/ID, /embed/ID, youtu.be/ID) return the caption track as SRT — anonymous, no login needed (needs proxy egress outside mainland). For academic papers: search first with web (engines: dblp, cnki, ieee, exa), then use this tool to read the full text. To read long content in chunks, pass startChar/endChar (0-based character offsets, applied per URL; the response includes totalLength so you can continue with startChar=endChar of the previous call). To avoid reading the full text, pass find (a literal substring): the server searches the fetched text and returns only the matching contexts — much cheaper than pulling the whole page and scanning it yourself. In find mode startChar/endChar/maxLength are ignored; the response carries matches (merged context windows, each with the hits inside) plus totalMatches instead of content. The response includes statusCode — non-200 (e.g. 404) means the target returned an error page. XML (RSS/Atom/sitemap) and text/plain (markdown/robots.txt) are returned verbatim without HTML extraction. Uses proxy if configured. Returns the page title and extracted content as markdown. Hyperlinks are stripped to their visible text by default; pass includeLinks:true to keep [text](url). X/Twitter links get a special rule: with x.com login cookies in the store, x.com/<user> returns the profile plus recent posts, and x.com/<user>/status/<id> returns the post plus its replies (rendered through twscrape); without a login it falls back to the public SSR page, where /search is an empty login wall.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -791,6 +812,55 @@ fn string_list(v: &Value) -> Vec<String> {
 }
 
 async fn handle_web_search(
+    args: &Value,
+    config: &Config,
+    engine_map: &[Arc<dyn SearchEngine>],
+) -> String {
+    let response = handle_web_search_without_engram(args, config, engine_map).await;
+    if !config.engram_search_enabled || args["includeEngram"].as_bool() == Some(false) {
+        return response;
+    }
+    attach_engram_memories(response, args, config).await
+}
+
+async fn attach_engram_memories(response: String, args: &Value, config: &Config) -> String {
+    let mut parsed: Value = match serde_json::from_str(&response) {
+        Ok(value) => value,
+        Err(_) => return response,
+    };
+
+    if parsed.get("count").is_some() {
+        if let Some(results) = parsed.get_mut("results").and_then(Value::as_array_mut) {
+            let mut unavailable: Option<String> = None;
+            for item in results {
+                let Some(query) = item.get("query").and_then(Value::as_str) else { continue };
+                if query.starts_with("(item ") || item.get("error").is_some() { continue; }
+                if let Some(error) = &unavailable {
+                    item["engramError"] = Value::String(error.clone());
+                    continue;
+                }
+                match config.engram.search(query).await {
+                    Ok(memories) => item["engramMemories"] = Value::Array(memories),
+                    Err(error) => {
+                        item["engramError"] = Value::String(error.clone());
+                        unavailable = Some(error);
+                    }
+                }
+            }
+        }
+        return serde_json::to_string_pretty(&parsed).unwrap_or(response);
+    }
+
+    if let Some(query) = args.get("query").and_then(Value::as_str).filter(|q| !q.trim().is_empty()) {
+        match config.engram.search(query).await {
+            Ok(memories) => parsed["engramMemories"] = Value::Array(memories),
+            Err(error) => parsed["engramError"] = Value::String(error),
+        }
+    }
+    serde_json::to_string_pretty(&parsed).unwrap_or(response)
+}
+
+async fn handle_web_search_without_engram(
     args: &Value,
     config: &Config,
     engine_map: &[Arc<dyn SearchEngine>],
@@ -1605,7 +1675,17 @@ async fn fetch_one(url: &str, args: &Value, config: &Config, budget: &FetchBudge
 
     // One automatic retry on timeout — Sogou redirect chains occasionally
     // exceed the fetch timeout on the first attempt.
-    let mut fetch_result = fetch::fetch_url(url, config).await;
+    // X/Twitter: a logged-in session lets twscrape render the profile or post
+    // as structured markdown. `None` means "not ours" (guest, other URL, or
+    // twscrape absent) and the normal HTTP path runs unchanged.
+    let mut fetch_result = match crate::x::fetch_page(url, config).await {
+        Some(Ok(result)) => Ok(result),
+        Some(Err(e)) => {
+            eprintln!("⚠️ x: {} — falling back to normal fetch for {}", e, url);
+            fetch::fetch_url(url, config).await
+        }
+        None => fetch::fetch_url(url, config).await,
+    };
     if matches!(fetch_result, Err(fetch::FetchError::Timeout)) {
         eprintln!("⏱️ Timeout on first attempt, retrying once...");
         retried.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1828,18 +1908,27 @@ async fn fetch_one(url: &str, args: &Value, config: &Config, budget: &FetchBudge
     }
 
     let returned = content.chars().count();
+    // 404/410/451 carry the server's error page as content (useful: a missing
+    // release asset vs. a deleted page), but it must not look like a success —
+    // otherwise the caller quotes "404: Not Found" as if it were the document.
+    let http_error = (result.status_code >= 400).then(|| {
+        format!(
+            "HTTP {} — the server returned an error page, not the requested content",
+            result.status_code
+        )
+    });
     log(
         &result.site_name,
-        true,
+        http_error.is_none(),
         Some(result.status_code),
-        None,
+        http_error.as_deref(),
         total,
         returned,
         truncated,
         &result.via,
     );
 
-    serde_json::json!({
+    let mut response = serde_json::json!({
         "url": result.url,
         "title": result.title,
         "site": result.site_name,
@@ -1850,5 +1939,13 @@ async fn fetch_one(url: &str, args: &Value, config: &Config, budget: &FetchBudge
         "endChar": actual_end,
         "totalLength": total,
         "truncated": truncated,
-    })
+    });
+    if let Some(err) = http_error {
+        response["ok"] = serde_json::json!(false);
+        response["error"] = serde_json::json!(err);
+        response["hint"] = serde_json::json!(
+            "The URL may be wrong, deleted, or private. Verify the link before quoting this text: the content field holds the server's error page, not the document."
+        );
+    }
+    response
 }

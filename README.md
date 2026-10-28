@@ -8,9 +8,9 @@
 
 A Rust-based MCP server that gives your AI assistant **web search**, **local file search**, and **web page fetching** abilities.
 
-- **`web`** — Search with 11 engines (Exa, Bing, CSDN, Juejin, Startpage, Sogou, Weixin, DBLP, CNKI + credential-gated DeepSeek, IEEE), with **per-request filters** (`freshness`, `topic`, `includeDomains`, `excludeDomains`), **cross-engine de-duplication**, and **several topics per call** (`queries`)
+- **`web`** — Search with 16 engines (Exa, Bing, CSDN, Juejin, Startpage, Sogou, Weixin, DBLP, CNKI, DuckDuckGo + key/cookie-gated DeepSeek, IEEE, X/Twitter, Firecrawl, Octen, Parallel), with **per-request filters** (`freshness`, `topic`, `includeDomains`, `excludeDomains`), **cross-engine de-duplication**, and **several topics per call** (`queries`)
 - **`local`** — Search your local files via Everything (voidtools)
-- **`get_page`** — Fetch and extract readable content from any web page, with `find` (literal) and `highlights` (query-relevance) modes, and up to 10 URLs per call
+- **`get_page`** — Fetch and extract readable content from any web page, with `find` (literal) and `highlights` (query-relevance) modes, and up to 10 URLs per call. X/Twitter links get a special rule: with x.com login cookies stored, a profile URL returns the profile plus recent posts and a status URL returns the post plus its replies, rendered as markdown through `twscrape`
 - **`set_cookies`** — A local, **domain-scoped** cookie store: set / list / clear login and anti-bot cookies at runtime, no restart needed
 - **`import_cookies`** — Opt-in (`ADVENT_ALLOW_COOKIE_IMPORT=1`): read cookies from a dedicated Edge profile over the DevTools protocol
 
@@ -129,7 +129,7 @@ IEEE_API_KEY=your_key_here
 # Optional — restrict which engines are available (comma-separated).
 # IMPORTANT: if you set this, include every engine you want — including
 # deepseek once its key is configured:
-ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,deepseek,ieee
+ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,duckduckgo,deepseek,ieee,x,firecrawl,octen,parallel
 
 # Optional — browser cookies for fetching authenticated pages (e.g. zhihu.com)
 # Same format as the HTTP Cookie header:
@@ -137,7 +137,16 @@ FETCH_COOKIES="d_c0=ABC...; z_c0=DEF...; SESSIONID=GHI..."
 
 # Optional — for local file search (see step 2)
 EVERYTHING_ES_PATH=C:\path\to\es.exe
+
+# Optional — attach Engram memories to web search (requires an Engram MCP)
+ADVENT_ENGRAM_ENABLED=1
+ENGRAM_MCP_COMMAND=engram
+ENGRAM_MCP_ARGS_JSON='["mcp","--tools=agent"]'
 ```
+
+With `ADVENT_ENGRAM_ENABLED=1`, `web` attaches two relevant Engram title summaries per search topic by default, formatted as `#<id> <title>`; searches cover all projects, and memory previews and bodies are not included. The agent can pass `includeEngram: false` on an individual call to skip them. When unset, the feature is disabled and no Engram child process is started. `ENGRAM_MCP_COMMAND` defaults to `engram`; `ENGRAM_MCP_ARGS_JSON` defaults to `["mcp","--tools=agent"]`. Configure a custom launcher and its arguments in the MCP server's `env` when needed. Connection or search failures are reported as `engramError` while web results still return normally. Single-topic responses contain `engramMemories`; batched responses attach them to each topic result.
+
+For example, on Windows an existing PowerShell launcher can be configured with `ENGRAM_MCP_COMMAND=powershell.exe` and `ENGRAM_MCP_ARGS_JSON` set to a JSON string array containing `-NoProfile`, `-WindowStyle`, `Hidden`, `-ExecutionPolicy`, `Bypass`, `-File`, and the launcher path.
 
 ### 4. Register as an MCP server
 
@@ -156,7 +165,9 @@ Edit `%APPDATA%\Code\User\mcp.json` (all projects) or `.vscode\mcp.json` (curren
         "PROXY_URL": "http://127.0.0.1:7890",
         "USE_PROXY": "true",
         "EXA_API_KEY": "your_key_here",
-        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF..."
+        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF...",
+        "ADVENT_ENGRAM_ENABLED": "1",
+        "ENGRAM_MCP_ARGS_JSON": "[\"mcp\",\"--tools=agent\"]"
       }
     }
   }
@@ -177,7 +188,9 @@ Edit `opencode.json`:
         "PROXY_URL": "http://127.0.0.1:7890",
         "USE_PROXY": "true",
         "EXA_API_KEY": "your_key_here",
-        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF..."
+        "FETCH_COOKIES": "d_c0=ABC...; z_c0=DEF...",
+        "ADVENT_ENGRAM_ENABLED": "1",
+        "ENGRAM_MCP_ARGS_JSON": "[\"mcp\",\"--tools=agent\"]"
       },
       "type": "local"
     }
@@ -199,13 +212,23 @@ Edit `opencode.json`:
 | `DEEPSEEK_API_MODE` | No | *(auto)* | Force backend: `official` (api.deepseek.com) or `go` (opencode.ai) |
 | `DEEPSEEK_MODEL` | No | `deepseek-v4-flash` | Model used by the deepseek engine |
 | `IEEE_API_KEY` | No | — | IEEE Xplore Metadata Search API key ([developer.ieee.org](https://developer.ieee.org)) — enables the `ieee` engine |
+| `CURL_IMPERSONATE_PATH` | No | `%LOCALAPPDATA%\advent-mcp\bin\curl-impersonate.exe` | Optional [curl-impersonate](https://github.com/lexiforest/curl-impersonate) build (v2, `--impersonate` support). Enables the browser-fingerprint rung: same connection, a real Chrome TLS/JA4 handshake. Without it that rung is silently skipped |
+| `CURL_IMPERSONATE_PROFILE` | No | `chrome150` | Profile passed to `--impersonate`. Older profiles (chrome136 and below) were still challenged by Cloudflare in 2026-10 |
+| `FIRECRAWL_API_KEY` | No | — | Firecrawl API key ([firecrawl.dev](https://www.firecrawl.dev)) — enables the `firecrawl` engine. Free: 1,000 credits/month (≈500 searches) |
+| `OCTEN_API_KEY` | No | — | Octen Search API key ([octen.ai](https://octen.ai)) — enables the `octen` engine. Only a one-time $5 signup balance |
+| `PARALLEL_API_KEY` | No | — | Parallel Search API key ([platform.parallel.ai](https://platform.parallel.ai)) — enables the `parallel` engine. New accounts get a one-time $20 credit; the $5/month free credit needs a payment method |
 | `FETCH_COOKIES` | No | — | Legacy way to supply long-lived **login** cookies as a flat `key=value; key2=value2` blob. It is now split by cookie owner: `d_c0`/`z_c0` → `zhihu.com`, `SESSDATA`/`buvid3`/`bili_jct`/… → `bilibili.com`, `SNUID`/`SUV` → `sogou.com`; **unrecognized names are dropped** (they would otherwise be sent to every fetched host). Prefer `set_cookies` / `import_cookies`, which store cookies per domain. **Never commit real cookies** |
 | `COOKIE_CACHE_TTL` | No | `1200` | Age (seconds) after which a cached cookie is logged as stale. Advisory only — stale cookies are still used, the remote server is the real authority. `0` disables the warning |
 | `ADVENT_ALLOW_COOKIE_IMPORT` | No | `0` | Set to `1` to register the `import_cookies` tool. Off by default: it is a credential-access capability and should be approved separately |
 | `ADVENT_FETCH_LOG` | No | `0` | Set to `1` to append one JSON line per `get_page` fetch (URL, host, outcome, status, chars, duration, strategy, attached cookie names). Values are never logged |
 | `ADVENT_FETCH_LOG_PATH` | No | `<cookie dir>/fetch-log.jsonl` | Where the fetch log is written (rotated once at 8 MB) |
 | `EVERYTHING_ES_PATH` | No | — | Path to ES.exe (required to enable local search) |
-| `DEFAULT_SEARCH_ENGINE` | No | `exa` | Default search engine |
+| `TWSCRAPE_PATH` | No | `twscrape` | `twscrape` executable used for X/Twitter reads. Install with `uv tool install twscrape`; when it is missing (or no x.com login cookies are stored) `get_page` falls back to the public SSR page |
+| `X_MIN_INTERVAL_MS` | No | `8000` | Minimum spacing between consecutive `twscrape` calls, in ms; a random 0–3s jitter is added. X rate-limits per endpoint and per account, so calls are also serialized |
+| `ADVENT_ENGRAM_ENABLED` | No | `0` | Set to `1` to allow Engram memories in `web` results; off by default. Pass `includeEngram: false` per call to skip |
+| `ENGRAM_MCP_COMMAND` | No | `engram` | Executable or launcher for the Engram stdio MCP |
+| `ENGRAM_MCP_ARGS_JSON` | No | `["mcp","--tools=agent"]` | JSON array of arguments passed to the Engram MCP launcher |
+| `DEFAULT_SEARCH_ENGINE` | No | `bing` | Default search engine for `web` when the caller does not pass `engines`. Set it to whichever engine suits the deployment (e.g. `exa` where an Exa key is configured); Bing is only the out-of-the-box default |
 | `ALLOWED_SEARCH_ENGINES` | No | *(all)* | Comma-separated list of allowed engines |
 | `FETCH_TIMEOUT` | No | `30` | Fetch timeout in seconds |
 
@@ -281,7 +304,7 @@ pages are never merged. The count of folded duplicates is reported as
 requires fetching each page's body, which would turn the fast search path into
 a slow one, and title-based heuristics merge genuinely different pages.
 
-Supported engines (11 total, all tested): Exa (default), Bing, CSDN, Juejin, Startpage, Sogou, Weixin (WeChat articles), DBLP (CS bibliography), CNKI (知网), DeepSeek (LLM-backed, requires key), IEEE (Xplore metadata, requires key).
+Supported engines (16 total): Exa, Bing (default; override with `DEFAULT_SEARCH_ENGINE`, e.g. `exa`), CSDN, Juejin, Startpage, Sogou, Weixin (WeChat articles), DBLP (CS bibliography), CNKI (知网), DuckDuckGo (free, no key), plus gated engines — DeepSeek (LLM-backed, key), IEEE (Xplore metadata, key), X/Twitter (x.com cookies + `twscrape`), Firecrawl, Octen and Parallel (each needs its own API key).
 
 Credential-gated engines (implemented, hidden until key set — appear automatically in `tools/list` when the env var is present):
 - **`deepseek`** — LLM-backed web search via the Anthropic-compatible Messages API with the server-side `web_search_20250305` tool. Two backends auto-detected from key format:
@@ -429,6 +452,15 @@ maxHighlights (number, default 5, max 20) — Max snippets in highlights mode
 includeLinks (boolean, default false) — Keep markdown hyperlinks [text](url); by default links are stripped to their visible text to save tokens
 ```
 
+**X / Twitter rule.** `x.com/<user>` and `x.com/<user>/status/<id>` (also
+`twitter.com`) are not scraped as HTML when x.com login cookies are present:
+they are rendered from X's GraphQL API through `twscrape` — profile (bio,
+counters, 10 recent posts) or post (text, metrics, quoted post, 10 replies).
+Without a login, or when `twscrape` is not installed, the call falls back to
+the normal fetch path, where a profile returns a thin SSR shell and
+`/search` is an empty login wall. `find` / `highlights` still work on the
+rendered text.
+
 **Highlights mode** (`highlights`) is the token-cheap way to read a long page:
 instead of returning the whole document, the server ranks passages against your
 query and returns only the best ones. It is local and deterministic (no LLM
@@ -473,7 +505,8 @@ Smart fetching strategy:
 - **Bilibili videos** (`bilibili.com/video/BVxxx`, optional `?p=N` for multi-part) → subtitle track returned as SRT (requires `SESSDATA` stored for `bilibili.com` — Bilibili only serves the subtitle list to logged-in users)
 - **YouTube videos** (`youtube.com/watch?v=ID`, `/shorts/ID`, `/live/ID`, `/embed/ID`, `youtu.be/ID`) → caption track returned as SRT via the Innertube ANDROID player API (anonymous, no login; needs proxy egress outside mainland China). Track priority: manual English > manual any language > auto English > first available. Non-video pages (channel, playlist, search) fall through to the generic fetch path
 - **arXiv papers** → accepts a paper ID (`2401.12345`, `arXiv:2401.12345`, or an `arxiv.org/abs/...` URL) and returns the paper's HTML content (official `arxiv.org/html/` conversion, falling back to ar5iv for older papers)
-- **JS-heavy sites** → Jina Reader fallback
+- **MediaWiki wikis** (`minecraft.wiki`, `zh.minecraft.wiki`, `*.wiki.gg`, Fandom) → `api.php` extracts: clean plain text in ~0.5s, instead of a Cloudflare challenge page or a 200k-character render
+- **JS-heavy sites / anti-bot walls / PDFs** → escalation ladder: retry the same URL on the other egress (direct ↔ proxy), then replay it with `curl-impersonate` (optional binary, real browser TLS/JA4 + HTTP-2 fingerprint), and only then Firecrawl (`FIRECRAWL_API_KEY`, 1 credit per page). A 403 usually means "who is asking", not "the page is broken", so the cheap rungs come first
 - **Normal sites** → direct HTTP with HTML-to-Markdown
 
 ### Fetch log
@@ -482,7 +515,7 @@ Set `ADVENT_FETCH_LOG=1` to append one JSON object per fetch to
 `%LOCALAPPDATA%\advent-mcp\fetch-log.jsonl` (override with
 `ADVENT_FETCH_LOG_PATH`). It records the URL, host, ok/failure, HTTP status,
 extracted and returned character counts, duration, which strategy produced the
-content (`direct`, `jina`, `zhihu-api`, ...) and the **names** of the stored
+content (`direct`, `firecrawl`, `mediawiki-api`, `zhihu-api`, ...) and the **names** of the stored
 cookies that were attached. Cookie values and response bodies are never logged.
 
 ```jsonc

@@ -40,6 +40,11 @@ pub mod dblp;
 pub mod cnki;
 pub mod deepseek;
 pub mod ieee;
+pub mod x;
+pub mod firecrawl;
+pub mod octen;
+pub mod parallel;
+pub mod duckduckgo;
 
 /// Engines that require an API key / cookie from the environment.
 /// They are only added to the engine map when the credential is present;
@@ -51,6 +56,21 @@ fn credential_gated_engines(config: &Config) -> Vec<Arc<dyn SearchEngine>> {
     }
     if config.has_ieee_key() {
         engines.push(Arc::new(ieee::IeeeEngine));
+    }
+    // X needs a logged-in x.com session; without auth_token + ct0 the search
+    // endpoint is a login wall, so the engine is not registered at all.
+    if crate::x::has_login(config) {
+        engines.push(Arc::new(x::XEngine));
+    }
+    // Keyed web-search APIs: only engines whose key we actually hold.
+    if config.api_key("firecrawl").is_some() {
+        engines.push(Arc::new(firecrawl::FirecrawlEngine));
+    }
+    if config.api_key("octen").is_some() {
+        engines.push(Arc::new(octen::OctenEngine));
+    }
+    if config.api_key("parallel").is_some() {
+        engines.push(Arc::new(parallel::ParallelEngine));
     }
     engines
 }
@@ -68,6 +88,8 @@ pub fn create_engine_map(config: &Config) -> Vec<Arc<dyn SearchEngine>> {
         Arc::new(weixin::WeixinEngine),
         Arc::new(dblp::DblpEngine),
         Arc::new(cnki::CnkiEngine),
+        // No key, no account: the zero-config fallback.
+        Arc::new(duckduckgo::DuckDuckGoEngine),
     ];
 
     engines
