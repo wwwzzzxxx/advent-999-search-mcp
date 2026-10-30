@@ -1,6 +1,9 @@
 #!/bin/bash
 # Build the Linux release binaries for advent-999-search-mcp.
 #
+# Fallback path: the primary aarch64 builder is the Raspberry Pi (`ssh pi`,
+# see AGENTS.md / memory #1578). Use this script when the Pi is unavailable.
+#
 # Run this ON r7525 (Ubuntu 24.04 x86_64, Docker available). It produces:
 #   target/release/advent-999-search-mcp                              (x86_64)
 #   target/aarch64-unknown-linux-gnu/release/advent-999-search-mcp    (aarch64)
