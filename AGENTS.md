@@ -177,7 +177,13 @@ cargo build --release                # 产物 target/release/advent-999-search-m
 | `advent-999-search-mcp-linux-x86_64` | Linux x86_64（glibc） |
 | `advent-999-search-mcp-linux-aarch64` | Linux ARM64（aarch64） |
 
-Linux 资产在 **r7525**（Ubuntu 24.04 x86_64、256 核）构建：x86_64 原生 `cargo build --release`；aarch64 用 `cross`（Docker 交叉镜像）。构建后 `scp` 回本机 `target/release/`，按上表命名。`scripts/publish.ps1` 默认在缺少任一 Linux 资产时**直接失败**；只有明确知道自己在做什么时才可用 `-AllowMissingLinux`，平时不要用。
+Linux 资产在 **r7525**（Ubuntu 24.04 x86_64、256 核）构建：
+
+- x86_64：原生 `cargo build --release`。
+- aarch64：**不要用 stock cross 镜像**（0.2.5 基于 Ubuntu 16.04，glibc 2.23，且不含 OpenSSL）。用自建 `advent-arm64-cross:24.04` 镜像：Ubuntu 24.04 + `gcc-aarch64-linux-gnu libssl-dev:arm64 libc6-dev:arm64 pkg-config build-essential`，把宿主的 `~/.rustup`、`~/.cargo` 和仓库挂进容器，设置 `CC_aarch64_unknown_linux_gnu`、`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc`、`RUSTFLAGS="-C link-arg=-B/usr/lib/aarch64-linux-gnu -C link-arg=-L/usr/lib/aarch64-linux-gnu"`、`PKG_CONFIG_ALLOW_CROSS=1`、`PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig`。完整命令见 `scripts/build-linux.sh`。
+- 国内到 ghcr.io / GitHub Releases 不稳时：本机 `ssh -R 17890:127.0.0.1:7890 r7525` 反向转发本地代理，服务器侧用 `https_proxy=http://127.0.0.1:17890` 或 `crane`（`crane pull` 后 `docker load`）绕过。
+
+构建后 `scp` 回本机 `target/release/`，按上表命名。`scripts/publish.ps1` 默认在缺少任一 Linux 资产时**直接失败**；只有明确知道自己在做什么时才可用 `-AllowMissingLinux`，平时不要用。
 
 1. 更新 `Cargo.toml` 版本号（`src/main.rs` 的 `serverInfo.version` 已改用 `env!("CARGO_PKG_VERSION")`，不用手改）
 2. `cargo check` 更新 `Cargo.lock`，提交并确认工作区干净
