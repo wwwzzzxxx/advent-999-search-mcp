@@ -169,7 +169,18 @@ cargo build --release                # 产物 target/release/advent-999-search-m
 
 ## 发布流程（publish.ps1 已封装）
 
-1. 更新 `Cargo.toml` 版本号 + `src/main.rs` serverInfo
-2. 构建 release，确认二进制字节数（版本以 `Cargo.toml` 为准，当前 v0.4.1；字节数以实际构建为准）
-3. `./scripts/publish.ps1`：push 双 remote（GitHub `wwwzzzxxx` + Gitee `pzwzx`）→ 两平台创建/更新 Release → 上传附件
-4. 验证两平台附件字节数一致（Gitee API 需要 `target_commitish` 字段）
+**每个 release 必须同时提供三个附件，缺一不算发布完成：**
+
+| 附件 | 平台 / 架构 |
+|---|---|
+| `advent-999-search-mcp.exe` | Windows x86_64 |
+| `advent-999-search-mcp-linux-x86_64` | Linux x86_64（glibc） |
+| `advent-999-search-mcp-linux-aarch64` | Linux ARM64（aarch64） |
+
+Linux 资产在 **r7525**（Ubuntu 24.04 x86_64、256 核）构建：x86_64 原生 `cargo build --release`；aarch64 用 `cross`（Docker 交叉镜像）。构建后 `scp` 回本机 `target/release/`，按上表命名。`scripts/publish.ps1` 默认在缺少任一 Linux 资产时**直接失败**；只有明确知道自己在做什么时才可用 `-AllowMissingLinux`，平时不要用。
+
+1. 更新 `Cargo.toml` 版本号（`src/main.rs` 的 `serverInfo.version` 已改用 `env!("CARGO_PKG_VERSION")`，不用手改）
+2. `cargo check` 更新 `Cargo.lock`，提交并确认工作区干净
+3. 构建三个平台的二进制并放到位，核对字节数非零
+4. `pwsh ./scripts/publish.ps1`（脚本是 UTF-8 无 BOM，必须用 PowerShell 7；5.1 会按 GBK 解码直接语法报错）：push 双 remote（GitHub `wwwzzzxxx` + Gitee `pzwzx`）→ 两平台创建/更新 Release → 上传全部附件
+5. 验证两平台附件齐全且字节数一致（Gitee API 需要 `target_commitish` 字段）

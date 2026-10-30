@@ -29,9 +29,10 @@ A Rust-based MCP server that gives your AI assistant **web search**, **local fil
 
 ### 1. Get the binary
 
-**Option A — Download** (recommended): Get the binary for your platform from the [Releases page](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases):
-- `advent-999-search-mcp.exe` — Windows
-- `advent-999-search-mcp-linux` — Linux (make it executable with `chmod +x`)
+**Option A — Download** (recommended): Get the binary for your platform from the [Releases page](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases). Every release ships three assets:
+- `advent-999-search-mcp.exe` — Windows x86_64
+- `advent-999-search-mcp-linux-x86_64` — Linux x86_64 (glibc; `chmod +x` after download)
+- `advent-999-search-mcp-linux-aarch64` — Linux ARM64 / aarch64 (glibc; `chmod +x` after download)
 
 **Option B — Build from source**:
 

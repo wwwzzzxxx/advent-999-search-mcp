@@ -29,9 +29,10 @@
 
 ### 1. 获取可执行文件
 
-**方式一：直接下载**（推荐）：从 [Releases 页面](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases) 下载对应平台的二进制：
-- `advent-999-search-mcp.exe` — Windows
-- `advent-999-search-mcp-linux` — Linux（下载后执行 `chmod +x` 赋予可执行权限）
+**方式一：直接下载**（推荐）：从 [Releases 页面](https://github.com/wwwzzzxxx/advent-999-search-mcp/releases) 下载对应平台的二进制。每个 release 都提供三个附件：
+- `advent-999-search-mcp.exe` — Windows x86_64
+- `advent-999-search-mcp-linux-x86_64` — Linux x86_64（glibc，下载后 `chmod +x`）
+- `advent-999-search-mcp-linux-aarch64` — Linux ARM64 / aarch64（glibc，下载后 `chmod +x`）
 
 **方式二：从源码编译**：
 

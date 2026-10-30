@@ -61,7 +61,9 @@ param(
   [switch]$ForceTag,
   [switch]$Prerelease,
   [switch]$SaveToken,
-  [switch]$DryRun
+  [switch]$DryRun,
+  # Escape hatch only. Normal releases must ship Windows + Linux x86_64 + Linux aarch64.
+  [switch]$AllowMissingLinux
 )
 
 $ErrorActionPreference = "Stop"
@@ -128,12 +130,23 @@ Ok "二进制: $ExePath ($((Get-Item $ExePath).Length) bytes)"
 $LinuxAssets = @(Get-ChildItem (Join-Path $ProjectDir "target\release") -Filter "advent-999-search-mcp-linux*" -File -ErrorAction SilentlyContinue |
                  Where-Object { $_.Name -notlike "*.stale*" } |
                  ForEach-Object { $_.FullName })
+# 发布规则：Windows x86_64 + Linux x86_64 + Linux aarch64，缺一不算完成。
+$requiredLinux = @(
+  (Join-Path $ProjectDir "target\release\advent-999-search-mcp-linux-x86_64"),
+  (Join-Path $ProjectDir "target\release\advent-999-search-mcp-linux-aarch64")
+)
+$missingLinux = @($requiredLinux | Where-Object { -not (Test-Path $_) })
+if ($missingLinux.Count -gt 0) {
+  if ($AllowMissingLinux) {
+    Warn "缺少 Linux 资产，但指定了 -AllowMissingLinux，仅发布 Windows 版："
+    foreach ($m in $missingLinux) { Warn "  $m" }
+  } else {
+    foreach ($m in $missingLinux) { Warn "缺少必需附件: $m" }
+    Fail "发布必须包含 Windows x86_64、Linux x86_64、Linux aarch64 三个二进制。请在 r7525 构建后拷回 target\release\（见 AGENTS.md「发布流程」）；确需只发 Windows 才用 -AllowMissingLinux。"
+  }
+}
 if ($LinuxAssets.Count -gt 0) {
   foreach ($a in $LinuxAssets) { Ok "Linux 二进制: $a ($((Get-Item $a).Length) bytes)" }
-} else {
-  Warn "找不到 Linux 二进制（target\release\advent-999-search-mcp-linux-*）—— 只发布 Windows 版。"
-  Warn "  在 Linux 机器上构建后拷回：cargo build --release && cp target/release/advent-999-search-mcp <repo>/target/release/advent-999-search-mcp-linux-x86_64"
-  Warn "  ARM（树莓派）：同样构建后命名为 advent-999-search-mcp-linux-aarch64"
 }
 
 # ---------- 4. Tag 处理 ----------

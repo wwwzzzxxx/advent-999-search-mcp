@@ -105,7 +105,9 @@ async fn main() {
                         },
                         "serverInfo": {
                             "name": "advent-999-search-mcp",
-                            "version": "0.11.0"
+                            // Never hard-code this again: it silently drifted
+                            // from Cargo.toml through v0.11-v0.13.
+                            "version": env!("CARGO_PKG_VERSION")
                         }
                     }
                 });
