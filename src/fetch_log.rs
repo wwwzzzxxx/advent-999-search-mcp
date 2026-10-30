@@ -149,6 +149,12 @@ fn rotate_if_needed(path: &std::path::Path) {
     }
 }
 
+/// Current UTC timestamp in the same `1970-01-01T00:00:00Z` form used by the
+/// log lines. Shared with `search_log`.
+pub fn now_iso8601() -> String {
+    iso8601(now_secs())
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

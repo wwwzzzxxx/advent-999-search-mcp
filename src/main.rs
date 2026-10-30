@@ -11,6 +11,7 @@ mod anubis;
 mod cookie_cache;
 mod browser_cookies;
 mod fetch_log;
+mod search_log;
 mod throttle;
 mod engram;
 mod x;
@@ -43,6 +44,9 @@ async fn main() {
     eprintln!("🔍 Default engine: {}", config.default_search_engine);
     if let Some(path) = fetch_log::path() {
         eprintln!("📝 get_page fetch log: {}", path.display());
+    }
+    if let Some(path) = search_log::path() {
+        eprintln!("📝 web search log: {}", path.display());
     }
     if config.use_proxy {
         if let Some(ref url) = config.proxy_url {
@@ -178,6 +182,40 @@ async fn write_response_locked(resp: &Value, lock: &std::sync::Arc<tokio::sync::
     write_response(resp);
 }
 
+/// Label shown for an engine in the `web` tool description.
+///
+/// `AA` is the Artificial Analysis Search Index (data 2026-10-19, higher is
+/// better); engines AA does not benchmark are marked `unscored`. The use-case
+/// hints combine the AA sub-scores, provider docs, and live probes of every
+/// engine on 2026-10-30 (Chinese news, Rust docs, OOM troubleshooting, papers).
+fn engine_label(name: &str) -> String {
+    let label = match name {
+        "exa" => "Exa (AA 80; default: general/factual + semantic discovery, honours dates/domains)",
+        "perplexity" => "Perplexity (AA 80; news + multi-hop, needs key)",
+        "octen" => "Octen (AA 77; cheap highlights, fast, occasional off-topic)",
+        "parallel" => "Parallel (AA 73 fast / 75 advanced; technical docs + multi-hop research, needs key)",
+        "brave" => "Brave (AA 75 LLM context / 65 web; independent index, needs key)",
+        "firecrawl" => "Firecrawl (AA 73; long pages and full-text scrape/markdown, needs key)",
+        "serper" => "Serper (unscored; real Google SERP, best for keyword/news/exact entity lookup, needs key)",
+        "apify" => "Apify (unscored; real Google SERP via hosted actor, $5/month free keeps refilling, slow 10-60s, needs key)",
+        "deepseek" => "DeepSeek (AA 69; factual Q&A, needs key)",
+        "bing" => "Bing (unscored; poor relevance, Chinese queries return homepages — avoid)",
+        "duckduckgo" => "DuckDuckGo (unscored; free, forums/community; often anti-bot blocked)",
+        "sogou" => "Sogou(搜狗) (unscored; Chinese news; needs fresh SNUID, IP rate-limited)",
+        "weixin" => "Weixin(微信公众号) (unscored; WeChat articles for Chinese news)",
+        "csdn" => "CSDN (unscored; Chinese dev blogs and troubleshooting)",
+        "juejin" => "Juejin(掘金) (unscored; Chinese dev posts, relevance noisy)",
+        "startpage" => "Startpage (unscored; Google results via proxy, usually Anubis-blocked)",
+        "dblp" => "DBLP(计算机文献) (unscored; CS papers)",
+        "cnki" => "CNKI(知网) (unscored; Chinese papers)",
+        "ieee" => "IEEE Xplore (unscored; IEEE papers)",
+        "semantic_scholar" => "Semantic Scholar (unscored; CS papers)",
+        "x" => "X/Twitter (unscored; posts from X)",
+        _ => return name.chars().next().map(|c| c.to_uppercase().to_string() + &name[1..]).unwrap_or_default(),
+    };
+    label.to_string()
+}
+
 fn list_tools(config: &Config) -> Vec<Value> {
     // All engines that are actually available right now (free ones + any
     // enabled by env credentials). Keeps the tools/list schema honest.
@@ -187,45 +225,10 @@ fn list_tools(config: &Config) -> Vec<Value> {
 
     // If ALLOWED_SEARCH_ENGINES restricts the list, respect that for the description
     let engines_desc = if config.allowed_search_engines.is_empty() {
-        let labeled: Vec<String> = engine_names.iter().map(|e| match e.as_str() {
-            "juejin" => "Juejin(掘金)".to_string(),
-            "startpage" => "Startpage".to_string(),
-            "sogou" => "Sogou(搜狗)".to_string(),
-            "weixin" => "Weixin(微信公众号)".to_string(),
-            "dblp" => "DBLP(计算机文献)".to_string(),
-            "semantic_scholar" => "Semantic Scholar".to_string(),
-            "ieee" => "IEEE Xplore".to_string(),
-            "cnki" => "CNKI(知网)".to_string(),
-            "brave" => "Brave".to_string(),
-            "parallel" => "Parallel".to_string(),
-            "perplexity" => "Perplexity".to_string(),
-            "firecrawl" => "Firecrawl".to_string(),
-            "octen" => "Octen".to_string(),
-            "duckduckgo" => "DuckDuckGo".to_string(),
-            "x" => "X/Twitter".to_string(),
-            _ => e.chars().next().map(|c| c.to_uppercase().to_string() + &e[1..]).unwrap_or_default(),
-        }).collect();
-        labeled.join(", ")
+        engine_names.iter().map(|e| engine_label(e)).collect::<Vec<_>>().join(", ")
     } else {
         config.allowed_search_engines.iter()
-            .map(|e| match e.as_str() {
-                "juejin" => "Juejin(掘金)".to_string(),
-                "startpage" => "Startpage".to_string(),
-                "sogou" => "Sogou(搜狗)".to_string(),
-                "weixin" => "Weixin(微信公众号)".to_string(),
-                "dblp" => "DBLP(计算机文献)".to_string(),
-                "semantic_scholar" => "Semantic Scholar".to_string(),
-                "ieee" => "IEEE Xplore".to_string(),
-                "cnki" => "CNKI(知网)".to_string(),
-            "brave" => "Brave".to_string(),
-            "parallel" => "Parallel".to_string(),
-            "perplexity" => "Perplexity".to_string(),
-            "firecrawl" => "Firecrawl".to_string(),
-            "octen" => "Octen".to_string(),
-            "duckduckgo" => "DuckDuckGo".to_string(),
-            "x" => "X/Twitter".to_string(),
-                _ => e.chars().next().map(|c| c.to_uppercase().to_string() + &e[1..]).unwrap_or_default(),
-            })
+            .map(|e| engine_label(e))
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -240,7 +243,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
     let search_tool = serde_json::json!({
         "name": "web",
         "description": format!(
-            "Search the web using these engines: {}. Academic search tips: use dblp for CS papers, cnki for Chinese papers, ieee for IEEE Xplore; then pass any arXiv ID / URL or paper links from results to get_page to read the full text. WeChat article results (weixin.sogou.com/link?url=...) can also be passed directly to get_page. searchMode meanings: omit or set auto to use the server configured SEARCH_MODE; request forces request-based search; playwright forces browser-based search. For several topics pass `queries` (up to 10) in ONE call instead of several web calls: the server fans out (query x engine) concurrently under one per-engine throttle, which saves round-trips and, on clients that run tool calls one at a time, is simply faster. Each topic's results come back separately; a bad topic does not lose the others. When ADVENT_ENGRAM_ENABLED=1, two relevant Engram memories are attached by default; set includeEngram=false to skip them for this call.",
+            "Search the web using these engines (AA = Artificial Analysis Search Index, data 2026-10-19, 0-100 higher is better; `unscored` = AA does not benchmark it): {}. Pick engines by task: default exa; Google keyword/news/exact entity lookup serper (fast) or apify (monthly free quota, slow); Chinese breaking news add sogou/weixin; Chinese dev troubleshooting add csdn; papers dblp/cnki/ieee; forums and community opinions duckduckgo; long pages firecrawl; multi-hop research parallel. `limit` is shared evenly across the requested engines: if limit is smaller than the engine count the tail engines get no slot (the response lists them in `warnings`), so pass limit >= 3x engines when you want broad coverage. Never point get_page at a search results page. Academic search tips: use dblp for CS papers, cnki for Chinese papers, ieee for IEEE Xplore; then pass any arXiv ID / URL or paper links from results to get_page to read the full text. WeChat article results (weixin.sogou.com/link?url=...) can also be passed directly to get_page. searchMode: auto uses the configured mode; request/playwright force one. For several topics pass `queries` (up to 10) in ONE call instead of several web calls: the server fans out (query x engine) concurrently under one per-engine throttle, which saves round-trips and, on clients that run tool calls one at a time, is simply faster. Each topic's results come back separately; a bad topic does not lose the others.",
             engines_desc
         ),
         "inputSchema": {
@@ -255,7 +258,7 @@ fn list_tools(config: &Config) -> Vec<Value> {
                     "items": { "type": "string" },
                     "minItems": 1,
                     "maxItems": 10,
-                    "description": "Several topics in one call (1-10). Same options apply to all of them. Returns one result object per topic, in input order; an invalid or failing topic is reported as {query, error} and does not abort the rest."
+                    "description": "Several topics in one call (1-10); one result object per topic, in order."
                 },
                 "limit": {
                     "type": "number",
@@ -275,31 +278,31 @@ fn list_tools(config: &Config) -> Vec<Value> {
                 },
                 "freshness": {
                     "type": "string",
-                    "description": "Restrict results by publish/insert time: day | week | month | year, or an explicit range YYYY-MM-DD..YYYY-MM-DD. Honoured natively by exa/sogou/csdn/ieee; approximated by a newest-first sort on juejin/cnki; mapped to X's since:/until: operators for x (best effort); sent but unverified on bing; not supported by weixin/startpage. The response's `filters.freshnessByEngine` reports which engines actually applied it."
+                    "description": "day | week | month | year, or YYYY-MM-DD..YYYY-MM-DD. Native for exa/sogou/csdn/ieee/serper/apify; see filters.freshnessByEngine for the rest."
                 },
                 "topic": {
                     "type": "string",
                     "enum": ["news", "general"],
-                    "description": "Content category hint. Only exa honours it natively today; `filters.topicAppliedBy` lists the engines that did."
+                    "description": "news | general. Only exa honours it natively."
                 },
                 "includeDomains": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Only return results from these domains (and their subdomains). Empty = no restriction. Passed to exa natively and applied to every other engine as a post-filter."
+                    "description": "Only these domains (and subdomains)."
                 },
                 "excludeDomains": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Drop results from these domains (and their subdomains)."
+                    "description": "Drop these domains (and subdomains)."
                 },
                 "dedupe": {
                     "type": "boolean",
-                    "description": "Fold duplicate URLs across engines into one result (default true). Tracking parameters are stripped; URLs that differ in a meaningful parameter (e.g. a bilibili ?p=2) are kept separate.",
+                    "description": "Fold duplicate URLs across engines into one result.",
                     "default": true
                 },
                 "includeEngram": {
                     "type": "boolean",
-                    "description": "Include the two most relevant Engram memories with this search. Defaults to true when ADVENT_ENGRAM_ENABLED=1; false skips Engram for this call.",
+                    "description": "Attach relevant Engram memories (default when enabled).",
                     "default": true
                 }
             },
@@ -943,6 +946,11 @@ async fn handle_web_search_without_engram(
     let per_engine = if engine_count > 0 { limit / engine_count } else { limit };
     let remainder = if engine_count > 0 { limit % engine_count } else { 0 };
 
+    // Engines that get no share of `limit` are skipped (not an error). They are
+    // logged and explained in a `warnings` entry so the caller can tell "this
+    // engine found nothing" from "this engine was never asked".
+    let mut skipped_engines: Vec<String> = Vec::new();
+
     let mut partial_failures: Vec<PartialFailure> = Vec::new();
     // engine name -> its results (or error). Collected by name so the final
     // ordering stays deterministic regardless of completion order.
@@ -953,6 +961,19 @@ async fn handle_web_search_without_engram(
     for (i, engine_name) in resolved_engines.iter().enumerate() {
         let engine_limit = per_engine + if i < remainder { 1 } else { 0 };
         if engine_limit == 0 {
+            skipped_engines.push(engine_name.clone());
+            search_log::write(&search_log::Entry {
+                query: &query,
+                engine: engine_name,
+                ok: false,
+                results: 0,
+                duration_ms: 0,
+                limit,
+                share: 0,
+                batch: 0,
+                code: "skipped",
+                error: Some("no share of limit: more engines than limit"),
+            });
             continue;
         }
         match engine_map.iter().find(|e| e.name() == engine_name) {
@@ -963,11 +984,12 @@ async fn handle_web_search_without_engram(
                 let c = config.clone();
                 let n = engine_name.clone();
                 set.spawn(async move {
+                    let started = std::time::Instant::now();
                     // Per-family throttling: held for the whole engine call
                     // (sogou/weixin serialize, dblp/startpage capped).
                     let _permits = crate::throttle::acquire(&n).await;
                     let res = engine.search(&q, engine_limit, &o, &c).await;
-                    (n, res)
+                    (n, engine_limit, res, started.elapsed().as_millis())
                 });
             }
             None => partial_failures.push(PartialFailure {
@@ -980,13 +1002,33 @@ async fn handle_web_search_without_engram(
 
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok((name, Ok(results))) => {
-                eprintln!("✅ {} returned {} results", name, results.len());
-                collected.insert(name, Ok(results));
-            }
-            Ok((name, Err(err))) => {
-                eprintln!("⚠️ {} search failed: {}", name, err);
-                collected.insert(name, Err(err.to_string()));
+            Ok((name, share, res, ms)) => {
+                let (ok, count, code, err) = match &res {
+                    Ok(results) => (true, results.len(), "ok", None),
+                    Err(e) => (false, 0, "error", Some(e.to_string())),
+                };
+                search_log::write(&search_log::Entry {
+                    query: &query,
+                    engine: &name,
+                    ok,
+                    results: count,
+                    duration_ms: ms,
+                    limit,
+                    share,
+                    batch: 0,
+                    code,
+                    error: err.as_deref(),
+                });
+                match res {
+                    Ok(results) => {
+                        eprintln!("✅ {} returned {} results", name, results.len());
+                        collected.insert(name, Ok(results));
+                    }
+                    Err(err) => {
+                        eprintln!("⚠️ {} search failed: {}", name, err);
+                        collected.insert(name, Err(err.to_string()));
+                    }
+                }
             }
             Err(join_err) => {
                 eprintln!("⚠️ engine task panicked: {}", join_err);
@@ -1038,17 +1080,39 @@ async fn handle_web_search_without_engram(
         &exclude_domains,
     );
 
+    let mut warnings = Vec::new();
+    if let Some(w) = limit_share_warning(limit, engine_count, &skipped_engines) {
+        warnings.push(w);
+    }
+
     let response = SearchResponse {
         query: query.clone(),
         engines: resolved_engines,
         total_results: all_results.len(),
         results: all_results,
         partial_failures,
+        warnings,
         duplicates_removed,
         filters: filters_meta,
     };
 
     serde_json::to_string_pretty(&response).unwrap_or_default()
+}
+
+/// Explain engines that received no share of `limit`. The call itself still
+/// succeeds: this is a note, not an error.
+fn limit_share_warning(limit: usize, engine_count: usize, skipped: &[String]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "limit={} is split across {} engines, so {} engine(s) got no slot and were skipped: {}. Raise limit to at least {} (or pass fewer engines) so every engine runs; engines are served in the order given.",
+        limit,
+        engine_count,
+        skipped.len(),
+        skipped.join(", "),
+        engine_count
+    ))
 }
 
 /// Batched parallel search: N topics in one call.
@@ -1198,6 +1262,8 @@ async fn handle_web_queries(
 
     // ── fan out (query × engine) ─────────────────────────────────────────
     let mut set = tokio::task::JoinSet::new();
+    // qi -> engines that got no share of that topic's limit
+    let mut skipped_by_query: Vec<Vec<String>> = (0..subs.len()).map(|_| Vec::new()).collect();
     for (qi, entry) in subs.iter().enumerate() {
         let Some(sub) = entry.sub.as_ref() else { continue };
         let n_engines = sub.engines.len();
@@ -1206,6 +1272,19 @@ async fn handle_web_queries(
         for (i, engine_name) in sub.engines.iter().enumerate() {
             let engine_limit = per_engine + if i < remainder { 1 } else { 0 };
             if engine_limit == 0 {
+                skipped_by_query[qi].push(engine_name.clone());
+                search_log::write(&search_log::Entry {
+                    query: &sub.query,
+                    engine: engine_name,
+                    ok: false,
+                    results: 0,
+                    duration_ms: 0,
+                    limit: sub.limit,
+                    share: 0,
+                    batch: qi + 1,
+                    code: "skipped",
+                    error: Some("no share of limit: more engines than limit"),
+                });
                 continue;
             }
             match engine_map.iter().find(|e| e.name() == engine_name) {
@@ -1216,9 +1295,10 @@ async fn handle_web_queries(
                     let c = config.clone();
                     let n = engine_name.clone();
                     set.spawn(async move {
+                        let started = std::time::Instant::now();
                         let _permits = crate::throttle::acquire(&n).await;
                         let res = engine.search(&q, engine_limit, &o, &c).await;
-                        (qi, n, res)
+                        (qi, n, engine_limit, res, started.elapsed().as_millis())
                     });
                 }
                 None => {
@@ -1232,7 +1312,9 @@ async fn handle_web_queries(
                         (
                             qi_c,
                             n_c,
+                            engine_limit,
                             Err(models::SearchError::Engine("unsupported_engine".to_string())),
+                            0u128,
                         )
                     });
                 }
@@ -1247,21 +1329,48 @@ async fn handle_web_queries(
     let mut unsupported: Vec<Vec<PartialFailure>> = (0..subs.len()).map(|_| Vec::new()).collect();
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok((qi, name, Ok(results))) => {
-                eprintln!("✅ [{}] {} returned {} results", subs[qi].label, name, results.len());
-                collected[qi].insert(name, Ok(results));
-            }
-            Ok((qi, name, Err(err))) => {
-                let msg = err.to_string();
-                if msg.contains("unsupported_engine") {
-                    unsupported[qi].push(PartialFailure {
-                        engine: name.clone(),
-                        code: "unsupported_engine".to_string(),
-                        message: format!("Unsupported search engine: {}", name),
+            Ok((qi, name, share, res, ms)) => {
+                let (ok, count, code, err) = match &res {
+                    Ok(results) => (true, results.len(), "ok", None),
+                    Err(e) => (false, 0, "error", Some(e.to_string())),
+                };
+                if let Some(sub) = subs[qi].sub.as_ref() {
+                    search_log::write(&search_log::Entry {
+                        query: &sub.query,
+                        engine: &name,
+                        ok,
+                        results: count,
+                        duration_ms: ms,
+                        limit: sub.limit,
+                        share,
+                        batch: qi + 1,
+                        code,
+                        error: err.as_deref(),
                     });
-                } else {
-                    eprintln!("⚠️ [{}] {} search failed: {}", subs[qi].label, name, msg);
-                    collected[qi].insert(name, Err(msg));
+                }
+                match res {
+                    Ok(results) => {
+                        eprintln!(
+                            "✅ [{}] {} returned {} results",
+                            subs[qi].label,
+                            name,
+                            results.len()
+                        );
+                        collected[qi].insert(name, Ok(results));
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        if msg.contains("unsupported_engine") {
+                            unsupported[qi].push(PartialFailure {
+                                engine: name.clone(),
+                                code: "unsupported_engine".to_string(),
+                                message: format!("Unsupported search engine: {}", name),
+                            });
+                        } else {
+                            eprintln!("⚠️ [{}] {} search failed: {}", subs[qi].label, name, msg);
+                            collected[qi].insert(name, Err(msg));
+                        }
+                    }
                 }
             }
             Err(join_err) => {
@@ -1324,6 +1433,13 @@ async fn handle_web_queries(
             "results": all_results,
             "partialFailures": partial_failures,
         });
+        if let Some(w) = limit_share_warning(
+            sub.limit,
+            sub.engines.len(),
+            &skipped_by_query[qi],
+        ) {
+            obj["warnings"] = serde_json::json!([w]);
+        }
         if sub.do_dedupe && duplicates_removed > 0 {
             obj["duplicatesRemoved"] = serde_json::json!(duplicates_removed);
         }

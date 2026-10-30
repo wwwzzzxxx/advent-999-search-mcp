@@ -44,6 +44,8 @@ pub mod x;
 pub mod firecrawl;
 pub mod octen;
 pub mod parallel;
+pub mod serper;
+pub mod apify;
 pub mod duckduckgo;
 
 /// Engines that require an API key / cookie from the environment.
@@ -71,6 +73,14 @@ fn credential_gated_engines(config: &Config) -> Vec<Arc<dyn SearchEngine>> {
     }
     if config.api_key("parallel").is_some() {
         engines.push(Arc::new(parallel::ParallelEngine));
+    }
+    // Real Google SERP results; replaces the blocked startpage scraper.
+    if config.api_key("serper").is_some() {
+        engines.push(Arc::new(serper::SerperEngine));
+    }
+    // Google SERP via Apify's hosted actor: free $5/month keeps refilling.
+    if config.api_key("apify").is_some() {
+        engines.push(Arc::new(apify::ApifyEngine));
     }
     engines
 }

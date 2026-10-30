@@ -42,6 +42,11 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     #[serde(rename = "partialFailures")]
     pub partial_failures: Vec<PartialFailure>,
+    /// Human-readable notes about how the request was served — currently the
+    /// engines that got no share of `limit` and were therefore skipped
+    /// (omitted when empty).
+    #[serde(rename = "warnings", skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// How many duplicate URLs were folded together (omitted when zero).
     #[serde(
         rename = "duplicatesRemoved",

@@ -126,10 +126,22 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # optional: override model
 # business hours before first use). The key is read ONLY from this env var.
 IEEE_API_KEY=your_key_here
 
+# Optional — Serper.dev Google search key (enables the `serper` engine).
+# 2,500 free queries on signup, no credit card; then $1/1k. https://serper.dev
+SERPER_API_KEY=your_key_here
+
+# Optional — Apify token (enables the `apify` engine, Google Search Scraper).
+# Free plan: $5 of platform usage per month (no card, no rollover),
+# roughly 1,000 queries/month; each call takes 30-80s.
+# https://console.apify.com/settings/integrations
+APIFY_API_KEY=apify_api_your_token
+
 # Optional — restrict which engines are available (comma-separated).
 # IMPORTANT: if you set this, include every engine you want — including
-# deepseek once its key is configured:
-ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,duckduckgo,deepseek,ieee,x,firecrawl,octen,parallel
+# deepseek / serper once their keys are configured.
+# This is the recommended set: bing, juejin and startpage are left out
+# because their measured recall was near zero.
+ALLOWED_SEARCH_ENGINES=exa,serper,apify,csdn,sogou,weixin,dblp,cnki,duckduckgo,deepseek,ieee,x,firecrawl,octen,parallel
 
 # Optional — browser cookies for fetching authenticated pages (e.g. zhihu.com)
 # Same format as the HTTP Cookie header:
@@ -217,11 +229,15 @@ Edit `opencode.json`:
 | `FIRECRAWL_API_KEY` | No | — | Firecrawl API key ([firecrawl.dev](https://www.firecrawl.dev)) — enables the `firecrawl` engine. Free: 1,000 credits/month (≈500 searches) |
 | `OCTEN_API_KEY` | No | — | Octen Search API key ([octen.ai](https://octen.ai)) — enables the `octen` engine. Only a one-time $5 signup balance |
 | `PARALLEL_API_KEY` | No | — | Parallel Search API key ([platform.parallel.ai](https://platform.parallel.ai)) — enables the `parallel` engine. New accounts get a one-time $20 credit; the $5/month free credit needs a payment method |
+| `SERPER_API_KEY` | No | — | Serper.dev API key ([serper.dev](https://serper.dev)) — enables the `serper` engine, which returns real Google SERP results. 2,500 free queries on signup, no card; then $1/1k. Replaces the blocked startpage scraper |
+| `APIFY_API_KEY` | No | — | Apify token ([console.apify.com](https://console.apify.com/settings/integrations)) — enables the `apify` engine, which runs Apify's hosted Google Search Scraper. Free plan: $5 of platform usage per month (no card, no rollover), about 1,000 queries/month; each call takes 30-80s |
 | `FETCH_COOKIES` | No | — | Legacy way to supply long-lived **login** cookies as a flat `key=value; key2=value2` blob. It is now split by cookie owner: `d_c0`/`z_c0` → `zhihu.com`, `SESSDATA`/`buvid3`/`bili_jct`/… → `bilibili.com`, `SNUID`/`SUV` → `sogou.com`; **unrecognized names are dropped** (they would otherwise be sent to every fetched host). Prefer `set_cookies` / `import_cookies`, which store cookies per domain. **Never commit real cookies** |
 | `COOKIE_CACHE_TTL` | No | `1200` | Age (seconds) after which a cached cookie is logged as stale. Advisory only — stale cookies are still used, the remote server is the real authority. `0` disables the warning |
 | `ADVENT_ALLOW_COOKIE_IMPORT` | No | `0` | Set to `1` to register the `import_cookies` tool. Off by default: it is a credential-access capability and should be approved separately |
 | `ADVENT_FETCH_LOG` | No | `0` | Set to `1` to append one JSON line per `get_page` fetch (URL, host, outcome, status, chars, duration, strategy, attached cookie names). Values are never logged |
 | `ADVENT_FETCH_LOG_PATH` | No | `<cookie dir>/fetch-log.jsonl` | Where the fetch log is written (rotated once at 8 MB) |
+| `ADVENT_SEARCH_LOG` | No | `0` | Set to `1` to append one JSON line per engine call in `web` (query, engine, result count, duration, share of `limit`, error, skipped). For diagnosing low-recall engines |
+| `ADVENT_SEARCH_LOG_PATH` | No | `<cookie dir>/search-log.jsonl` | Where the search log is written (rotated once at 8 MB) |
 | `EVERYTHING_ES_PATH` | No | — | Path to ES.exe (required to enable local search) |
 | `TWSCRAPE_PATH` | No | `twscrape` | `twscrape` executable used for X/Twitter reads. Install with `uv tool install twscrape`; when it is missing (or no x.com login cookies are stored) `get_page` falls back to the public SSR page |
 | `X_MIN_INTERVAL_MS` | No | `8000` | Minimum spacing between consecutive `twscrape` calls, in ms; a random 0–3s jitter is added. X rate-limits per endpoint and per account, so calls are also serialized |
@@ -256,6 +272,38 @@ duplicate URLs are folded together (the survivor lists every engine that
 returned it, in `engines`), and results agreed on by more engines rank first.
 Per-engine relevance order is preserved within equal agreement.
 
+#### Recommended engines (measured 2026-10)
+
+Pick engines by task; do not turn them all on. AA is the Artificial Analysis
+Search Index (data 2026-10-19, 0-100, higher is better; `-` = not benchmarked).
+
+| Engine | AA | Best for | Notes |
+|---|---|---|---|
+| `exa` | 80 | **Default**: general facts, semantic discovery, date/domain filters | $10/month free credit |
+| `serper` | - | Google keyword results, breaking news, exact entity lookup | 2,500 free, no card; needs `SERPER_API_KEY`; 1-6s |
+| `apify` | - | Same Google results, but the quota refills monthly | $5/month free ≈ 1,000 queries; needs `APIFY_API_KEY`; 30-80s |
+| `octen` | 77 | Cheap and fast, good for bulk coverage | occasional off-topic hit |
+| `parallel` | 73 (fast) / 75 (advanced) | Technical docs, multi-hop research | needs key |
+| `firecrawl` | 73 | Long pages, full-text scrape/markdown | slow |
+| `duckduckgo` | - | Forums and community opinions | free; often anti-bot blocked |
+| `sogou` / `weixin` | - | Chinese news, WeChat articles | shared SNUID, rate-limited |
+| `csdn` | - | Chinese developer troubleshooting | |
+| `dblp` / `cnki` / `ieee` | - | Papers | academic only |
+| `x` | - | X/Twitter posts | needs x.com login cookies |
+
+Not recommended (near-zero useful recall in 2026-10 tests):
+
+- `bing` — Chinese and technical queries often return only homepages;
+- `juejin` — returns years-old beginner tutorials, poorly related;
+- `startpage` — a Google frontend; datacenter/proxy IPs are blocked by Anubis. Use `serper`.
+
+#### How `limit` is split
+
+`limit` is shared evenly across the engines requested. When `limit` is smaller
+than the number of engines, the tail engines get no slot and do not run — this
+is not a failure: the response lists them in `warnings`. For broad coverage
+pass `limit >= 3 x engines` (e.g. `limit: 20` with 6 engines).
+
 #### `freshness` — and what each engine can actually do
 
 Engines differ a lot here, and some silently ignore a filter. Rather than
@@ -268,6 +316,8 @@ pretend, the response reports the truth per engine in
 | `sogou` | `applied` | `tsn` (1/2/3/4 = day/week/month/year) |
 | `csdn` | `applied` | `tm` (1/2/3/5 = day/week/month/year) |
 | `ieee` | `applied` | `start_date` / `end_date` (`YYYYMMDD`) |
+| `serper` | `applied` | Google `tbs=qdr:d/w/m/y`, explicit ranges via `cdr:1` |
+| `apify` | `applied` | Actor `quickDateRange` (`d1/w1/m1/y1`) and `beforeDate`/`afterDate` |
 | `juejin` | `best_effort` | newest-first sort (`sort_type=1`), not a true range |
 | `cnki` | `best_effort` | already sorted by publication time |
 | `dblp` | `best_effort` | `year:YYYY` query term (year granularity only) |
@@ -304,7 +354,7 @@ pages are never merged. The count of folded duplicates is reported as
 requires fetching each page's body, which would turn the fast search path into
 a slow one, and title-based heuristics merge genuinely different pages.
 
-Supported engines (16 total): Exa, Bing (default; override with `DEFAULT_SEARCH_ENGINE`, e.g. `exa`), CSDN, Juejin, Startpage, Sogou, Weixin (WeChat articles), DBLP (CS bibliography), CNKI (知网), DuckDuckGo (free, no key), plus gated engines — DeepSeek (LLM-backed, key), IEEE (Xplore metadata, key), X/Twitter (x.com cookies + `twscrape`), Firecrawl, Octen and Parallel (each needs its own API key).
+Supported engines (18 total): Exa, CSDN, Sogou, Weixin (WeChat articles), DBLP (CS bibliography), CNKI (知网), DuckDuckGo (free, no key), plus gated engines — DeepSeek (LLM-backed, key), IEEE (Xplore metadata, key), X/Twitter (x.com cookies + `twscrape`), Firecrawl, Octen, Parallel and Serper (real Google SERP; each needs its own API key). Bing, Juejin and Startpage still exist in code (`DEFAULT_SEARCH_ENGINE` still defaults to `bing`), but measured recall was poor in 2026-10: disable them with `ALLOWED_SEARCH_ENGINES` and set the default to `exa`.
 
 Credential-gated engines (implemented, hidden until key set — appear automatically in `tools/list` when the env var is present):
 - **`deepseek`** — LLM-backed web search via the Anthropic-compatible Messages API with the server-side `web_search_20250305` tool. Two backends auto-detected from key format:

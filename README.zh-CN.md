@@ -124,10 +124,20 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 可选：覆盖模型
 # key 只从该环境变量读取（绝不读任何文件）
 IEEE_API_KEY=你的密钥
 
+# （可选）Serper.dev Google 搜索密钥（启用 serper 引擎）
+# 注册送 2,500 次、不绑卡；之后 $1/1k。申请：https://serper.dev
+SERPER_API_KEY=你的密钥
+
+# （可选）Apify 令牌（启用 apify 引擎，走 Google Search Scraper）
+# 免费计划每月 $5 平台额度（不绑卡、不滚存），约 1,000 次查询/月。
+# 申请：https://console.apify.com/settings/integrations
+APIFY_API_KEY=apify_api_你的令牌
+
 # （可选）限制可用引擎（逗号分隔）
 # 重要：如果设置了这个变量，务必把想用的引擎都写进去——
-# 包括配置了 key 后的 deepseek：
-ALLOWED_SEARCH_ENGINES=exa,bing,csdn,juejin,startpage,sogou,weixin,dblp,cnki,duckduckgo,deepseek,ieee,x,firecrawl,octen,parallel
+# 包括配置了 key 后的 deepseek / serper。
+# 下面是"推荐组合"：去掉了实测召回很差的 bing、juejin、startpage。
+ALLOWED_SEARCH_ENGINES=exa,serper,apify,csdn,sogou,weixin,dblp,cnki,duckduckgo,deepseek,ieee,x,firecrawl,octen,parallel
 
 # （可选）浏览器 Cookie，用于抓取需登录的页面（如知乎）
 # 格式与 HTTP 的 Cookie 请求头相同：
@@ -215,11 +225,15 @@ ENGRAM_MCP_ARGS_JSON='["mcp","--tools=agent"]'
 | `FIRECRAWL_API_KEY` | 否 | — | Firecrawl API 密钥（[firecrawl.dev](https://www.firecrawl.dev)）——启用 `firecrawl` 引擎。免费：1,000 credits/月（≈500 次搜索） |
 | `OCTEN_API_KEY` | 否 | — | Octen Search API 密钥（[octen.ai](https://octen.ai)）——启用 `octen` 引擎。只有一次性 $5 注册余额 |
 | `PARALLEL_API_KEY` | 否 | — | Parallel Search API 密钥（[platform.parallel.ai](https://platform.parallel.ai)）——启用 `parallel` 引擎。新账号一次性送 $20；每月 $5 免费额度需要绑卡 |
+| `SERPER_API_KEY` | 否 | — | Serper.dev API 密钥（[serper.dev](https://serper.dev)）——启用 `serper` 引擎，返回真实 Google SERP。注册送 2,500 次、不绑卡，之后 $1/1k。用于替代被反爬拦死的 startpage |
+| `APIFY_API_KEY` | 否 | — | Apify 令牌（[console.apify.com](https://console.apify.com/settings/integrations)）——启用 `apify` 引擎，调用 Apify 托管的 Google Search Scraper。免费计划每月 $5 平台额度（不绑卡、不滚存），约 1,000 次查询/月；单次 30–80 秒 |
 | `FETCH_COOKIES` | 否 | — | 旧式长期**登录** Cookie，扁平格式 `key=value; key2=value2`。现在会按 Cookie 归属域名拆分：`d_c0`/`z_c0` → `zhihu.com`，`SESSDATA`/`buvid3`/`bili_jct`/… → `bilibili.com`，`SNUID`/`SUV` → `sogou.com`；**无法识别归属的名字会被丢弃**（否则会被发给任意被抓站点）。推荐改用 `set_cookies` / `import_cookies` 按域存储。**切勿提交真实 Cookie** |
 | `COOKIE_CACHE_TTL` | 否 | `1200` | 缓存 Cookie 超过该秒数后在日志里提醒「可能已失效」。仅提示——过期条目仍会使用，真实有效性以远端为准。`0` 关闭提醒 |
 | `ADVENT_ALLOW_COOKIE_IMPORT` | 否 | `0` | 设为 `1` 才注册 `import_cookies` 工具。默认关闭：这是读取凭据的能力，应单独授权 |
 | `ADVENT_FETCH_LOG` | 否 | `0` | 设为 `1` 后每次 `get_page` 抓取追加一行 JSON（链接、host、成败、状态码、字符数、耗时、抓取路径、附带的 Cookie 名）。永不记录 Cookie 值 |
 | `ADVENT_FETCH_LOG_PATH` | 否 | `<cookie 目录>/fetch-log.jsonl` | 抓取日志路径（超过 8 MB 轮转一次） |
+| `ADVENT_SEARCH_LOG` | 否 | `0` | 设为 `1` 后每次 `web` 搜索按引擎追加一行 JSON（查询、引擎、结果数、耗时、分到的 limit、错误、是否因 limit 太小被跳过）。用于排查召回率低的引擎 |
+| `ADVENT_SEARCH_LOG_PATH` | 否 | `<cookie 目录>/search-log.jsonl` | 搜索日志路径（超过 8 MB 轮转一次） |
 | `EVERYTHING_ES_PATH` | 否 | — | ES.exe 路径（必须设置才能启用本地搜索） |
 | `TWSCRAPE_PATH` | 否 | `twscrape` | X/Twitter 读取所用的 `twscrape` 可执行文件。用 `uv tool install twscrape` 安装；未安装或没有 x.com 登录 Cookie 时，`get_page` 回落到公开 SSR 页面 |
 | `X_MIN_INTERVAL_MS` | 否 | `8000` | 两次 `twscrape` 调用之间的最小间隔（毫秒），另加 0–3 秒随机抖动。X 按端点和账号限流，调用本身也是串行的 |
@@ -253,6 +267,37 @@ dedupe         (boolean, 默认 true) — 跨引擎合并重复 URL
 `engines` 字段列出所有命中它的引擎），被更多引擎一致命中的结果排更前；在
 命中数相同时保持各引擎自身的相关性顺序。
 
+#### 推荐引擎（2026-10 实测）
+
+按任务选引擎，不要一次全开。AA 分来自 Artificial Analysis Search Index
+（2026-10-19，0-100，越高越好；`-` 表示该榜未收录）。
+
+| 引擎 | AA | 适合 | 备注 |
+|---|---|---|---|
+| `exa` | 80 | **默认**：通用事实、语义发现、带日期/域名过滤的检索 | 免费额度 $10/月 |
+| `serper` | - | Google 关键词结果、时效新闻、精确实体查找 | 2,500 次免费、不绑卡；需 `SERPER_API_KEY`，单次 1–6 秒 |
+| `apify` | - | 同上，但额度按月补充 | 免费 $5/月 ≈ 1,000 次；需 `APIFY_API_KEY`，单次 30–80 秒 |
+| `octen` | 77 | 便宜、快，适合批量铺量 | 偶有跑题 |
+| `parallel` | 73 (fast) / 75 (advanced) | 技术文档、多跳研究 | 需 key |
+| `firecrawl` | 73 | 长文、整页抓取/markdown | 较慢 |
+| `duckduckgo` | - | 论坛、社区观点 | 免费，常被 anti-bot 临时拦 |
+| `sogou` / `weixin` | - | 中文新闻、公众号文章 | 共用 SNUID，易限流 |
+| `csdn` | - | 中文开发排障 | |
+| `dblp` / `cnki` / `ieee` | - | 论文检索 | 仅学术 |
+| `x` | - | X/Twitter 推文 | 需 x.com 登录 cookie |
+
+不推荐（2026-10 实测有效召回接近 0）：
+
+- `bing`：中文和技术查询经常只返回官网首页级泛结果；
+- `juejin`：返回的多是几年前的入门教程，相关性差；
+- `startpage`：Google 结果前端，机房/代理 IP 基本都被 Anubis 拦住，改用 `serper`。
+
+#### `limit` 怎么分
+
+`limit` 会在本次请求的所有引擎之间**均分**。当 `limit` 小于引擎数时，排在后面的
+引擎拿不到名额、不会执行——这不算失败，响应会在 `warnings` 里列出被跳过的引擎。
+想要广覆盖就传 `limit >= 3 × 引擎数`（例如 6 个引擎用 `limit: 20`）。
+
 #### `freshness` —— 各引擎的真实能力
 
 这一项各引擎差异极大，且部分引擎会**静默忽略**参数。因此响应不会假装过滤
@@ -264,6 +309,8 @@ dedupe         (boolean, 默认 true) — 跨引擎合并重复 URL
 | `sogou` | `applied` | `tsn`（1/2/3/4 = 一天/一周/一月/一年） |
 | `csdn` | `applied` | `tm`（1/2/3/5 = 一天/一周/一月/一年） |
 | `ieee` | `applied` | `start_date` / `end_date`（`YYYYMMDD`） |
+| `serper` | `applied` | Google `tbs=qdr:d/w/m/y`，显式区间用 `cdr:1` |
+| `apify` | `applied` | Actor 的 `quickDateRange`（`d1/w1/m1/y1`）与 `beforeDate/afterDate` |
 | `juejin` | `best_effort` | 按最新排序（`sort_type=1`），并非真区间过滤 |
 | `cnki` | `best_effort` | 本身已按出版时间倒序 |
 | `dblp` | `best_effort` | 查询里加 `year:YYYY`（仅到年粒度） |
@@ -294,7 +341,7 @@ dedupe         (boolean, 默认 true) — 跨引擎合并重复 URL
 **不做**的去重：同一篇文章转载到不同域名。这需要抓取每个页面正文，会把快速
 搜索路径变成慢速路径，而且基于标题的启发式会误合并真正不同的页面。
 
-支持的搜索引擎（16 个）：Exa、Bing（默认；用 `DEFAULT_SEARCH_ENGINE` 改成别的，例如 `exa`）、CSDN、掘金、Startpage、搜狗、微信（公众号文章）、DBLP（计算机文献）、知网、DuckDuckGo（免费无 key），以及门控引擎：DeepSeek（LLM 搜索，需密钥）、IEEE（Xplore 元数据，需密钥）、X/Twitter（需要 x.com 登录 cookie + `twscrape`）、Firecrawl、Octen、Parallel（各自需要 API key）。
+支持的搜索引擎（18 个）：Exa、CSDN、搜狗、微信（公众号文章）、DBLP（计算机文献）、知网、DuckDuckGo（免费无 key），以及门控引擎：DeepSeek（LLM 搜索，需密钥）、IEEE（Xplore 元数据，需密钥）、X/Twitter（需要 x.com 登录 cookie + `twscrape`）、Firecrawl、Octen、Parallel、Serper（真实 Google SERP；各自需要 API key）。Bing、掘金、Startpage 仍在代码里（`DEFAULT_SEARCH_ENGINE` 默认值仍是 `bing`），但 2026-10 实测召回很差，建议用 `ALLOWED_SEARCH_ENGINES` 关掉，默认引擎改成 `exa`。
 
 凭据门控引擎（已实现，设置密钥前隐藏——配置环境变量后自动出现在 `tools/list`）：
 - **`deepseek`** — 基于 LLM 的搜索，通过 Anthropic 兼容 Messages API 调用服务端 `web_search_20250305` 工具。按 key 格式自动检测后端：

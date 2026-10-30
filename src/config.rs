@@ -162,6 +162,8 @@ impl Config {
             ("firecrawl", "FIRECRAWL_API_KEY"),
             ("octen", "OCTEN_API_KEY"),
             ("parallel", "PARALLEL_API_KEY"),
+            ("serper", "SERPER_API_KEY"),
+            ("apify", "APIFY_API_KEY"),
         ] {
             if let Ok(k) = env::var(var) {
                 let k = k.trim().to_string();
@@ -299,10 +301,30 @@ impl Config {
         self.client_builder(use_proxy)?.build()
     }
 
+    /// Synchronous Apify Actor runs can take tens of seconds; the shared 30s
+    /// timeout would cut them off, so engines that need it build a slower
+    /// client through this method.
+    pub fn build_reqwest_client_for_slow(
+        &self,
+        domain: &str,
+        timeout_secs: u64,
+    ) -> reqwest::Result<reqwest::Client> {
+        self.client_builder_with_timeout(!self.should_bypass_proxy(domain), timeout_secs)?
+            .build()
+    }
+
     /// Shared builder so every client gets identical timeout / UA / proxy rules.
     fn client_builder(&self, use_proxy: bool) -> reqwest::Result<reqwest::ClientBuilder> {
+        self.client_builder_with_timeout(use_proxy, 30)
+    }
+
+    fn client_builder_with_timeout(
+        &self,
+        use_proxy: bool,
+        timeout_secs: u64,
+    ) -> reqwest::Result<reqwest::ClientBuilder> {
         let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .connect_timeout(std::time::Duration::from_secs(10))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36");
 
